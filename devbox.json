@@ -1,0 +1,32 @@
+{
+  "packages": {
+    "python": {"version": "3.14"},
+    "python314Packages.pip": {},
+
+    "bpftrace": {},
+    "sysstat": {},
+    "fio": {}
+  },
+  "env": {
+    "ROOT_DIR": "$PWD",
+
+    "VENV_DIR": "./.venv",
+    "PIP_REQUIRE_VIRTUALENV": "true",
+    "PIP_REQUIRE_FILE": "./requirements.txt"
+  },
+  "shell": {
+    "init_hook": [
+      "if [ ! -d \"$VENV_DIR\" ]; then python -m venv \"$VENV_DIR\"; fi",
+      ". $VENV_DIR/bin/activate",
+
+      "clear",
+      "echo -e \"\\nDevbox started!\""
+    ],
+    "scripts": {
+      "update_pip": [
+        "python -m pip install --upgrade pip",
+        "python -m pip install -r $PIP_REQUIRE_FILE"
+      ]
+    }
+  }
+}
