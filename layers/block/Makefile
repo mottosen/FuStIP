@@ -35,7 +35,7 @@ ensure-results-exists:
 		exit 1; \
 	fi
 
-	$(Q)mkdir -p "$(RESULTS_DIR)/bpftrace"
+	$(Q)mkdir -p "$(RESULTS_DIR)/block"
 
 	$(Q)echo -e "Results dir was found or created.\n"
 
@@ -46,8 +46,8 @@ start-collection: ensure-results-exists ensure-sudo
 	$(Q)mkdir -p "$(PIDS_DIR)"
 
 	$(Q)sudo $(BPFTRACE) ./bt/$(MODE).bt "fio" \
-		-o "$(RESULTS_DIR)/bpftrace/block-$(MODE).out" \
-		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/bpftrace-block-$(MODE).pid"
+		-o "$(RESULTS_DIR)/block/$(MODE).out" \
+		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/$(MODE).pid"
 
 	$(Q)echo -e "bpftrace collection is running!\n"
 

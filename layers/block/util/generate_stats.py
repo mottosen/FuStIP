@@ -14,15 +14,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
-from stats_generation.shared import (
-    compute_duration_from_tseries,
-    derive_throughput,
-    histogram_stats,
-    parse_counters,
-    parse_histograms,
-    parse_tseries,
-    tseries_stats,
-)
+from stats_generation.shared import (compute_duration_from_tseries,
+                                     derive_throughput, histogram_stats,
+                                     parse_counters, parse_histograms,
+                                     parse_tseries, tseries_stats)
 
 LAYER_PREFIX = "block"
 MODES = ["summary", "legacy"]
@@ -84,14 +79,14 @@ def main():
     parser.add_argument("results_dir", type=Path, help="Results directory")
     args = parser.parse_args()
 
-    bpf_dir = args.results_dir / "bpftrace"
+    bpf_dir = args.results_dir / "block"
     if not bpf_dir.is_dir():
         print(f"Error: {bpf_dir} not found", file=sys.stderr)
         sys.exit(1)
 
     found = False
     for mode in MODES:
-        input_file = bpf_dir / f"{LAYER_PREFIX}-{mode}.out"
+        input_file = bpf_dir / f"{mode}.out"
         if not input_file.exists():
             continue
 
@@ -99,7 +94,7 @@ def main():
         print(f"Processing {input_file.name}...")
         stats = generate_stats(input_file)
 
-        output_file = bpf_dir / f"{LAYER_PREFIX}-{mode}-stats.json"
+        output_file = bpf_dir / f"{mode}-stats.json"
         with open(output_file, "w") as f:
             json.dump(stats, f, indent=2)
         print(f"  -> {output_file.name}")

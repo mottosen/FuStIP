@@ -38,6 +38,17 @@ workload: $(WORK_JOBS)
 .PHONY: all
 all: validate workload
 
+.PHONY: reset-results
+reset-results:
+ifndef RESULTS_DIR
+	$(error RESULTS_DIR is not set)
+endif
+
+	$(Q)echo -e "Cleaning experiment results.."
+	$(Q)rm -rf $(RESULTS_DIR)/*
+
+	$(Q)echo -e "✓ All cleaned up!\n"
+
 # ── Per-job pattern ──
 # Each target: start collection → run fio → stop collection → check results
 
@@ -47,6 +58,7 @@ $(1): ensure-sudo
 	$(Q)echo -e "\n============================================================"
 	$(Q)echo -e "  Running: $(1)"
 	$(Q)echo -e "============================================================\n"
+	$(Q)$(MAKE) reset-results
 	$(Q)$(MAKE) -C $(BLOCK_DIR) start-collection RESULTS_DIR=$(RESULTS_DIR) MODE=$(MODE) $(REDIRECT)
 	$(Q)$(MAKE) -C $(NVME_DIR) start-collection RESULTS_DIR=$(RESULTS_DIR) MODE=$(MODE) $(REDIRECT)
 	$(Q)sleep 5
@@ -59,8 +71,8 @@ $(1): ensure-sudo
 	$(Q)sleep 1
 	$(Q)python check_test.py --job $(1) \
 		--fio-json $(FIO_OUT) \
-		--block-out $(RESULTS_DIR)/bpftrace/block-$(MODE).out \
-		--nvme-out $(RESULTS_DIR)/bpftrace/nvme-$(MODE).out \
+		--block-out $(RESULTS_DIR)/block/$(MODE).out \
+		--nvme-out $(RESULTS_DIR)/nvme/$(MODE).out \
 		--mode $(MODE)
 endef
 
