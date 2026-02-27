@@ -1,0 +1,113 @@
+config =
+{
+    unstable_tseries=enable;
+}
+
+BEGIN
+{
+    print("bpftrace - NVMe Layer\n");
+
+    @dev_filter = $1;
+
+    @nvme_op[(uint64)0] = "read";
+    @nvme_op[(uint64)1] = "write";
+    @nvme_op[(uint64)2] = "flush";
+    @nvme_op[(uint64)3] = "discard";
+    @nvme_op[(uint64)9] = "write_zeros";
+}
+
+fentry:nvme_core:nvme_setup_cmd
+/ strcontains(@dev_filter, args.req->q->disk->disk_name) /
+{
+    $rq = (uint64)args.req;
+    $op = (uint64)(args.req->cmd_flags & 0xFF);
+    $size = (uint64)args.req->__data_len;
+
+    @cmd_setup[@nvme_op[$op]] = count();
+
+    @cmd_ops[$rq] = $op;
+    @cmd_size[$rq] = $size;
+    @fentry_rq[tid] = $rq;
+}
+
+rawtracepoint:nvme_setup_cmd
+{
+    $rq = @fentry_rq[tid];
+    if ($rq)
+    {
+        @cmd_time[$rq] = nsecs;
+        delete(@fentry_rq[tid]);
+    }
+}
+
+rawtracepoint:nvme_complete_rq
+{
+    $rq = (uint64)arg0;
+    $t_ref = @cmd_time[$rq];
+    if ($t_ref)
+    {
+        $now = nsecs;
+        $cmd_op = @cmd_ops[$rq];
+        $cmd_size = @cmd_size[$rq];
+
+        @cmd_completed[@nvme_op[$cmd_op]] = count();
+
+        $lat_ns = $now - $t_ref;
+        @cmd_latencies[@nvme_op[$cmd_op]] = hist($lat_ns);
+        @cmd_sizes[@nvme_op[$cmd_op]] = hist($cmd_size);
+        @cmd_total_bytes[@nvme_op[$cmd_op]] = sum($cmd_size);
+
+        delete(@cmd_time[$rq]);
+        delete(@cmd_ops[$rq]);
+        delete(@cmd_size[$rq]);
+    }
+    else
+    {
+        @cmd_untracked[((struct request *)arg0)->q->disk->disk_name] = count();
+    }
+}
+
+interval:s:1
+{
+    @cmd_inflight["read"] = tseries(@cmd_setup["read"] - @cmd_completed["read"], 1s, 120);
+    @cmd_inflight["write"] = tseries(@cmd_setup["write"] - @cmd_completed["write"], 1s, 120);
+    @cmd_inflight["flush"] = tseries(@cmd_setup["flush"] - @cmd_completed["flush"], 1s, 120);
+    @cmd_inflight["discard"] = tseries(@cmd_setup["discard"] - @cmd_completed["discard"], 1s, 120);
+    @cmd_inflight["write_zeros"] = tseries(@cmd_setup["write_zeros"] - @cmd_completed["write_zeros"], 1s, 120);
+}
+
+END
+{
+    print(@cmd_setup);
+    print(@cmd_completed);
+    print(@cmd_untracked);
+    print("");
+
+    print(@cmd_total_bytes);
+    print("");
+
+    print(@cmd_sizes);
+    print(@cmd_latencies);
+    print(@cmd_inflight);
+
+
+    clear(@cmd_latencies);
+    clear(@cmd_sizes);
+    clear(@cmd_total_bytes);
+
+    clear(@cmd_time);
+    clear(@cmd_ops);
+    clear(@cmd_size);
+
+    clear(@cmd_setup);
+    clear(@cmd_completed);
+    clear(@cmd_untracked);
+
+    clear(@cmd_inflight);
+
+    clear(@fentry_rq);
+    clear(@nvme_op);
+
+
+    delete(@dev_filter);
+}
