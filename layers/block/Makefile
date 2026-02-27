@@ -64,3 +64,13 @@ stop-collection:
 	$(Q)rm -rf "$(PIDS_DIR)"
 
 	$(Q)echo -e "Collection stopped!\n"
+
+	$(Q)$(MAKE) generate-stats
+
+.PHONY: generate-stats
+generate-stats: ensure-results-exists
+	$(Q)echo -e "\nGenerating block layer stats.."
+
+	$(Q)python "./util/generate_stats.py" "$(RESULTS_DIR)"
+
+	$(Q)echo -e "Stats generated!\n"

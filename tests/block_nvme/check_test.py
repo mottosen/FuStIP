@@ -6,26 +6,11 @@ Asserts that profiler metrics match FIO-reported numbers within tolerance.
 
 import argparse
 import json
-import re
+import sys
+from pathlib import Path
 
-
-def parse_bpftrace_output(path):
-    """Parse bpftrace text output into nested dict.
-
-    Lines like '@rq_issued[read]: 485313' become:
-        {"rq_issued": {"read": 485313}}
-    """
-    data = {}
-    pattern = re.compile(r"^@(\w+)\[([^\]]+)\]:\s+(-?\d+)")
-
-    with open(path) as f:
-        for line in f:
-            m = pattern.match(line.strip())
-            if m:
-                map_name, key, value = m.group(1), m.group(2), int(m.group(3))
-                data.setdefault(map_name, {})[key] = value
-
-    return data
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "util"))
+from stats_generation.shared import parse_counters
 
 
 def parse_fio_json(path):
@@ -258,8 +243,8 @@ def main():
     args = parser.parse_args()
 
     fio = parse_fio_json(args.fio_json)
-    blk = parse_bpftrace_output(args.block_out) if args.mode in ["legacy", "summary"] else {}
-    nvme = parse_bpftrace_output(args.nvme_out) if args.mode in ["legacy", "summary"] else {}
+    blk = parse_counters(args.block_out) if args.mode in ["legacy", "summary"] else {}
+    nvme = parse_counters(args.nvme_out) if args.mode in ["legacy", "summary"] else {}
 
     print(f"\n=== {args.job} (mode={args.mode}) ===")
 

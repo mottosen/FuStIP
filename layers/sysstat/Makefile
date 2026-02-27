@@ -64,6 +64,11 @@ stop-collection:
 
 	$(Q)echo -e "Collection stopped!\n"
 
+	$(Q)$(MAKE) parse
+	$(Q)$(MAKE) generate-stats
+
+.PHONY: parse
+parse: ensure-results-exists
 	$(Q)echo -e "\nParsing sysstat output.."
 
 	$(Q)python "./util/parse_output.py" "$(RESULTS_DIR)/sysstat" \
@@ -73,12 +78,10 @@ stop-collection:
 
 	$(Q)rm "$(RESULTS_DIR)/sysstat/pidstat.out"
 
-.PHONY: visualize
-visualize: ensure-results-exists
-	$(Q)echo -e "\nVisualize sysstat output.."
+.PHONY: generate-stats
+generate-stats: ensure-results-exists
+	$(Q)echo -e "\nGenerating sysstat stats.."
 
-	$(Q)python "./visualization/visualize_dashboard.py" $(OPTIONS) \
-		"$(RESULTS_DIR)/sysstat" \
-		$(ERR_REDIRECT) 1>&2
+	$(Q)python "./util/generate_stats.py" $(OPTIONS) "$(RESULTS_DIR)"
 
-	$(Q)echo -e "Data visualized!\n"
+	$(Q)echo -e "Stats generated!\n"
