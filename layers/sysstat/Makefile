@@ -66,7 +66,7 @@ stop-collection:
 
 	$(Q)echo -e "\nParsing sysstat output.."
 
-	$(Q)python "./visualization/parse_output.py" "$(RESULTS_DIR)/sysstat" \
+	$(Q)python "./util/parse_output.py" "$(RESULTS_DIR)/sysstat" \
 		$(ERR_REDIRECT) 1>&2
 
 	$(Q)echo -e "Data parsed!\n"
