@@ -64,6 +64,8 @@ stop-collection:
 
 	$(Q)echo -e "Collection stopped!\n"
 
+	$(Q)sleep 2
+
 	$(Q)$(MAKE) parse
 	$(Q)$(MAKE) generate-stats
 

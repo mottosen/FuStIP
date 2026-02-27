@@ -65,6 +65,8 @@ stop-collection:
 
 	$(Q)echo -e "Collection stopped!\n"
 
+	$(Q)sleep 2
+
 	$(Q)$(MAKE) generate-stats
 
 .PHONY: generate-stats
