@@ -1,10 +1,10 @@
 ifdef DEBUG
     Q =
-    ERR_REDIRECT =
+    REDIRECT =
     MAKE_FLAGS =
 else
     Q = @
-    ERR_REDIRECT = 2>/dev/null
+    REDIRECT = 1>/dev/null 2>&1
     MAKE_FLAGS = --no-print-directory
 endif
 
@@ -47,15 +47,15 @@ $(1): ensure-sudo
 	$(Q)echo -e "\n============================================================"
 	$(Q)echo -e "  Running: $(1)"
 	$(Q)echo -e "============================================================\n"
-	$(Q)$(MAKE) -C $(BLOCK_DIR) start-collection RESULTS_DIR=$(RESULTS_DIR) MODE=$(MODE)
-	$(Q)$(MAKE) -C $(NVME_DIR) start-collection RESULTS_DIR=$(RESULTS_DIR) MODE=$(MODE)
+	$(Q)$(MAKE) -C $(BLOCK_DIR) start-collection RESULTS_DIR=$(RESULTS_DIR) MODE=$(MODE) $(REDIRECT)
+	$(Q)$(MAKE) -C $(NVME_DIR) start-collection RESULTS_DIR=$(RESULTS_DIR) MODE=$(MODE) $(REDIRECT)
 	$(Q)sleep 5
 	$(Q)sudo fio ./jobs.fio --filename=$(FIO_FILE) \
 		--output-format=json --output=$(FIO_OUT) \
 		--section=$(1)
 	$(Q)sleep 1
-	$(Q)$(MAKE) -C $(NVME_DIR) stop-collection $(ERR_REDIRECT)
-	$(Q)$(MAKE) -C $(BLOCK_DIR) stop-collection $(ERR_REDIRECT)
+	$(Q)$(MAKE) -C $(NVME_DIR) stop-collection $(REDIRECT)
+	$(Q)$(MAKE) -C $(BLOCK_DIR) stop-collection $(REDIRECT)
 	$(Q)sleep 1
 	$(Q)python check_test.py --job $(1) \
 		--fio-json $(FIO_OUT) \
