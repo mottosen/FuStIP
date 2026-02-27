@@ -1,3 +1,5 @@
 .env
 results
 __pycache__
+*.lock
+*.swp
