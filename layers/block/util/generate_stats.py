@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate stats JSON from block layer bpftrace output.
 
-Reads block-{summary,legacy}.out from the results directory,
+Reads trace.out from the results directory,
 computes aggregate statistics, and writes JSON files.
 
 Usage:
@@ -20,7 +20,6 @@ from stats_generation.shared import (compute_duration_from_tseries,
                                      parse_tseries, tseries_stats)
 
 LAYER_PREFIX = "block"
-MODES = ["summary", "legacy"]
 
 COUNTER_MAPS = [
     "rq_issued", "rq_completed", "rq_queued", "rq_queue_done",
@@ -84,23 +83,18 @@ def main():
         print(f"Error: {bpf_dir} not found", file=sys.stderr)
         sys.exit(1)
 
-    found = False
-    for mode in MODES:
-        input_file = bpf_dir / f"{mode}.out"
-        if not input_file.exists():
-            continue
+    input_file = bpf_dir / "trace.out"
+    if not input_file.exists():
+        print(f"No block layer output found: {input_file}", file=sys.stderr)
+        sys.exit(1)
 
-        found = True
-        print(f"Processing {input_file.name}...")
-        stats = generate_stats(input_file)
+    print(f"Processing {input_file.name}...")
+    stats = generate_stats(input_file)
 
-        output_file = bpf_dir / f"{mode}-stats.json"
-        with open(output_file, "w") as f:
-            json.dump(stats, f, indent=2)
-        print(f"  -> {output_file.name}")
-
-    if not found:
-        print(f"No block layer output files found in {bpf_dir}")
+    output_file = bpf_dir / "trace-stats.json"
+    with open(output_file, "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"  -> {output_file.name}")
 
 
 if __name__ == "__main__":

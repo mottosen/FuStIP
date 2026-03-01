@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate stats JSON from NVMe layer bpftrace output.
 
-Reads nvme-{summary,legacy}.out from the results directory,
+Reads trace.out from the results directory,
 computes aggregate statistics, and writes JSON files.
 
 Usage:
@@ -20,7 +20,6 @@ from stats_generation.shared import (compute_duration_from_tseries,
                                      parse_tseries, tseries_stats)
 
 LAYER_PREFIX = "nvme"
-MODES = ["summary", "legacy"]
 
 COUNTER_MAPS = [
     "cmd_setup", "cmd_completed", "cmd_untracked", "cmd_total_bytes",
@@ -50,12 +49,11 @@ def generate_stats(input_path):
         if m in counters:
             result["counters"][m] = counters[m]
 
-    # Derived throughput (only if bytes map exists — summary mode)
-    if "cmd_total_bytes" in counters:
-        throughput = derive_throughput(
-            counters, duration_s, "cmd_completed", "cmd_total_bytes"
-        )
-        result["derived"].update(throughput)
+    # Derived throughput
+    throughput = derive_throughput(
+        counters, duration_s, "cmd_completed", "cmd_total_bytes"
+    )
+    result["derived"].update(throughput)
 
     # Histogram stats
     for m in HISTOGRAM_MAPS:
@@ -86,23 +84,18 @@ def main():
         print(f"Error: {bpf_dir} not found", file=sys.stderr)
         sys.exit(1)
 
-    found = False
-    for mode in MODES:
-        input_file = bpf_dir / f"{mode}.out"
-        if not input_file.exists():
-            continue
+    input_file = bpf_dir / "trace.out"
+    if not input_file.exists():
+        print(f"No NVMe layer output found: {input_file}", file=sys.stderr)
+        sys.exit(1)
 
-        found = True
-        print(f"Processing {input_file.name}...")
-        stats = generate_stats(input_file)
+    print(f"Processing {input_file.name}...")
+    stats = generate_stats(input_file)
 
-        output_file = bpf_dir / f"{mode}-stats.json"
-        with open(output_file, "w") as f:
-            json.dump(stats, f, indent=2)
-        print(f"  -> {output_file.name}")
-
-    if not found:
-        print(f"No NVMe layer output files found in {bpf_dir}")
+    output_file = bpf_dir / "trace-stats.json"
+    with open(output_file, "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"  -> {output_file.name}")
 
 
 if __name__ == "__main__":
