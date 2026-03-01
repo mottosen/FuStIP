@@ -1,0 +1,136 @@
+[global]
+; ── Target ──
+size=1G
+time_based=1
+runtime=10
+
+; ── Engine ──
+ioengine=psync
+direct=0
+
+; ── Reporting ──
+group_reporting=1
+numjobs=1
+
+; ── Latency distribution ──
+lat_percentiles=1
+percentile_list=1:5:10:20:30:40:50:60:70:80:90:95:99:99.5:99.9:99.95:99.99
+
+
+; ============================================================
+;  0  File prep — sequential write to pre-allocate
+; ============================================================
+[prep]
+ioengine=sync
+rw=write
+bs=1m
+fallocate=posix
+time_based=0
+stonewall
+
+
+; ============================================================
+;  A  Validation — simple, predictable jobs for profiler checks
+; ============================================================
+; QD=1, short runtime, single op type.  Each job targets one
+; syscall type to verify exact match with FIO.
+
+; sync engine → read() syscall
+[val_seqread]
+ioengine=sync
+rw=read
+bs=128k
+iodepth=1
+stonewall
+
+; sync engine → write() syscall
+[val_seqwrite]
+ioengine=sync
+rw=write
+bs=128k
+iodepth=1
+stonewall
+
+; psync engine → pread64() syscall
+[val_randread]
+rw=randread
+bs=4k
+iodepth=1
+stonewall
+
+; psync engine → pwrite64() syscall
+[val_randwrite]
+rw=randwrite
+bs=4k
+iodepth=1
+stonewall
+
+; psync engine → pread64() + pwrite64() syscalls
+[val_randrw]
+rw=randrw
+rwmixread=50
+bs=4k
+iodepth=1
+stonewall
+
+
+; ============================================================
+;  B  Workloads — VDB-like heavy IO patterns
+; ============================================================
+; Longer runtime, higher queue depths.
+
+; ANN vector search — random 4K reads across index structures
+[work_index_search]
+rw=randread
+bs=4k
+iodepth=64
+size=4G
+runtime=30
+stonewall
+
+; Batch vector insert — sequential large writes
+[work_bulk_insert]
+rw=write
+bs=128k
+iodepth=32
+size=4G
+runtime=30
+stonewall
+
+; Background compaction — read old segments, write new ones
+[work_compaction]
+rw=randrw
+rwmixread=50
+bs=128k
+iodepth=16
+size=4G
+runtime=30
+stonewall
+
+; Concurrent queries (reads) + inserts (writes)
+[work_query_insert]
+rw=randrw
+rwmixread=70
+bs=4k
+iodepth=32
+size=4G
+runtime=30
+stonewall
+
+; Full table/partition sequential scan
+[work_scan]
+rw=read
+bs=128k
+iodepth=64
+size=4G
+runtime=30
+stonewall
+
+; Stress test — max inflight random reads
+[work_high_qd]
+rw=randread
+bs=4k
+iodepth=256
+size=4G
+runtime=30
+stonewall
