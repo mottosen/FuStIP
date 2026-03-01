@@ -13,7 +13,6 @@ MAKE := $(MAKE) $(MAKE_FLAGS)
 BLOCK_DIR = ../../layers/block
 NVME_DIR = ../../layers/nvme
 
-MODE ?= summary
 FIO_OUT = block_nvme-fio_out.json
 
 VAL_JOBS = val_seqread val_seqwrite val_randread val_randwrite val_randrw
@@ -59,8 +58,8 @@ $(1): ensure-sudo
 	$(Q)echo -e "  Running: $(1)"
 	$(Q)echo -e "============================================================\n"
 	$(Q)$(MAKE) reset-results
-	$(Q)$(MAKE) -C $(BLOCK_DIR) start-collection RESULTS_DIR=$(RESULTS_DIR) MODE=$(MODE) $(REDIRECT)
-	$(Q)$(MAKE) -C $(NVME_DIR) start-collection RESULTS_DIR=$(RESULTS_DIR) MODE=$(MODE) $(REDIRECT)
+	$(Q)$(MAKE) -C $(BLOCK_DIR) start-collection RESULTS_DIR=$(RESULTS_DIR) $(REDIRECT)
+	$(Q)$(MAKE) -C $(NVME_DIR) start-collection RESULTS_DIR=$(RESULTS_DIR) $(REDIRECT)
 	$(Q)sleep 5
 	$(Q)sudo fio ./jobs.fio --filename=$(FIO_FILE) \
 		--output-format=json --output=$(FIO_OUT) \
@@ -71,9 +70,8 @@ $(1): ensure-sudo
 	$(Q)sleep 1
 	$(Q)python check_test.py --job $(1) \
 		--fio-json $(FIO_OUT) \
-		--block-out $(RESULTS_DIR)/block/$(MODE).out \
-		--nvme-out $(RESULTS_DIR)/nvme/$(MODE).out \
-		--mode $(MODE)
+		--block-out $(RESULTS_DIR)/block/trace.out \
+		--nvme-out $(RESULTS_DIR)/nvme/trace.out
 endef
 
 $(foreach job,$(VAL_JOBS) $(WORK_JOBS),$(eval $(call JOB_TEMPLATE,$(job))))

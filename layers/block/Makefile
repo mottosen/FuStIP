@@ -14,7 +14,6 @@ BPFTRACE := $(shell which bpftrace)
 PIDS_DIR = /tmp/bpftrace_block-pids
 
 INTERVAL ?= 1
-MODE ?= summary
 
 .NOTPARALLEL:
 
@@ -41,13 +40,18 @@ ensure-results-exists:
 
 .PHONY: start-collection
 start-collection: ensure-results-exists ensure-sudo
+ifndef COMM_FILTER
+	$(error COMM_FILTER is not set)
+endif
+
 	$(Q)echo -e "\nStarting bpftrace collection.."
 
 	$(Q)mkdir -p "$(PIDS_DIR)"
 
-	$(Q)sudo $(BPFTRACE) ./bt/$(MODE).bt "fio" \
-		-o "$(RESULTS_DIR)/block/$(MODE).out" \
-		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/$(MODE).pid"
+	$(Q)sudo $(BPFTRACE) ./bt/trace.bt $(COMM_FILTER) \
+		--no-warnings \
+		-o "$(RESULTS_DIR)/block/trace.out" \
+		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/trace.pid"
 
 	$(Q)echo -e "bpftrace collection is running!\n"
 
