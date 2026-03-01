@@ -38,7 +38,7 @@ _COUNTER_RE = re.compile(r"^@(\w+)\[([^\]]+)\]:\s+(-?\d+)\s*$")
 _KEYED_HEADER_RE = re.compile(r"^@(\w+)\[([^\]]+)\]:\s*$")
 _UNKEYED_HEADER_RE = re.compile(r"^@(\w+):\s*$")
 _HIST_BUCKET_RE = re.compile(r"^\[(\S+),\s+(\S+)\)\s+(\d+)\s+\|")
-_TSERIES_DATA_RE = re.compile(r"^(\d{2}:\d{2}:\d{2})\s+.*\|\s*(-?\d+)\s*$")
+_TSERIES_DATA_RE = re.compile(r"^(\d{2}:\d{2}:\d{2})\s+.*[|*]\s*(-?\d+)\s*$")
 
 
 def parse_counters(path):
