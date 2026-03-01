@@ -4,14 +4,14 @@ ifdef DEBUG
     MAKE_FLAGS =
 else
     Q = @
-    ERR_REDIRECT = 2>/dev/null
+    ERR_REDIRECT = 2>/dev/null 1>&2
     MAKE_FLAGS = --no-print-directory
 endif
 
 MAKE := $(MAKE) $(MAKE_FLAGS)
 
-PIDSTAT := $(shell which pidstat)
-PIDS_DIR = /tmp/sysstat-pids
+BPFTRACE := $(shell which bpftrace)
+PIDS_DIR = /tmp/bpftrace_block-pids
 
 INTERVAL ?= 1
 
@@ -34,25 +34,30 @@ ensure-results-exists:
 		exit 1; \
 	fi
 
-	$(Q)mkdir -p "$(RESULTS_DIR)/sysstat"
+	$(Q)mkdir -p "$(RESULTS_DIR)/block"
 
 	$(Q)echo -e "Results dir was found or created.\n"
 
 .PHONY: start-collection
 start-collection: ensure-results-exists ensure-sudo
-	$(Q)echo -e "\nStarting sysstat collection.."
+ifndef COMM_FILTER
+	$(error COMM_FILTER is not set)
+endif
+
+	$(Q)echo -e "\nStarting bpftrace collection.."
 
 	$(Q)mkdir -p "$(PIDS_DIR)"
 
-	$(Q)sudo $(PIDSTAT) -turd $(INTERVAL) \
-		> "$(RESULTS_DIR)/sysstat/pidstat.out" \
-		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/pidstat.pid"
+	$(Q)sudo $(BPFTRACE) ./bt/trace.bt $(COMM_FILTER) \
+		--no-warnings \
+		-o "$(RESULTS_DIR)/block/trace.out" \
+		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/trace.pid"
 
-	$(Q)echo -e "sysstat collection is running!\n"
+	$(Q)echo -e "bpftrace collection is running!\n"
 
 .PHONY: stop-collection
 stop-collection:
-	$(Q)echo -e "\nStopping sysstat collection.."
+	$(Q)echo -e "\nStopping bpftrace collection.."
 
 	$(Q)for pidfile in $(PIDS_DIR)/*.pid; do \
 		if [ -f "$$pidfile" ]; then \
@@ -66,24 +71,12 @@ stop-collection:
 
 	$(Q)sleep 2
 
-	$(Q)$(MAKE) parse
 	$(Q)$(MAKE) generate-stats
-
-.PHONY: parse
-parse: ensure-results-exists
-	$(Q)echo -e "\nParsing sysstat output.."
-
-	$(Q)python "./util/parse_output.py" "$(RESULTS_DIR)/sysstat" \
-		$(ERR_REDIRECT) 1>&2
-
-	$(Q)echo -e "Data parsed!\n"
-
-	$(Q)rm "$(RESULTS_DIR)/sysstat/pidstat.out"
 
 .PHONY: generate-stats
 generate-stats: ensure-results-exists
-	$(Q)echo -e "\nGenerating sysstat stats.."
+	$(Q)echo -e "\nGenerating block layer stats.."
 
-	$(Q)python "./util/generate_stats.py" $(OPTIONS) "$(RESULTS_DIR)"
+	$(Q)python "./util/generate_stats.py" "$(RESULTS_DIR)"
 
 	$(Q)echo -e "Stats generated!\n"
