@@ -10,6 +10,13 @@ endif
 
 MAKE := $(MAKE) $(MAKE_FLAGS)
 
+MODE ?= summary
+ifneq ($(MODE),summary)
+ifneq ($(MODE),detailed)
+$(error MODE must be 'summary' or 'detailed' (got '$(MODE)'))
+endif
+endif
+
 BPFTRACE := $(shell which bpftrace)
 PIDS_DIR = /tmp/bpftrace_fs-pids
 
@@ -44,19 +51,32 @@ ifndef COMM_FILTER
 	$(error COMM_FILTER is not set)
 endif
 
-	$(Q)echo -e "\nStarting bpftrace collection.."
-
 	$(Q)mkdir -p "$(PIDS_DIR)"
+
+ifeq ($(MODE),detailed)
+	$(Q)echo -e "\nStarting detailed collection.."
+
+	$(Q)$(MAKE) -C bpf standalone
+
+	$(Q)sudo ./bpf/c/standalone \
+		-o "$(RESULTS_DIR)/fs/detailed.csv" \
+		-f $(COMM_FILTER) \
+		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/detailed.pid"
+
+	$(Q)echo -e "Detailed collection is running!\n"
+else
+	$(Q)echo -e "\nStarting bpftrace collection.."
 
 	$(Q)sudo $(BPFTRACE) ./bt/trace.bt $(COMM_FILTER) \
 		-o "$(RESULTS_DIR)/fs/trace.out" \
 		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/trace.pid"
 
 	$(Q)echo -e "bpftrace collection is running!\n"
+endif
 
 .PHONY: stop-collection
 stop-collection:
-	$(Q)echo -e "\nStopping bpftrace collection.."
+	$(Q)echo -e "\nStopping collection.."
 
 	$(Q)for pidfile in $(PIDS_DIR)/*.pid; do \
 		if [ -f "$$pidfile" ]; then \
@@ -70,12 +90,24 @@ stop-collection:
 
 	$(Q)sleep 2
 
+ifeq ($(MODE),detailed)
+	$(Q)$(MAKE) generate-detailed-stats
+else
 	$(Q)$(MAKE) generate-stats
+endif
 
 .PHONY: generate-stats
 generate-stats: ensure-results-exists
-	$(Q)echo -e "\nGenerating fs layer stats.."
+	$(Q)echo -e "\nGenerating fs layer summary stats.."
 
-	$(Q)python "./util/generate_stats.py" "$(RESULTS_DIR)"
+	$(Q)python "./util/generate_summary_stats.py" "$(RESULTS_DIR)"
+
+	$(Q)echo -e "Stats generated!\n"
+
+.PHONY: generate-detailed-stats
+generate-detailed-stats: ensure-results-exists
+	$(Q)echo -e "\nGenerating fs layer detailed stats.."
+
+	$(Q)python "./util/generate_detailed_stats.py" "$(RESULTS_DIR)"
 
 	$(Q)echo -e "Stats generated!\n"

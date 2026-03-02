@@ -3,6 +3,7 @@
 
 Asserts that profiler metrics match FIO-reported numbers within tolerance.
 Validates per-syscall counters based on the FIO engine used by each job.
+Supports both bpftrace (summary) and detailed (CSV) modes.
 """
 
 import argparse
@@ -27,6 +28,17 @@ def parse_fio_json(path):
         "write_ios": job["write"]["total_ios"],
         "write_bytes": job["write"]["io_bytes"],
     }
+
+
+def parse_detailed_stats(path):
+    """Parse detailed-stats.json into the same dict format as parse_counters().
+
+    The stats JSON has: {"counters": {"sc_completed": {"pread64": N}, ...}}
+    We flatten to: {"sc_completed": {"pread64": N}, ...}
+    """
+    with open(path) as f:
+        stats = json.load(f)
+    return stats.get("counters", {})
 
 
 def get_val(data, map_name, key, default=0):
@@ -146,16 +158,22 @@ def main():
     parser.add_argument("--job", required=True, help="FIO job name")
     parser.add_argument("--fio-json", required=True, help="Path to FIO JSON output")
     parser.add_argument("--fs-out", required=True, help="Path to FS layer output")
+    parser.add_argument("--mode", default="summary", choices=["summary", "detailed"],
+                        help="Profiling mode (default: summary)")
     parser.add_argument("--tolerance", type=float, default=0.02, help="Tolerance for count checks (default: 0.02)")
     args = parser.parse_args()
 
     fio = parse_fio_json(args.fio_json)
-    fs = parse_counters(args.fs_out)
+
+    if args.mode == "detailed":
+        fs = parse_detailed_stats(args.fs_out)
+    else:
+        fs = parse_counters(args.fs_out)
 
     read_key, write_key = syscall_keys_for_job(args.job)
     kind = classify_job(fio)
 
-    print(f"\n=== {args.job} ===")
+    print(f"\n=== {args.job} (mode={args.mode}) ===")
 
     print(f"  FIO:   read_ios={fio['read_ios']}  read_bytes={fio['read_bytes']}"
           f"  write_ios={fio['write_ios']}  write_bytes={fio['write_bytes']}")

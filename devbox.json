@@ -5,7 +5,13 @@
 
     "bpftrace": {},
     "sysstat": {},
-    "fio": {}
+    "fio": {},
+
+    "clang_18": {},
+    "bpftools": {},
+    "libbpf": {},
+    "elfutils": {},
+    "zlib": {}
   },
   "env_from": "./.env",
   "env": {

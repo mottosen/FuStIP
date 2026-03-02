@@ -315,6 +315,32 @@ def derive_throughput(counters, duration_s, count_map, bytes_map):
     return {"iops": iops, "throughput_mb_s": throughput}
 
 
+def raw_values_to_hist_buckets(values):
+    """Bin raw numeric values into power-of-2 histogram buckets.
+
+    Matches the bucket format used by bpftrace's hist() function.
+    Returns: [{"lo": int, "hi": int, "count": int}, ...]
+    """
+    if not values:
+        return []
+
+    buckets = {}
+    for v in values:
+        if v <= 0:
+            lo, hi = 0, 1
+        else:
+            exp = int(math.floor(math.log2(v)))
+            lo = 1 << exp
+            hi = 1 << (exp + 1)
+        key = (lo, hi)
+        buckets[key] = buckets.get(key, 0) + 1
+
+    result = []
+    for (lo, hi), count in sorted(buckets.items()):
+        result.append({"lo": lo, "hi": hi, "count": count})
+    return result
+
+
 def series_stats(values):
     """Compute stats from a plain list of numeric values.
 

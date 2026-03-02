@@ -10,6 +10,13 @@ endif
 
 MAKE := $(MAKE) $(MAKE_FLAGS)
 
+MODE ?= summary
+ifneq ($(MODE),summary)
+ifneq ($(MODE),detailed)
+$(error MODE must be 'summary' or 'detailed' (got '$(MODE)'))
+endif
+endif
+
 FS_DIR = ../../layers/fs
 
 FIO_OUT = fs-fio_out.json
@@ -50,24 +57,33 @@ endif
 # ── Per-job pattern ──
 # Each target: start collection → run fio → stop collection → check results
 
+ifeq ($(MODE),detailed)
+    FS_OUT_FLAG = --fs-out $(RESULTS_DIR)/fs/detailed-stats.json
+    MODE_FLAG = --mode detailed
+else
+    FS_OUT_FLAG = --fs-out $(RESULTS_DIR)/fs/trace.out
+    MODE_FLAG =
+endif
+
 define JOB_TEMPLATE
 .PHONY: $(1)
 $(1): ensure-sudo
 	$(Q)echo -e "\n============================================================"
-	$(Q)echo -e "  Running: $(1)"
+	$(Q)echo -e "  Running: $(1)  [mode=$(MODE)]"
 	$(Q)echo -e "============================================================\n"
 	$(Q)$(MAKE) reset-results
-	$(Q)$(MAKE) -C $(FS_DIR) start-collection RESULTS_DIR=$(RESULTS_DIR) $(REDIRECT)
+	$(Q)$(MAKE) -C $(FS_DIR) start-collection MODE=$(MODE) RESULTS_DIR=$(RESULTS_DIR) $(REDIRECT)
 	$(Q)sleep 5
 	$(Q)sudo fio ./jobs.fio --filename=$(FIO_FILE) \
 		--output-format=json --output=$(FIO_OUT) \
 		--section=$(1)
 	$(Q)sleep 1
-	$(Q)$(MAKE) -C $(FS_DIR) stop-collection $(REDIRECT)
+	$(Q)$(MAKE) -C $(FS_DIR) stop-collection MODE=$(MODE) $(REDIRECT)
 	$(Q)sleep 1
 	$(Q)python check_test.py --job $(1) \
 		--fio-json $(FIO_OUT) \
-		--fs-out $(RESULTS_DIR)/fs/trace.out
+		$(FS_OUT_FLAG) \
+		$(MODE_FLAG)
 endef
 
 $(foreach job,$(VAL_JOBS) $(WORK_JOBS),$(eval $(call JOB_TEMPLATE,$(job))))

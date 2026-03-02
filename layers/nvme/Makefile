@@ -10,6 +10,13 @@ endif
 
 MAKE := $(MAKE) $(MAKE_FLAGS)
 
+MODE ?= summary
+ifneq ($(MODE),summary)
+ifneq ($(MODE),detailed)
+$(error MODE must be 'summary' or 'detailed' (got '$(MODE)'))
+endif
+endif
+
 BPFTRACE := $(shell which bpftrace)
 PIDS_DIR = /tmp/bpftrace_nvme-pids
 
@@ -44,9 +51,21 @@ ifndef DEV_FILTER
 	$(error DEV_FILTER is not set)
 endif
 
-	$(Q)echo -e "\nStarting bpftrace collection.."
-
 	$(Q)mkdir -p "$(PIDS_DIR)"
+
+ifeq ($(MODE),detailed)
+	$(Q)echo -e "\nStarting detailed collection.."
+
+	$(Q)$(MAKE) -C bpf standalone
+
+	$(Q)sudo ./bpf/c/standalone \
+		-o "$(RESULTS_DIR)/nvme/detailed.csv" \
+		-f $(DEV_FILTER) \
+		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/detailed.pid"
+
+	$(Q)echo -e "Detailed collection is running!\n"
+else
+	$(Q)echo -e "\nStarting bpftrace collection.."
 
 	$(Q)sudo $(BPFTRACE) ./bt/trace.bt $(DEV_FILTER) \
 		--no-warnings \
@@ -54,10 +73,11 @@ endif
 		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/trace.pid"
 
 	$(Q)echo -e "bpftrace collection is running!\n"
+endif
 
 .PHONY: stop-collection
 stop-collection:
-	$(Q)echo -e "\nStopping bpftrace collection.."
+	$(Q)echo -e "\nStopping collection.."
 
 	$(Q)for pidfile in $(PIDS_DIR)/*.pid; do \
 		if [ -f "$$pidfile" ]; then \
@@ -77,6 +97,10 @@ stop-collection:
 generate-stats: ensure-results-exists
 	$(Q)echo -e "\nGenerating nvme layer stats.."
 
-	$(Q)python "./util/generate_stats.py" "$(RESULTS_DIR)"
+ifeq ($(MODE),detailed)
+	$(Q)python "./util/generate_detailed_stats.py" "$(RESULTS_DIR)"
+else
+	$(Q)python "./util/generate_summary_stats.py" "$(RESULTS_DIR)"
+endif
 
 	$(Q)echo -e "Stats generated!\n"
