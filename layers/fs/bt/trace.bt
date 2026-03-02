@@ -1,0 +1,250 @@
+config =
+{
+    unstable_tseries=enable;
+}
+
+BEGIN
+{
+    print("bpftrace - FS Layer\n");
+
+    @comm_filter = $1;
+}
+
+// ── read() ──
+
+tracepoint:syscalls:sys_enter_read
+/ strcontains(@comm_filter, comm) /
+{
+    @sc_entered["read"] = count();
+    @read_start[tid] = nsecs;
+}
+
+tracepoint:syscalls:sys_exit_read
+/ strcontains(@comm_filter, comm) /
+{
+    $now = nsecs;
+    $ret = (int64)args.ret;
+
+    if (@read_start[tid])
+    {
+        @sc_completed["read"] = count();
+
+        if ($ret >= 0)
+        {
+            @sc_latencies["read"] = hist($now - @read_start[tid]);
+            @sc_sizes["read"] = hist($ret);
+            @sc_total_bytes["read"] = sum($ret);
+        }
+
+        delete(@read_start[tid]);
+    }
+    else
+    {
+        @sc_untracked["read"] = count();
+    }
+}
+
+// ── write() ──
+
+tracepoint:syscalls:sys_enter_write
+/ strcontains(@comm_filter, comm) /
+{
+    @sc_entered["write"] = count();
+    @write_start[tid] = nsecs;
+}
+
+tracepoint:syscalls:sys_exit_write
+/ strcontains(@comm_filter, comm) /
+{
+    $now = nsecs;
+    $ret = (int64)args.ret;
+
+    if (@write_start[tid])
+    {
+        @sc_completed["write"] = count();
+
+        if ($ret >= 0)
+        {
+            @sc_latencies["write"] = hist($now - @write_start[tid]);
+            @sc_sizes["write"] = hist($ret);
+            @sc_total_bytes["write"] = sum($ret);
+        }
+
+        delete(@write_start[tid]);
+    }
+    else
+    {
+        @sc_untracked["write"] = count();
+    }
+}
+
+// ── pread64() ──
+
+tracepoint:syscalls:sys_enter_pread64
+/ strcontains(@comm_filter, comm) /
+{
+    @sc_entered["pread64"] = count();
+    @pread_start[tid] = nsecs;
+}
+
+tracepoint:syscalls:sys_exit_pread64
+/ strcontains(@comm_filter, comm) /
+{
+    $now = nsecs;
+    $ret = (int64)args.ret;
+
+    if (@pread_start[tid])
+    {
+        @sc_completed["pread64"] = count();
+
+        if ($ret >= 0)
+        {
+            @sc_latencies["pread64"] = hist($now - @pread_start[tid]);
+            @sc_sizes["pread64"] = hist($ret);
+            @sc_total_bytes["pread64"] = sum($ret);
+        }
+
+        delete(@pread_start[tid]);
+    }
+    else
+    {
+        @sc_untracked["pread64"] = count();
+    }
+}
+
+// ── pwrite64() ──
+
+tracepoint:syscalls:sys_enter_pwrite64
+/ strcontains(@comm_filter, comm) /
+{
+    @sc_entered["pwrite64"] = count();
+    @pwrite_start[tid] = nsecs;
+}
+
+tracepoint:syscalls:sys_exit_pwrite64
+/ strcontains(@comm_filter, comm) /
+{
+    $now = nsecs;
+    $ret = (int64)args.ret;
+
+    if (@pwrite_start[tid])
+    {
+        @sc_completed["pwrite64"] = count();
+
+        if ($ret >= 0)
+        {
+            @sc_latencies["pwrite64"] = hist($now - @pwrite_start[tid]);
+            @sc_sizes["pwrite64"] = hist($ret);
+            @sc_total_bytes["pwrite64"] = sum($ret);
+        }
+
+        delete(@pwrite_start[tid]);
+    }
+    else
+    {
+        @sc_untracked["pwrite64"] = count();
+    }
+}
+
+// ── Additional syscall counts (enter-only) ──
+
+tracepoint:syscalls:sys_enter_openat
+/ strcontains(@comm_filter, comm) /
+{
+    @sc_count["openat"] = count();
+}
+
+tracepoint:syscalls:sys_enter_close
+/ strcontains(@comm_filter, comm) /
+{
+    @sc_count["close"] = count();
+}
+
+tracepoint:syscalls:sys_enter_lseek
+/ strcontains(@comm_filter, comm) /
+{
+    @sc_count["lseek"] = count();
+}
+
+tracepoint:syscalls:sys_enter_newfstatat
+/ strcontains(@comm_filter, comm) /
+{
+    @sc_count["newfstatat"] = count();
+}
+
+tracepoint:syscalls:sys_enter_newfstat
+/ strcontains(@comm_filter, comm) /
+{
+    @sc_count["newfstat"] = count();
+}
+
+tracepoint:syscalls:sys_enter_unlinkat
+/ strcontains(@comm_filter, comm) /
+{
+    @sc_count["unlinkat"] = count();
+}
+
+tracepoint:syscalls:sys_enter_mkdirat
+/ strcontains(@comm_filter, comm) /
+{
+    @sc_count["mkdirat"] = count();
+}
+
+tracepoint:syscalls:sys_enter_mmap
+/ strcontains(@comm_filter, comm) /
+{
+    @sc_count["mmap"] = count();
+}
+
+tracepoint:syscalls:sys_enter_munmap
+/ strcontains(@comm_filter, comm) /
+{
+    @sc_count["munmap"] = count();
+}
+
+// ── Inflight time-series ──
+
+interval:s:1
+{
+    @sc_inflight["read"] = tseries(@sc_entered["read"] - @sc_completed["read"], 1s, 120);
+    @sc_inflight["write"] = tseries(@sc_entered["write"] - @sc_completed["write"], 1s, 120);
+    @sc_inflight["pread64"] = tseries(@sc_entered["pread64"] - @sc_completed["pread64"], 1s, 120);
+    @sc_inflight["pwrite64"] = tseries(@sc_entered["pwrite64"] - @sc_completed["pwrite64"], 1s, 120);
+}
+
+// ── Output ──
+
+END
+{
+    print(@sc_entered);
+    print(@sc_completed);
+    print(@sc_untracked);
+    print(@sc_count);
+    print("");
+
+    print(@sc_total_bytes);
+    print("");
+
+    print(@sc_sizes);
+    print(@sc_latencies);
+    print(@sc_inflight);
+
+
+    clear(@sc_latencies);
+    clear(@sc_sizes);
+    clear(@sc_total_bytes);
+
+    clear(@read_start);
+    clear(@write_start);
+    clear(@pread_start);
+    clear(@pwrite_start);
+
+    clear(@sc_entered);
+    clear(@sc_completed);
+    clear(@sc_untracked);
+    clear(@sc_count);
+
+    clear(@sc_inflight);
+
+    delete(@comm_filter);
+}

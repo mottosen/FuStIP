@@ -7,8 +7,10 @@
     "sysstat": {},
     "fio": {}
   },
+  "env_from": "./.env",
   "env": {
     "ROOT_DIR": "$PWD",
+    "RESULTS_DIR": "$PWD/results",
 
     "VENV_DIR": "./.venv",
     "PIP_REQUIRE_VIRTUALENV": "true",
@@ -18,6 +20,8 @@
     "init_hook": [
       "if [ ! -d \"$VENV_DIR\" ]; then python -m venv \"$VENV_DIR\"; fi",
       ". $VENV_DIR/bin/activate",
+
+      "mkdir -p $RESULTS_DIR",
 
       "clear",
       "echo -e \"\\nDevbox started!\""
