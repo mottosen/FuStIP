@@ -171,49 +171,81 @@ def percentile(sorted_values, p):
     return sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac
 
 
-def histogram_stats(buckets):
-    """Compute stats from a histogram bucket list.
+def histogram_stats(hist_data):
+    """Compute stats from histogram data (points + ranges).
 
-    Input: [{"lo": int, "hi": int, "count": int}, ...]
+    Input: {"points": [{"value": int, "count": int}, ...],
+            "ranges": [{"lo": int, "hi": int, "count": int}, ...]}
     Output: {"count", "min", "max", "mean", "p1", "p5", "p50", "p95", "p99"}
 
-    Uses geometric midpoint for mean estimation (appropriate for power-of-2 buckets).
-    Percentiles use linear interpolation within the target bucket on log scale.
+    Points are exact 2^i values (no estimation needed).
+    Ranges use geometric midpoint for mean and log-scale interpolation for percentiles.
     """
-    total = sum(b["count"] for b in buckets)
+    points = hist_data.get("points", [])
+    ranges = hist_data.get("ranges", [])
+
+    total = (sum(p["count"] for p in points)
+             + sum(r["count"] for r in ranges))
     if total == 0:
         return {"count": 0, "min": 0, "max": 0, "mean": 0,
                 "p1": 0, "p5": 0, "p50": 0, "p95": 0, "p99": 0}
 
-    # Find min/max from first/last non-zero bucket
-    non_zero = [b for b in buckets if b["count"] > 0]
-    bmin = non_zero[0]["lo"]
-    bmax = non_zero[-1]["hi"]
+    # Find min/max
+    nz_points = [p for p in points if p["count"] > 0]
+    nz_ranges = [r for r in ranges if r["count"] > 0]
+    mins, maxs = [], []
+    if nz_points:
+        mins.append(nz_points[0]["value"])
+        maxs.append(nz_points[-1]["value"])
+    if nz_ranges:
+        mins.append(nz_ranges[0]["lo"])
+        maxs.append(nz_ranges[-1]["hi"])
+    bmin = min(mins)
+    bmax = max(maxs)
 
-    # Mean using geometric midpoint
+    # Mean: exact for points, geometric midpoint for ranges
     weighted_sum = 0.0
-    for b in buckets:
-        if b["count"] > 0:
-            if b["lo"] > 0:
-                midpoint = math.sqrt(b["lo"] * b["hi"])
+    for p in points:
+        weighted_sum += p["value"] * p["count"]
+    for r in ranges:
+        if r["count"] > 0:
+            if r["lo"] > 0:
+                midpoint = math.sqrt(r["lo"] * r["hi"])
             else:
-                midpoint = b["hi"] / 2.0
-            weighted_sum += midpoint * b["count"]
+                midpoint = r["hi"] / 2.0
+            weighted_sum += midpoint * r["count"]
     mean = weighted_sum / total
 
-    # Percentiles via CDF interpolation
+    # Merge points and ranges into sorted order for percentile walk.
+    # A point at value V sorts before a range starting at V.
+    entries = []
+    for p in points:
+        if p["count"] > 0:
+            entries.append(("point", p["value"], p["count"]))
+    for r in ranges:
+        if r["count"] > 0:
+            entries.append(("range", r["lo"], r["hi"], r["count"]))
+    entries.sort(key=lambda e: (e[1], 0 if e[0] == "point" else 1))
+
     def hist_percentile(p_val):
         target = p_val / 100.0 * total
         cumulative = 0
-        for b in buckets:
+        for entry in entries:
             prev_cumulative = cumulative
-            cumulative += b["count"]
-            if cumulative >= target and b["count"] > 0:
-                fraction = (target - prev_cumulative) / b["count"]
-                if b["lo"] > 0:
-                    return b["lo"] * math.pow(b["hi"] / b["lo"], fraction)
-                else:
-                    return b["hi"] * fraction
+            if entry[0] == "point":
+                _, value, count = entry
+                cumulative += count
+                if cumulative >= target:
+                    return value
+            else:
+                _, lo, hi, count = entry
+                cumulative += count
+                if cumulative >= target:
+                    fraction = (target - prev_cumulative) / count
+                    if lo > 0:
+                        return lo * math.pow(hi / lo, fraction)
+                    else:
+                        return hi * fraction
         return bmax
 
     return {
@@ -229,6 +261,13 @@ def histogram_stats(buckets):
     }
 
 
+def _trapezoidal_auc(values):
+    """Trapezoidal integration for uniformly-spaced (1-second) samples."""
+    if len(values) <= 1:
+        return sum(values)
+    return values[0] / 2 + sum(values[1:-1]) + values[-1] / 2
+
+
 def tseries_stats(points):
     """Compute stats from a time-series point list.
 
@@ -236,7 +275,7 @@ def tseries_stats(points):
     Output: {"count", "min", "max", "mean", "p1", "p5", "p50", "p95", "p99",
              "area_under_curve"}
 
-    area_under_curve = sum of values (1-second intervals assumed).
+    area_under_curve uses trapezoidal rule (1-second intervals assumed).
     """
     if not points:
         return {"count": 0, "min": 0, "max": 0, "mean": 0,
@@ -258,7 +297,7 @@ def tseries_stats(points):
         "p50": round(percentile(sorted_vals, 50), 2),
         "p95": round(percentile(sorted_vals, 95), 2),
         "p99": round(percentile(sorted_vals, 99), 2),
-        "area_under_curve": total,
+        "area_under_curve": _trapezoidal_auc(values),
     }
 
 
@@ -315,10 +354,46 @@ def derive_throughput(counters, duration_s, count_map, bytes_map):
     return {"iops": iops, "throughput_mb_s": throughput}
 
 
+def raw_values_to_hist(values):
+    """Bin raw numeric values into exact 2^i points and inter-power ranges.
+
+    Values that are exactly a power of 2 become points; all others fall into
+    the range (2^i, 2^(i+1)) between the two nearest powers.
+
+    Returns: {"points": [{"value": int, "count": int}, ...],
+              "ranges": [{"lo": int, "hi": int, "count": int}, ...]}
+    """
+    if not values:
+        return {"points": [], "ranges": []}
+
+    pts = {}
+    rngs = {}
+    for v in values:
+        if v <= 0:
+            rngs[(0, 1)] = rngs.get((0, 1), 0) + 1
+        else:
+            exp = int(math.floor(math.log2(v)))
+            power = 1 << exp
+            if v == power:
+                pts[v] = pts.get(v, 0) + 1
+            else:
+                hi = 1 << (exp + 1)
+                rngs[(power, hi)] = rngs.get((power, hi), 0) + 1
+
+    return {
+        "points": [{"value": v, "count": c}
+                    for v, c in sorted(pts.items())],
+        "ranges": [{"lo": lo, "hi": hi, "count": c}
+                    for (lo, hi), c in sorted(rngs.items())],
+    }
+
+
 def raw_values_to_hist_buckets(values):
     """Bin raw numeric values into power-of-2 histogram buckets.
 
-    Matches the bucket format used by bpftrace's hist() function.
+    All values in [2^i, 2^(i+1)) go into one bucket (no point/range split).
+    Use for latency histograms where exact-power hits are not meaningful.
+
     Returns: [{"lo": int, "hi": int, "count": int}, ...]
     """
     if not values:
@@ -335,10 +410,8 @@ def raw_values_to_hist_buckets(values):
         key = (lo, hi)
         buckets[key] = buckets.get(key, 0) + 1
 
-    result = []
-    for (lo, hi), count in sorted(buckets.items()):
-        result.append({"lo": lo, "hi": hi, "count": count})
-    return result
+    return [{"lo": lo, "hi": hi, "count": c}
+            for (lo, hi), c in sorted(buckets.items())]
 
 
 def series_stats(values):
@@ -365,4 +438,148 @@ def series_stats(values):
         "p50": round(percentile(sorted_vals, 50), 2),
         "p95": round(percentile(sorted_vals, 95), 2),
         "p99": round(percentile(sorted_vals, 99), 2),
+    }
+
+
+# ── Wrappers that preserve raw data alongside stats ──
+
+
+def histogram_with_data(hist_data):
+    """Wrap histogram data (points + ranges) with computed stats.
+
+    Input: {"points": [...], "ranges": [...]}
+    Returns: {"points": [...], "ranges": [...], "stats": {...}}
+    """
+    return {
+        "points": hist_data["points"],
+        "ranges": hist_data["ranges"],
+        "stats": histogram_stats(hist_data),
+    }
+
+
+def histogram_with_buckets(buckets):
+    """Wrap bucket-only histogram data with computed stats.
+
+    For histograms where point/range splitting is not meaningful (e.g. latencies).
+    Input: [{"lo": int, "hi": int, "count": int}, ...]
+    Returns: {"buckets": [...], "stats": {...}}
+    """
+    return {
+        "buckets": buckets,
+        "stats": histogram_stats({"points": [], "ranges": buckets}),
+    }
+
+
+def _time_to_secs(t):
+    """Parse a time string (HH:MM:SS or HH:MM:SS AM/PM) to seconds."""
+    parts = t.strip().split()
+    h, m, s = (int(x) for x in parts[0].split(":"))
+    if len(parts) > 1:
+        ampm = parts[1].upper()
+        if ampm == "PM" and h != 12:
+            h += 12
+        elif ampm == "AM" and h == 12:
+            h = 0
+    return h * 3600 + m * 60 + s
+
+
+def _normalize_times(points):
+    """Convert time-series points to relative timestamps starting at 00:00:00."""
+    if not points:
+        return points
+    base = _time_to_secs(points[0]["time"])
+    result = []
+    for p in points:
+        offset = _time_to_secs(p["time"]) - base
+        h, rem = divmod(offset, 3600)
+        m, s = divmod(rem, 60)
+        result.append({"time": f"{h:02d}:{m:02d}:{s:02d}", "value": p["value"]})
+    return result
+
+
+def tseries_with_points(points):
+    """Wrap tseries_stats with the raw point data.
+
+    Timestamps are normalized to be relative to 0 (00:00:00).
+    Returns: {"points": [...], "stats": {...}}
+    """
+    normalized = _normalize_times(points)
+    return {"points": normalized, "stats": tseries_stats(normalized)}
+
+
+# ── Access pattern analysis ──
+
+
+def compute_access_pattern(sectors, bytes_list):
+    """Compute sequential/random access pattern from sector addresses.
+
+    For consecutive IOs (already sorted by timestamp):
+      gap = abs(sector[i+1] - (sector[i] + bytes[i] // 512))
+      gap == 0 → sequential, gap > 0 → random
+
+    Returns: {"total_ios", "sequential_count", "random_count",
+              "sequential_pct", "random_pct",
+              "gap_histogram": {"points": [...], "ranges": [...], "stats": {...}}}
+    """
+    n = len(sectors)
+    if n < 2:
+        empty = {"points": [], "ranges": []}
+        return {"total_ios": n, "sequential_count": 0, "random_count": 0,
+                "sequential_pct": 0, "random_pct": 0,
+                "gap_histogram": {**empty, "stats": histogram_stats(empty)}}
+
+    gaps = []
+    for i in range(n - 1):
+        expected_next = sectors[i] + bytes_list[i] // 512
+        gap = abs(sectors[i + 1] - expected_next)
+        gaps.append(gap)
+
+    seq_count = sum(1 for g in gaps if g == 0)
+    rnd_count = len(gaps) - seq_count
+    total_gaps = len(gaps)
+
+    return {
+        "total_ios": n,
+        "sequential_count": seq_count,
+        "random_count": rnd_count,
+        "sequential_pct": round(100 * seq_count / total_gaps, 2),
+        "random_pct": round(100 * rnd_count / total_gaps, 2),
+        "gap_histogram": histogram_with_data(raw_values_to_hist(gaps)),
+    }
+
+
+def compute_fs_access_pattern(offsets, bytes_list):
+    """Compute sequential/random access pattern from byte offsets.
+
+    Same logic as compute_access_pattern but uses byte offsets directly
+    (for pread64/pwrite64 which have explicit file offsets).
+
+    gap = abs(offset[i+1] - (offset[i] + bytes[i]))
+
+    Returns: same structure as compute_access_pattern.
+    """
+    n = len(offsets)
+    if n < 2:
+        empty = {"points": [], "ranges": []}
+        return {"total_ios": n, "sequential_count": 0, "random_count": 0,
+                "sequential_pct": 0, "random_pct": 0,
+                "gap_histogram": {**empty, "stats": histogram_stats(empty)}}
+
+    gaps = []
+    for i in range(n - 1):
+        expected_next = offsets[i] + bytes_list[i]
+        gap = abs(offsets[i + 1] - expected_next)
+        gaps.append(gap)
+
+    seq_count = sum(1 for g in gaps if g == 0)
+    rnd_count = len(gaps) - seq_count
+    total_gaps = len(gaps)
+
+    return {
+        "total_ios": n,
+        "sequential_count": seq_count,
+        "random_count": rnd_count,
+        "sequential_pct": round(100 * seq_count / total_gaps, 2),
+        "random_pct": round(100 * rnd_count / total_gaps, 2),
+        "gap_histogram": histogram_with_data(raw_values_to_hist(gaps)),
     }

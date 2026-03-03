@@ -16,9 +16,13 @@ from pathlib import Path
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
-from stats_generation.shared import (derive_throughput, histogram_stats,
+from stats_generation.shared import (compute_fs_access_pattern,
+                                     derive_throughput,
+                                     histogram_with_buckets,
+                                     histogram_with_data,
+                                     raw_values_to_hist,
                                      raw_values_to_hist_buckets,
-                                     tseries_stats)
+                                     tseries_with_points)
 
 LAYER_PREFIX = "fs"
 
@@ -83,14 +87,16 @@ def generate_stats(csv_path):
     if len(lat_exits) > 0:
         result["histograms"]["sc_latencies"] = {}
         for sc, group in lat_exits.groupby("syscall"):
-            buckets = raw_values_to_hist_buckets(group["latency_ns"].tolist())
-            result["histograms"]["sc_latencies"][sc] = histogram_stats(buckets)
+            result["histograms"]["sc_latencies"][sc] = histogram_with_buckets(
+                raw_values_to_hist_buckets(group["latency_ns"].tolist())
+            )
 
     if len(positive_exits) > 0:
         result["histograms"]["sc_sizes"] = {}
         for sc, group in positive_exits.groupby("syscall"):
-            buckets = raw_values_to_hist_buckets(group["bytes"].tolist())
-            result["histograms"]["sc_sizes"][sc] = histogram_stats(buckets)
+            result["histograms"]["sc_sizes"][sc] = histogram_with_data(
+                raw_values_to_hist(group["bytes"].tolist())
+            )
 
     # Inflight time-series (IO syscalls only)
     if len(io_enters) > 0 and len(io_exits) > 0:
@@ -113,7 +119,22 @@ def generate_stats(csv_path):
                 t += window_ns
                 sec += 1
             if points:
-                result["tseries"]["sc_inflight"][sc] = tseries_stats(points)
+                result["tseries"]["sc_inflight"][sc] = tseries_with_points(points)
+
+    # Access pattern (sequential/random from byte offsets, pread64/pwrite64 only)
+    offset_syscalls = {"pread64", "pwrite64"}
+    offset_exits = io_exits[
+        io_exits["syscall"].isin(offset_syscalls) & io_exits["offset"].notna()
+    ]
+    if len(offset_exits) >= 2 and "offset" in offset_exits.columns:
+        result["access_pattern"] = {"sc_offsets": {}}
+        for sc, group in offset_exits.sort_values("timestamp_ns").groupby("syscall"):
+            offsets = group["offset"].astype(int).tolist()
+            bytes_list = group["bytes"].astype(int).tolist()
+            if len(offsets) >= 2:
+                result["access_pattern"]["sc_offsets"][sc] = compute_fs_access_pattern(
+                    offsets, bytes_list
+                )
 
     return result
 

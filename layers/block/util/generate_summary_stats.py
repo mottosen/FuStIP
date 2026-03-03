@@ -15,9 +15,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from stats_generation.shared import (compute_duration_from_tseries,
-                                     derive_throughput, histogram_stats,
+                                     derive_throughput,
+                                     histogram_with_buckets,
                                      parse_counters, parse_histograms,
-                                     parse_tseries, tseries_stats)
+                                     parse_tseries, tseries_with_points)
 
 LAYER_PREFIX = "block"
 
@@ -59,14 +60,14 @@ def generate_stats(input_path):
         if m in histograms:
             result["histograms"][m] = {}
             for key, buckets in histograms[m].items():
-                result["histograms"][m][key] = histogram_stats(buckets)
+                result["histograms"][m][key] = histogram_with_buckets(buckets)
 
     # Time-series stats
     for m in TSERIES_MAPS:
         if m in tseries:
             result["tseries"][m] = {}
             for key, points in tseries[m].items():
-                result["tseries"][m][key] = tseries_stats(points)
+                result["tseries"][m][key] = tseries_with_points(points)
 
     return result
 

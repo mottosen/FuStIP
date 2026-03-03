@@ -16,9 +16,13 @@ from pathlib import Path
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
-from stats_generation.shared import (derive_throughput, histogram_stats,
+from stats_generation.shared import (compute_access_pattern,
+                                     derive_throughput,
+                                     histogram_with_buckets,
+                                     histogram_with_data,
+                                     raw_values_to_hist,
                                      raw_values_to_hist_buckets,
-                                     tseries_stats)
+                                     tseries_with_points)
 
 LAYER_PREFIX = "nvme"
 
@@ -66,14 +70,16 @@ def generate_stats(csv_path):
     if len(cmd_lat) > 0:
         result["histograms"]["cmd_latencies"] = {}
         for op, group in cmd_lat.groupby("op"):
-            buckets = raw_values_to_hist_buckets(group["latency_ns"].tolist())
-            result["histograms"]["cmd_latencies"][op] = histogram_stats(buckets)
+            result["histograms"]["cmd_latencies"][op] = histogram_with_buckets(
+                raw_values_to_hist_buckets(group["latency_ns"].tolist())
+            )
 
     if len(complete) > 0:
         result["histograms"]["cmd_sizes"] = {}
         for op, group in complete.groupby("op"):
-            buckets = raw_values_to_hist_buckets(group["bytes"].tolist())
-            result["histograms"]["cmd_sizes"][op] = histogram_stats(buckets)
+            result["histograms"]["cmd_sizes"][op] = histogram_with_data(
+                raw_values_to_hist(group["bytes"].tolist())
+            )
 
     # Inflight time-series
     if len(all_events) > 1:
@@ -96,7 +102,18 @@ def generate_stats(csv_path):
                 t += window_ns
                 sec += 1
             if points:
-                result["tseries"]["cmd_inflight"][op] = tseries_stats(points)
+                result["tseries"]["cmd_inflight"][op] = tseries_with_points(points)
+
+    # Access pattern (sequential/random from sector addresses)
+    if len(complete) > 0 and "sector" in complete.columns:
+        result["access_pattern"] = {"cmd_sectors": {}}
+        for op, group in complete.sort_values("timestamp_ns").groupby("op"):
+            sectors = group["sector"].dropna().astype(int).tolist()
+            bytes_list = group.loc[group["sector"].notna(), "bytes"].astype(int).tolist()
+            if len(sectors) >= 2:
+                result["access_pattern"]["cmd_sectors"][op] = compute_access_pattern(
+                    sectors, bytes_list
+                )
 
     return result
 
