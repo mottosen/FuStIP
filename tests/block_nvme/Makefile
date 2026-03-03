@@ -20,7 +20,7 @@ endif
 BLOCK_DIR = ../../layers/block
 NVME_DIR = ../../layers/nvme
 
-FIO_OUT = block_nvme-fio_out.json
+FIO_OUT = $(RESULTS_DIR)/fio/block_nvme-fio_out.json
 
 VAL_JOBS = val_seqread val_seqwrite val_randread val_randwrite val_randrw
 WORK_JOBS = work_index_search work_bulk_insert work_compaction work_query_insert work_scan work_high_qd
@@ -78,6 +78,7 @@ $(1): ensure-sudo
 	$(Q)$(MAKE) -C $(BLOCK_DIR) start-collection MODE=$(MODE) RESULTS_DIR=$(RESULTS_DIR) $(REDIRECT)
 	$(Q)$(MAKE) -C $(NVME_DIR) start-collection MODE=$(MODE) RESULTS_DIR=$(RESULTS_DIR) $(REDIRECT)
 	$(Q)sleep 5
+	$(Q)mkdir -p $(RESULTS_DIR)/fio
 	$(Q)sudo fio ./jobs.fio --filename=$(FIO_FILE) \
 		--output-format=json --output=$(FIO_OUT) \
 		--section=$(1)
