@@ -22,7 +22,7 @@ NVME_DIR = ../../layers/nvme
 
 FIO_OUT = $(RESULTS_DIR)/fio/block_nvme-fio_out.json
 
-VAL_JOBS = val_seqread val_seqwrite val_randread val_randwrite val_randrw
+VAL_JOBS = val_seqread val_seqwrite val_randread val_randwrite val_randrw val_high_qd
 WORK_JOBS = work_index_search work_bulk_insert work_compaction work_query_insert work_scan work_high_qd
 
 .NOTPARALLEL:

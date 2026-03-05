@@ -1,8 +1,6 @@
 [global]
 ; ── Target ──
 size=1G
-time_based=1
-runtime=10
 
 ; ── Engine ──
 ioengine=io_uring
@@ -67,6 +65,15 @@ bs=4k
 iodepth=1
 stonewall
 
+; High QD stress — maximize NVMe inflights (4 threads × QD256 = 1024 slots)
+[val_high_qd]
+rw=randread
+bs=4k
+iodepth=256
+numjobs=4
+size=16G
+stonewall
+
 
 ; ============================================================
 ;  B  Workloads — VDB-like heavy IO patterns
@@ -75,6 +82,7 @@ stonewall
 
 ; ANN vector search — random 4K reads across index structures
 [work_index_search]
+time_based=1
 rw=randread
 bs=4k
 iodepth=64
@@ -84,6 +92,7 @@ stonewall
 
 ; Batch vector insert — sequential large writes
 [work_bulk_insert]
+time_based=1
 rw=write
 bs=128k
 iodepth=32
@@ -93,6 +102,7 @@ stonewall
 
 ; Background compaction — read old segments, write new ones
 [work_compaction]
+time_based=1
 rw=randrw
 rwmixread=50
 bs=128k
@@ -103,6 +113,7 @@ stonewall
 
 ; Concurrent queries (reads) + inserts (writes)
 [work_query_insert]
+time_based=1
 rw=randrw
 rwmixread=70
 bs=4k
@@ -113,6 +124,7 @@ stonewall
 
 ; Full table/partition sequential scan
 [work_scan]
+time_based=1
 rw=read
 bs=128k
 iodepth=64
@@ -122,9 +134,11 @@ stonewall
 
 ; Stress test — max inflight random reads
 [work_high_qd]
-rw=randread
+time_based=1
+rw=randrw
 bs=4k
 iodepth=256
+numjobs=8
 size=16G
 runtime=30
 stonewall
