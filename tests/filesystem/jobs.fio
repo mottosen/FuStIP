@@ -129,12 +129,13 @@ size=4G
 runtime=30
 stonewall
 
-; Stress test — max inflight random reads
+; Stress test — max inflight random reads/writes (8 threads)
 [work_high_qd]
 time_based=1
-rw=randread
+rw=randrw
 bs=4k
 iodepth=256
+numjobs=8
 size=4G
 runtime=30
 stonewall
