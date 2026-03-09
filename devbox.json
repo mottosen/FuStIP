@@ -36,7 +36,8 @@
       "update_pip": [
         "python -m pip install --upgrade pip",
         "python -m pip install -r $PIP_REQUIRE_FILE"
-      ]
+      ],
+      "install_ig": ["make -C ./subs/inspektor-gadget ig"]
     }
   }
 }

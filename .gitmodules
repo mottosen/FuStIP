@@ -1,0 +1,3 @@
+[submodule "subs/inspektor-gadget"]
+	path = subs/inspektor-gadget
+	url = git@github.com:inspektor-gadget/inspektor-gadget.git
