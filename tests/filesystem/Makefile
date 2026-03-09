@@ -10,9 +10,17 @@ endif
 
 MAKE := $(MAKE) $(MAKE_FLAGS)
 
-FS_DIR = ../../layers/fs
+MODE ?= summary
+ifneq ($(MODE),summary)
+ifneq ($(MODE),detailed)
+$(error MODE must be 'summary' or 'detailed' (got '$(MODE)'))
+endif
+endif
 
-FIO_OUT = fs-fio_out.json
+FS_DIR = ../../layers/fs
+SYSSTAT_DIR = ../../layers/sysstat
+
+FIO_OUT = $(RESULTS_DIR)/fio/fs-fio_out.json
 
 VAL_JOBS = val_seqread val_seqwrite val_randread val_randwrite val_randrw
 WORK_JOBS = work_index_search work_bulk_insert work_compaction work_query_insert work_scan work_high_qd
@@ -50,24 +58,36 @@ endif
 # ── Per-job pattern ──
 # Each target: start collection → run fio → stop collection → check results
 
+ifeq ($(MODE),detailed)
+    FS_OUT_FLAG = --fs-out $(RESULTS_DIR)/fs/detailed-stats.json
+    MODE_FLAG = --mode detailed
+else
+    FS_OUT_FLAG = --fs-out $(RESULTS_DIR)/fs/trace.out
+    MODE_FLAG =
+endif
+
 define JOB_TEMPLATE
 .PHONY: $(1)
 $(1): ensure-sudo
 	$(Q)echo -e "\n============================================================"
-	$(Q)echo -e "  Running: $(1)"
+	$(Q)echo -e "  Running: $(1)  [mode=$(MODE)]"
 	$(Q)echo -e "============================================================\n"
 	$(Q)$(MAKE) reset-results
-	$(Q)$(MAKE) -C $(FS_DIR) start-collection RESULTS_DIR=$(RESULTS_DIR) $(REDIRECT)
+	$(Q)$(MAKE) -C $(FS_DIR) start-collection MODE=$(MODE) RESULTS_DIR=$(RESULTS_DIR) $(REDIRECT)
+	$(Q)$(MAKE) -C $(SYSSTAT_DIR) start-collection RESULTS_DIR=$(RESULTS_DIR) $(REDIRECT)
 	$(Q)sleep 5
+	$(Q)mkdir -p $(RESULTS_DIR)/fio
 	$(Q)sudo fio ./jobs.fio --filename=$(FIO_FILE) \
 		--output-format=json --output=$(FIO_OUT) \
 		--section=$(1)
 	$(Q)sleep 1
-	$(Q)$(MAKE) -C $(FS_DIR) stop-collection $(REDIRECT)
+	$(Q)$(MAKE) -C $(SYSSTAT_DIR) stop-collection $(REDIRECT)
+	$(Q)$(MAKE) -C $(FS_DIR) stop-collection MODE=$(MODE) $(REDIRECT)
 	$(Q)sleep 1
 	$(Q)python check_test.py --job $(1) \
 		--fio-json $(FIO_OUT) \
-		--fs-out $(RESULTS_DIR)/fs/trace.out
+		$(FS_OUT_FLAG) \
+		$(MODE_FLAG)
 endef
 
 $(foreach job,$(VAL_JOBS) $(WORK_JOBS),$(eval $(call JOB_TEMPLATE,$(job))))

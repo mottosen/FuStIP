@@ -17,7 +17,7 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
-from stats_generation.shared import series_stats
+from stats_generation.shared import tseries_with_points
 
 
 def parse_csv(path, processes=None):
@@ -44,74 +44,81 @@ def compute_duration(rows, time_field="time"):
     return len(times) - 1
 
 
-def cpu_stats(rows):
-    """Compute per-command CPU stats.
+def cpu_stats(rows, duration_s):
+    """Compute per-command CPU stats as time-series with AUC.
 
-    CPU rows are per-thread (tid). For each timestamp, sum cpu_pct across
-    all threads of the same TGID/command, then compute stats across timestamps.
+    CPU rows are per-thread (tid). For each timestamp, sum metrics across
+    all threads of the same command, then produce time-series points + stats.
     """
-    # Group: command -> time -> list of cpu_pct values (one per thread)
-    by_cmd_time = defaultdict(lambda: defaultdict(list))
+    metrics = ["usr", "system", "guest", "wait", "cpu_pct"]
+    max_auc = round(100 * duration_s, 2)
+
+    # Aggregate: command -> time -> {metric: summed_value}
+    agg = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
     for row in rows:
-        cmd = row["command"]
-        time = row["time"]
-        by_cmd_time[cmd][time].append(float(row["cpu_pct"]))
+        cmd, time = row["command"], row["time"]
+        for metric in metrics:
+            agg[cmd][time][metric] += float(row[metric])
 
     result = {}
-    metrics = ["usr", "system", "guest", "wait", "cpu_pct"]
-
-    for cmd in by_cmd_time:
-        # For cpu_pct: sum across threads per timestamp, then stats
-        time_sums = {}
-        for time, vals in by_cmd_time[cmd].items():
-            time_sums[time] = sum(vals)
-
-        summed_values = list(time_sums.values())
-        cmd_result = {"cpu_pct": series_stats(summed_values)}
-
-        # For other metrics: also sum across threads per timestamp
-        for metric in ["usr", "system", "guest", "wait"]:
-            metric_by_time = defaultdict(float)
-            for row in rows:
-                if row["command"] == cmd:
-                    metric_by_time[row["time"]] += float(row[metric])
-            vals = list(metric_by_time.values())
-            cmd_result[metric] = series_stats(vals)
-
+    for cmd, times in agg.items():
+        cmd_result = {}
+        for metric in metrics:
+            points = [{"time": t, "value": round(times[t][metric], 2)}
+                      for t in sorted(times)]
+            entry = tseries_with_points(points)
+            entry["stats"]["max_area_under_curve"] = max_auc
+            cmd_result[metric] = entry
         result[cmd] = cmd_result
 
     return result
 
 
-def mem_stats(rows):
-    """Compute per-command memory stats."""
-    by_cmd = defaultdict(list)
+def mem_stats(rows, duration_s):
+    """Compute per-command memory stats as time-series with AUC."""
+    metrics = ["minflt_s", "majflt_s", "vsz_kb", "rss_kb", "mem_pct"]
+    max_auc = round(100 * duration_s, 2)
+
+    # Aggregate: command -> time -> {metric: summed_value}
+    agg = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
     for row in rows:
-        by_cmd[row["command"]].append(row)
+        cmd, time = row["command"], row["time"]
+        for metric in metrics:
+            agg[cmd][time][metric] += float(row[metric])
 
     result = {}
-    for cmd, cmd_rows in by_cmd.items():
+    for cmd, times in agg.items():
         cmd_result = {}
-        for metric in ["minflt_s", "majflt_s", "vsz_kb", "rss_kb", "mem_pct"]:
-            values = [float(r[metric]) for r in cmd_rows]
-            cmd_result[metric] = series_stats(values)
+        for metric in metrics:
+            points = [{"time": t, "value": round(times[t][metric], 2)}
+                      for t in sorted(times)]
+            entry = tseries_with_points(points)
+            if metric == "mem_pct":
+                entry["stats"]["max_area_under_curve"] = max_auc
+            cmd_result[metric] = entry
         result[cmd] = cmd_result
 
     return result
 
 
 def dev_stats(rows):
-    """Compute per-command device IO stats."""
-    by_cmd = defaultdict(list)
+    """Compute per-command device IO stats as time-series with AUC."""
+    metrics = ["kb_rd_s", "kb_wr_s", "kb_ccwr_s", "iodelay"]
+
+    # Aggregate: command -> time -> {metric: summed_value}
+    agg = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
     for row in rows:
-        by_cmd[row["command"]].append(row)
+        cmd, time = row["command"], row["time"]
+        for metric in metrics:
+            agg[cmd][time][metric] += float(row[metric])
 
     result = {}
-    for cmd, cmd_rows in by_cmd.items():
+    for cmd, times in agg.items():
         cmd_result = {}
-        for metric in ["kb_rd_s", "kb_wr_s", "kb_ccwr_s", "iodelay"]:
-            values = [float(r[metric]) for r in cmd_rows]
-            cmd_result[metric] = series_stats(values)
+        for metric in metrics:
+            points = [{"time": t, "value": round(times[t][metric], 2)}
+                      for t in sorted(times)]
+            cmd_result[metric] = tseries_with_points(points)
         result[cmd] = cmd_result
 
     return result
@@ -137,43 +144,32 @@ def main():
         print(f"Error: {sysstat_dir} not found", file=sys.stderr)
         sys.exit(1)
 
-    result = {"source": [], "duration_s": 0}
+    result = {"source": []}
 
-    all_rows = []
-
-    # CPU
-    cpu_path = sysstat_dir / "cpu.csv"
-    if cpu_path.exists():
-        result["source"].append("cpu.csv")
-        rows = parse_csv(cpu_path, processes)
-        all_rows.extend(rows)
-        result["cpu"] = {"per_command": cpu_stats(rows)}
-        print(f"  Processed {cpu_path.name}: {len(rows)} rows")
-
-    # Memory
-    mem_path = sysstat_dir / "mem.csv"
-    if mem_path.exists():
-        result["source"].append("mem.csv")
-        rows = parse_csv(mem_path, processes)
-        all_rows.extend(rows)
-        result["mem"] = {"per_command": mem_stats(rows)}
-        print(f"  Processed {mem_path.name}: {len(rows)} rows")
-
-    # Device IO
-    dev_path = sysstat_dir / "dev.csv"
-    if dev_path.exists():
-        result["source"].append("dev.csv")
-        rows = parse_csv(dev_path, processes)
-        all_rows.extend(rows)
-        result["dev"] = {"per_command": dev_stats(rows)}
-        print(f"  Processed {dev_path.name}: {len(rows)} rows")
+    # Read all CSVs first to compute global duration
+    csv_data = {}
+    for name, path in [("cpu", sysstat_dir / "cpu.csv"),
+                       ("mem", sysstat_dir / "mem.csv"),
+                       ("dev", sysstat_dir / "dev.csv")]:
+        if path.exists():
+            result["source"].append(f"{name}.csv")
+            csv_data[name] = parse_csv(path, processes)
+            print(f"  Processed {path.name}: {len(csv_data[name])} rows")
 
     if not result["source"]:
         print(f"No sysstat CSV files found in {sysstat_dir}")
         return
 
-    # Duration from all timestamps across all CSVs
-    result["duration_s"] = compute_duration(all_rows)
+    all_rows = [row for rows in csv_data.values() for row in rows]
+    duration_s = compute_duration(all_rows)
+    result["duration_s"] = duration_s
+
+    if "cpu" in csv_data:
+        result["cpu"] = {"per_command": cpu_stats(csv_data["cpu"], duration_s)}
+    if "mem" in csv_data:
+        result["mem"] = {"per_command": mem_stats(csv_data["mem"], duration_s)}
+    if "dev" in csv_data:
+        result["dev"] = {"per_command": dev_stats(csv_data["dev"])}
 
     output_file = sysstat_dir / "sysstat-stats.json"
     with open(output_file, "w") as f:

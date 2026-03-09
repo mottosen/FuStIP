@@ -3,3 +3,9 @@ results
 __pycache__
 *.lock
 *.swp
+
+# BPF CO-RE build artifacts
+util/bpf/include
+*.bpf.o
+*.skel.h
+layers/*/bpf/c/standalone

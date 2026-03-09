@@ -2,6 +2,7 @@
 """Compare FIO JSON output against bpftrace block/nvme profiler output.
 
 Asserts that profiler metrics match FIO-reported numbers within tolerance.
+Supports both bpftrace (summary) and detailed (CSV) modes.
 """
 
 import argparse
@@ -28,6 +29,17 @@ def parse_fio_json(path):
     }
 
 
+def parse_detailed_stats(path):
+    """Parse detailed-stats.json into the same dict format as parse_counters().
+
+    The stats JSON has: {"counters": {"rq_completed": {"read": N}, ...}}
+    We flatten to: {"rq_completed": {"read": N}, ...}
+    """
+    with open(path) as f:
+        stats = json.load(f)
+    return stats.get("counters", {})
+
+
 def get_val(data, map_name, key, default=0):
     """Safely get a value from parsed bpftrace data."""
     return data.get(map_name, {}).get(key, default)
@@ -42,8 +54,8 @@ def check_approx(label, actual, expected, tolerance):
 
     passed = pct <= tolerance
     tag = "PASS" if passed else "FAIL"
-    direction = "over" if actual > expected else "under" if actual < expected else "exact"
-    msg = f"[{tag}] {label}: {actual} vs {expected} ({pct:.2%} error, {direction})"
+    note = f"{pct:.2%} over" if actual > expected else f"{pct:.2%} under" if actual < expected else "exact"
+    msg = f"[{tag}] {label}: {actual} vs {expected} ({note})"
     if not passed:
         msg += f" — exceeds {tolerance:.0%} tolerance"
     return passed, msg
@@ -166,15 +178,23 @@ def main():
     parser.add_argument("--fio-json", required=True, help="Path to FIO JSON output")
     parser.add_argument("--block-out", required=True, help="Path to block layer output")
     parser.add_argument("--nvme-out", required=True, help="Path to NVMe layer output")
+    parser.add_argument("--mode", default="summary", choices=["summary", "detailed"],
+                        help="Profiling mode (default: summary)")
     parser.add_argument("--tolerance", type=float, default=0.02, help="Tolerance for count checks (default: 0.02)")
     args = parser.parse_args()
 
     fio = parse_fio_json(args.fio_json)
-    blk = parse_counters(args.block_out)
-    nvme = parse_counters(args.nvme_out)
+
+    if args.mode == "detailed":
+        blk = parse_detailed_stats(args.block_out)
+        nvme = parse_detailed_stats(args.nvme_out)
+    else:
+        blk = parse_counters(args.block_out)
+        nvme = parse_counters(args.nvme_out)
+
     kind = classify_job(fio)
 
-    print(f"\n=== {args.job} ===")
+    print(f"\n=== {args.job} (mode={args.mode}) ===")
 
     print(f"  FIO:   read_ios={fio['read_ios']}  read_bytes={fio['read_bytes']}"
           f"  write_ios={fio['write_ios']}  write_bytes={fio['write_bytes']}")
