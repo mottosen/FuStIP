@@ -1,0 +1,12 @@
+services:
+  fio-test:
+    container_name: fio-test
+    image: fio-test
+    build:
+      context: .
+    privileged: true
+    working_dir: /work
+    volumes:
+      - ${FIO_DIR}:${FIO_DIR}
+      - ${TEST_DIR}:/work
+      - ${RESULTS_DIR}/fio:${RESULTS_DIR}/fio
