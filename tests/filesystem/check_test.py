@@ -55,8 +55,8 @@ def check_approx(label, actual, expected, tolerance):
 
     passed = pct <= tolerance
     tag = "PASS" if passed else "FAIL"
-    direction = "over" if actual > expected else "under" if actual < expected else "exact"
-    msg = f"[{tag}] {label}: {actual} vs {expected} ({pct:.2%} error, {direction})"
+    note = f"{pct:.2%} over" if actual > expected else f"{pct:.2%} under" if actual < expected else "exact"
+    msg = f"[{tag}] {label}: {actual} vs {expected} ({note})"
     if not passed:
         msg += f" — exceeds {tolerance:.0%} tolerance"
     return passed, msg
