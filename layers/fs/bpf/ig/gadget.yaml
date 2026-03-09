@@ -1,0 +1,29 @@
+name: fs
+description: Filesystem syscall tracing (enter/exit)
+datasources:
+  fs:
+    fields:
+      timestamp_ns:
+        annotations:
+          description: Event timestamp in nanoseconds
+      event_type:
+        annotations:
+          description: "Event type: 0=enter, 1=exit"
+      syscall:
+        annotations:
+          description: "Syscall index: 0=read .. 12=munmap"
+      bytes:
+        annotations:
+          description: Byte count or return value
+      latency_ns:
+        annotations:
+          description: Enter to exit latency in nanoseconds
+      fd:
+        annotations:
+          description: File descriptor (-1 if N/A)
+      offset:
+        annotations:
+          description: File offset (-1 if N/A)
+      tid:
+        annotations:
+          description: Thread ID (correlation key)

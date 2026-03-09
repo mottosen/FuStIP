@@ -1,0 +1,26 @@
+name: nvme
+description: NVMe layer tracing (setup/complete)
+datasources:
+  nvme:
+    fields:
+      timestamp_ns:
+        annotations:
+          description: Event timestamp in nanoseconds
+      event_type:
+        annotations:
+          description: "Event type: 0=setup, 1=complete"
+      op:
+        annotations:
+          description: "NVMe op: 0=read, 1=write, 2=flush, 3=discard, 9=write_zeros"
+      bytes:
+        annotations:
+          description: IO size in bytes
+      latency_ns:
+        annotations:
+          description: Setup to complete latency in nanoseconds
+      sector:
+        annotations:
+          description: LBA (sector)
+      rq:
+        annotations:
+          description: Request pointer (correlation ID)
