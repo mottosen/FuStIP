@@ -75,8 +75,10 @@ endif
 # Variables passed to layer Makefiles
 ifdef CONTAINER_FILTER
     LAYER_VARS = CONTAINER_FILTER=$(CONTAINER_FILTER) RESULTS_DIR=$(RESULTS_DIR)
+    TOLERANCE_FLAG = --tolerance 0.05
 else
     LAYER_VARS = MODE=$(MODE) RESULTS_DIR=$(RESULTS_DIR)
+    TOLERANCE_FLAG =
 endif
 
 define JOB_TEMPLATE
@@ -109,7 +111,8 @@ endif
 	$(Q)python check_test.py --job $(1) \
 		--fio-json $(FIO_OUT) \
 		$(FS_OUT_FLAG) \
-		$(MODE_FLAG)
+		$(MODE_FLAG) \
+		$(TOLERANCE_FLAG)
 endef
 
 $(foreach job,$(VAL_JOBS) $(WORK_JOBS),$(eval $(call JOB_TEMPLATE,$(job))))

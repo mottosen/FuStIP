@@ -36,7 +36,7 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 1 << 24); // 16 MB
+	__uint(max_entries, 1 << 28); // 256 MB
 } events SEC(".maps");
 
 // ── Inline probe handlers ──

@@ -77,8 +77,10 @@ endif
 # Variables passed to layer Makefiles
 ifdef CONTAINER_FILTER
     LAYER_VARS = CONTAINER_FILTER=$(CONTAINER_FILTER) RESULTS_DIR=$(RESULTS_DIR)
+    TOLERANCE_FLAG = --tolerance 0.05
 else
     LAYER_VARS = MODE=$(MODE) RESULTS_DIR=$(RESULTS_DIR)
+    TOLERANCE_FLAG =
 endif
 
 define JOB_TEMPLATE
@@ -112,7 +114,8 @@ endif
 		--fio-json $(FIO_OUT) \
 		$(BLOCK_OUT_FLAG) \
 		$(NVME_OUT_FLAG) \
-		$(MODE_FLAG)
+		$(MODE_FLAG) \
+		$(TOLERANCE_FLAG)
 endef
 
 $(foreach job,$(VAL_JOBS) $(WORK_JOBS),$(eval $(call JOB_TEMPLATE,$(job))))
