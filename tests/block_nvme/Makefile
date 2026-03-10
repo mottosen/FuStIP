@@ -78,9 +78,11 @@ endif
 ifdef CONTAINER_FILTER
     LAYER_VARS = CONTAINER_FILTER=$(CONTAINER_FILTER) RESULTS_DIR=$(RESULTS_DIR)
     TOLERANCE_FLAG = --tolerance 0.05
+    CONTAINER_FLAG = --container
 else
     LAYER_VARS = MODE=$(MODE) RESULTS_DIR=$(RESULTS_DIR)
     TOLERANCE_FLAG =
+    CONTAINER_FLAG =
 endif
 
 define JOB_TEMPLATE
@@ -115,7 +117,8 @@ endif
 		$(BLOCK_OUT_FLAG) \
 		$(NVME_OUT_FLAG) \
 		$(MODE_FLAG) \
-		$(TOLERANCE_FLAG)
+		$(TOLERANCE_FLAG) \
+		$(CONTAINER_FLAG)
 endef
 
 $(foreach job,$(VAL_JOBS) $(WORK_JOBS),$(eval $(call JOB_TEMPLATE,$(job))))
