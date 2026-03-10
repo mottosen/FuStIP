@@ -71,8 +71,8 @@ ifdef CONTAINER_FILTER
 
 	$(Q)$(MAKE) -C bpf ig-build
 
-	$(Q)sudo RUNTIME_PATH=$(RUNC) $(IG) run $(IG_TAG) --verify-image=false -c $(CONTAINER_FILTER) -o json \
-		> "$(RESULTS_DIR)/nvme/detailed.jsonl" \
+	$(Q)sudo RUNTIME_PATH=$(RUNC) $(IG) run $(IG_TAG) --verify-image=false -c $(CONTAINER_FILTER) -o columns \
+		> "$(RESULTS_DIR)/nvme/detailed.columns" \
 		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/ig.pid"
 
 	$(Q)echo -e "IG collection is running!\n"
@@ -117,8 +117,8 @@ stop-collection:
 
 ifeq ($(MODE),detailed)
 ifdef CONTAINER_FILTER
-	$(Q)python "$(ROOT_DIR)/util/ig_json_to_csv.py" \
-		"$(RESULTS_DIR)/nvme/detailed.jsonl" \
+	$(Q)python "$(ROOT_DIR)/util/ig_to_csv.py" \
+		"$(RESULTS_DIR)/nvme/detailed.columns" \
 		"$(RESULTS_DIR)/nvme/detailed.csv" \
 		nvme
 endif

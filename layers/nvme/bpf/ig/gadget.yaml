@@ -6,6 +6,7 @@ datasources:
       timestamp_ns:
         annotations:
           description: Event timestamp in nanoseconds
+          columns.maxwidth: "24"
       event_type:
         annotations:
           description: "Event type: 0=setup, 1=complete"
@@ -18,9 +19,12 @@ datasources:
       latency_ns:
         annotations:
           description: Setup to complete latency in nanoseconds
+          columns.maxwidth: "20"
       sector:
         annotations:
           description: LBA (sector)
+          columns.maxwidth: "20"
       rq:
         annotations:
           description: Request pointer (correlation ID)
+          columns.maxwidth: "24"

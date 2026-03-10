@@ -6,6 +6,7 @@ datasources:
       timestamp_ns:
         annotations:
           description: Event timestamp in nanoseconds
+          columns.maxwidth: "24"
       event_type:
         annotations:
           description: "Event type: 0=enter, 1=exit"
@@ -15,15 +16,18 @@ datasources:
       bytes:
         annotations:
           description: Byte count or return value
+          columns.maxwidth: "20"
       latency_ns:
         annotations:
           description: Enter to exit latency in nanoseconds
+          columns.maxwidth: "20"
       fd:
         annotations:
           description: File descriptor (-1 if N/A)
       offset:
         annotations:
           description: File offset (-1 if N/A)
+          columns.maxwidth: "20"
       tid:
         annotations:
           description: Thread ID (correlation key)

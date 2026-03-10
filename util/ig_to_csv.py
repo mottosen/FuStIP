@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Convert Inspektor Gadget newline-delimited JSON output to CSV.
+"""Convert Inspektor Gadget columns output to CSV.
 
-Produces the same CSV format as each layer's standalone loader.c,
+Parses whitespace-delimited columns output (header + data rows) and
+produces the same CSV format as each layer's standalone loader.c,
 so generate_detailed_stats.py can process it unchanged.
 
 Usage:
-    python ig_json_to_csv.py <input.jsonl> <output.csv> <layer>
+    python ig_to_csv.py <input.columns> <output.csv> <layer>
 
 Layers: block, nvme, fs
 """
 
 import csv
-import json
 import sys
 
 # ── String mappings (must match loader.c) ──
@@ -32,13 +32,36 @@ FS_SYSCALL_NAMES = {
 }
 
 
+def parse_columns(input_path):
+    """Parse IG columns output into list of dicts keyed by header names."""
+    rows = []
+    headers = None
+    with open(input_path) as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            fields = line.split()
+            if headers is None:
+                # First non-empty line is the header
+                headers = [h.lower() for h in fields]
+                continue
+            if len(fields) != len(headers):
+                print(f"Warning: skipping line {line_num}: "
+                      f"expected {len(headers)} fields, got {len(fields)}",
+                      file=sys.stderr)
+                continue
+            rows.append(dict(zip(headers, fields)))
+    return rows
+
+
 def convert_block(rows, writer):
     """CSV: timestamp_ns,event,op,bytes,latency_ns,sector,rq"""
     writer.writerow(["timestamp_ns", "event", "op", "bytes", "latency_ns", "sector", "rq"])
     for obj in rows:
-        event_type = obj.get("event_type", 0)
-        op = obj.get("op", 0)
-        latency = obj.get("latency_ns", 0)
+        event_type = int(obj.get("event_type", 0))
+        op = int(obj.get("op", 0))
+        latency = int(obj.get("latency_ns", 0))
         writer.writerow([
             obj.get("timestamp_ns", 0),
             BLOCK_EVENT_NAMES.get(event_type, "unknown"),
@@ -46,7 +69,7 @@ def convert_block(rows, writer):
             obj.get("bytes", 0),
             latency if latency else "",
             obj.get("sector", 0),
-            f"0x{obj.get('rq', 0):x}",
+            f"0x{int(obj.get('rq', 0)):x}",
         ])
 
 
@@ -54,9 +77,9 @@ def convert_nvme(rows, writer):
     """CSV: timestamp_ns,event,op,bytes,latency_ns,sector,rq"""
     writer.writerow(["timestamp_ns", "event", "op", "bytes", "latency_ns", "sector", "rq"])
     for obj in rows:
-        event_type = obj.get("event_type", 0)
-        op = obj.get("op", 0)
-        latency = obj.get("latency_ns", 0)
+        event_type = int(obj.get("event_type", 0))
+        op = int(obj.get("op", 0))
+        latency = int(obj.get("latency_ns", 0))
         writer.writerow([
             obj.get("timestamp_ns", 0),
             NVME_EVENT_NAMES.get(event_type, "unknown"),
@@ -64,7 +87,7 @@ def convert_nvme(rows, writer):
             obj.get("bytes", 0),
             latency if latency else "",
             obj.get("sector", 0),
-            f"0x{obj.get('rq', 0):x}",
+            f"0x{int(obj.get('rq', 0)):x}",
         ])
 
 
@@ -72,12 +95,12 @@ def convert_fs(rows, writer):
     """CSV: timestamp_ns,event,syscall,bytes,latency_ns,fd,offset,tid"""
     writer.writerow(["timestamp_ns", "event", "syscall", "bytes", "latency_ns", "fd", "offset", "tid"])
     for obj in rows:
-        event_type = obj.get("event_type", 0)
-        syscall = obj.get("syscall", 0)
-        bytes_val = obj.get("bytes", 0)
-        latency = obj.get("latency_ns", 0)
-        fd = obj.get("fd", -1)
-        offset = obj.get("offset", -1)
+        event_type = int(obj.get("event_type", 0))
+        syscall = int(obj.get("syscall", 0))
+        bytes_val = int(obj.get("bytes", 0))
+        latency = int(obj.get("latency_ns", 0))
+        fd = int(obj.get("fd", -1))
+        offset = int(obj.get("offset", -1))
         writer.writerow([
             obj.get("timestamp_ns", 0),
             FS_EVENT_NAMES.get(event_type, "unknown"),
@@ -99,7 +122,7 @@ CONVERTERS = {
 
 def main():
     if len(sys.argv) != 4:
-        print(f"Usage: {sys.argv[0]} <input.jsonl> <output.csv> <layer>",
+        print(f"Usage: {sys.argv[0]} <input.columns> <output.csv> <layer>",
               file=sys.stderr)
         print(f"  Layers: {', '.join(CONVERTERS.keys())}", file=sys.stderr)
         sys.exit(1)
@@ -111,24 +134,14 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
-    # Read all JSON lines
-    rows = []
-    with open(input_path) as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError as e:
-                print(f"Warning: skipping line {line_num}: {e}", file=sys.stderr)
+    rows = parse_columns(input_path)
 
     # Write CSV
     with open(output_path, "w", newline="") as f:
         writer = csv.writer(f)
         CONVERTERS[layer](rows, writer)
 
-    print(f"Converted {len(rows)} events → {output_path}", file=sys.stderr)
+    print(f"Converted {len(rows)} events -> {output_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
