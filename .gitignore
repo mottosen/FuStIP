@@ -9,3 +9,4 @@ util/bpf/include
 *.bpf.o
 *.skel.h
 layers/*/bpf/c/standalone
+bin

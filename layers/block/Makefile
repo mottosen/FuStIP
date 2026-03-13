@@ -4,11 +4,16 @@ ifdef DEBUG
     MAKE_FLAGS =
 else
     Q = @
-    ERR_REDIRECT = 2>/dev/null 1>&2
+    ERR_REDIRECT = 2>/dev/null
     MAKE_FLAGS = --no-print-directory
 endif
 
 MAKE := $(MAKE) $(MAKE_FLAGS)
+
+# If CONTAINER_FILTER is set, force detailed mode (IG backend)
+ifdef CONTAINER_FILTER
+MODE := detailed
+endif
 
 MODE ?= summary
 ifneq ($(MODE),summary)
@@ -19,6 +24,11 @@ endif
 
 BPFTRACE := $(shell which bpftrace)
 PIDS_DIR = /tmp/bpftrace_block-pids
+
+IG ?= $(ROOT_DIR)/subs/inspektor-gadget/ig
+IG_TAG ?= fustip-block:latest
+RUNC ?= $(shell d=$$(dirname $$(cat /proc/$$(pgrep -x dockerd)/cmdline 2>/dev/null | tr '\0' '\n' | head -1)) && \
+	test -x "$$d/runc" && readlink -f "$$d/runc" || which runc 2>/dev/null)
 
 INTERVAL ?= 1
 
@@ -47,13 +57,26 @@ ensure-results-exists:
 
 .PHONY: start-collection
 start-collection: ensure-results-exists ensure-sudo
+ifndef CONTAINER_FILTER
 ifndef COMM_FILTER
-	$(error COMM_FILTER is not set)
+	$(error COMM_FILTER is not set (set COMM_FILTER or CONTAINER_FILTER))
+endif
 endif
 
 	$(Q)mkdir -p "$(PIDS_DIR)"
 
 ifeq ($(MODE),detailed)
+ifdef CONTAINER_FILTER
+	$(Q)echo -e "\nStarting IG collection (container: $(CONTAINER_FILTER)).."
+
+	$(Q)$(MAKE) -C bpf ig-build
+
+	$(Q)sudo RUNTIME_PATH=$(RUNC) $(IG) run $(IG_TAG) --verify-image=false -c $(CONTAINER_FILTER) -o columns \
+		> "$(RESULTS_DIR)/block/detailed.columns" \
+		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/ig.pid"
+
+	$(Q)echo -e "IG collection is running!\n"
+else
 	$(Q)echo -e "\nStarting detailed collection.."
 
 	$(Q)$(MAKE) -C bpf standalone
@@ -61,16 +84,17 @@ ifeq ($(MODE),detailed)
 	$(Q)sudo ./bpf/c/standalone \
 		-o "$(RESULTS_DIR)/block/detailed.csv" \
 		-f $(COMM_FILTER) \
-		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/detailed.pid"
+		$(ERR_REDIRECT) 1>&2 & echo $$! > "$(PIDS_DIR)/detailed.pid"
 
 	$(Q)echo -e "Detailed collection is running!\n"
+endif
 else
 	$(Q)echo -e "\nStarting bpftrace collection.."
 
 	$(Q)sudo $(BPFTRACE) ./bt/trace.bt $(COMM_FILTER) \
 		--no-warnings \
 		-o "$(RESULTS_DIR)/block/trace.out" \
-		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/trace.pid"
+		$(ERR_REDIRECT) 1>&2 & echo $$! > "$(PIDS_DIR)/trace.pid"
 
 	$(Q)echo -e "bpftrace collection is running!\n"
 endif
@@ -81,7 +105,7 @@ stop-collection:
 
 	$(Q)for pidfile in $(PIDS_DIR)/*.pid; do \
 		if [ -f "$$pidfile" ]; then \
-			kill $$(cat "$$pidfile") $(ERR_REDIRECT) || true; \
+			kill $$(cat "$$pidfile") $(ERR_REDIRECT) 1>&2 || true; \
 		fi; \
 	done
 
@@ -92,6 +116,12 @@ stop-collection:
 	$(Q)sleep 2
 
 ifeq ($(MODE),detailed)
+ifdef CONTAINER_FILTER
+	$(Q)python "$(ROOT_DIR)/util/ig_to_csv.py" \
+		"$(RESULTS_DIR)/block/detailed.columns" \
+		"$(RESULTS_DIR)/block/detailed.csv" \
+		block
+endif
 	$(Q)$(MAKE) generate-detailed-stats
 else
 	$(Q)$(MAKE) generate-stats

@@ -1,0 +1,30 @@
+name: block
+description: Block IO layer tracing (insert/issue/complete)
+datasources:
+  block:
+    fields:
+      timestamp_ns:
+        annotations:
+          description: Event timestamp in nanoseconds
+          columns.maxwidth: "24"
+      event_type:
+        annotations:
+          description: "Event type: 0=insert, 1=issue, 2=complete"
+      op:
+        annotations:
+          description: "Block op: 0=read, 1=write, 2=flush, 3=discard, 9=write_zeros"
+      bytes:
+        annotations:
+          description: IO size in bytes
+      latency_ns:
+        annotations:
+          description: Latency in nanoseconds (queue or driver)
+          columns.maxwidth: "20"
+      sector:
+        annotations:
+          description: Sector number
+          columns.maxwidth: "20"
+      rq:
+        annotations:
+          description: Request pointer (correlation ID)
+          columns.maxwidth: "24"

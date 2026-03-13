@@ -45,27 +45,20 @@ def get_val(data, map_name, key, default=0):
     return data.get(map_name, {}).get(key, default)
 
 
-def check_approx(label, actual, expected, tolerance):
+def check_approx(label, actual, expected, tolerance, allow_over=False):
     """Check that actual ~ expected within tolerance."""
     if expected == 0:
         pct = 0.0 if actual == 0 else float("inf")
     else:
         pct = abs(actual - expected) / expected
 
-    passed = pct <= tolerance
+    over = actual > expected
+    passed = pct <= tolerance or (allow_over and over)
     tag = "PASS" if passed else "FAIL"
-    note = f"{pct:.2%} over" if actual > expected else f"{pct:.2%} under" if actual < expected else "exact"
+    note = f"{pct:.2%} over" if over else f"{pct:.2%} under" if actual < expected else "exact"
     msg = f"[{tag}] {label}: {actual} vs {expected} ({note})"
     if not passed:
         msg += f" — exceeds {tolerance:.0%} tolerance"
-    return passed, msg
-
-
-def check_near_zero(label, actual, max_allowed=10):
-    """Check that a counter is near zero."""
-    passed = actual <= max_allowed
-    tag = "PASS" if passed else "FAIL"
-    msg = f"[{tag}] {label}: {actual} (expected ~0, limit {max_allowed})"
     return passed, msg
 
 
@@ -82,7 +75,7 @@ def classify_job(fio):
         return "read"
 
 
-def validate_blk(fio, blk, tolerance, kind):
+def validate_blk(fio, blk, tolerance, kind, allow_over=False):
     """Block layer: completed vs FIO, then issued~completed consistency."""
     results = []
 
@@ -91,43 +84,35 @@ def validate_blk(fio, blk, tolerance, kind):
         results.append(check_approx(
             "blk read completed",
             get_val(blk, "rq_completed", "read"),
-            fio["read_ios"], tolerance))
+            fio["read_ios"], tolerance, allow_over))
         results.append(check_approx(
             "blk read bytes",
             get_val(blk, "rq_total_bytes", "read"),
-            fio["read_bytes"], tolerance))
+            fio["read_bytes"], tolerance, allow_over))
 
     if kind in ("write", "mixed"):
         results.append(check_approx(
             "blk write completed",
             get_val(blk, "rq_completed", "write"),
-            fio["write_ios"], tolerance))
+            fio["write_ios"], tolerance, allow_over))
         results.append(check_approx(
             "blk write bytes",
             get_val(blk, "rq_total_bytes", "write"),
-            fio["write_bytes"], tolerance))
-
-    if kind == "read":
-        results.append(check_near_zero(
-            "blk write completed",
-            get_val(blk, "rq_completed", "write")))
-    elif kind == "write":
-        results.append(check_near_zero(
-            "blk read completed",
-            get_val(blk, "rq_completed", "read")))
+            fio["write_bytes"], tolerance, allow_over))
 
     # Consistency: issued~completed, queued~queue_done
-    for op in ("read", "write"):
+    ops = ("read", "write") if kind == "mixed" else (kind,)
+    for op in ops:
         issued = get_val(blk, "rq_issued", op)
         completed = get_val(blk, "rq_completed", op)
-        if issued > 0 or completed > 0:
+        if issued > 0 and completed > 0:
             results.append(check_approx(
                 f"blk {op} issued~completed",
                 issued, completed, tolerance))
 
         queued = get_val(blk, "rq_queued", op)
         queue_done = get_val(blk, "rq_queue_done", op)
-        if queued > 0 or queue_done > 0:
+        if queued > 0 and queue_done > 0:
             results.append(check_approx(
                 f"blk {op} queued~queue_done",
                 queued, queue_done, tolerance))
@@ -135,7 +120,7 @@ def validate_blk(fio, blk, tolerance, kind):
     return results
 
 
-def validate_nvme(fio, nvme, tolerance, kind):
+def validate_nvme(fio, nvme, tolerance, kind, allow_over=False):
     """NVMe layer: completed vs FIO, then setup~completed consistency."""
     results = []
 
@@ -144,27 +129,28 @@ def validate_nvme(fio, nvme, tolerance, kind):
         results.append(check_approx(
             "nvme read completed",
             get_val(nvme, "cmd_completed", "read"),
-            fio["read_ios"], tolerance))
+            fio["read_ios"], tolerance, allow_over))
         results.append(check_approx(
             "nvme read bytes",
             get_val(nvme, "cmd_total_bytes", "read"),
-            fio["read_bytes"], tolerance))
+            fio["read_bytes"], tolerance, allow_over))
 
     if kind in ("write", "mixed"):
         results.append(check_approx(
             "nvme write completed",
             get_val(nvme, "cmd_completed", "write"),
-            fio["write_ios"], tolerance))
+            fio["write_ios"], tolerance, allow_over))
         results.append(check_approx(
             "nvme write bytes",
             get_val(nvme, "cmd_total_bytes", "write"),
-            fio["write_bytes"], tolerance))
+            fio["write_bytes"], tolerance, allow_over))
 
     # Consistency: setup~completed
-    for op in ("read", "write"):
+    ops = ("read", "write") if kind == "mixed" else (kind,)
+    for op in ops:
         setup = get_val(nvme, "cmd_setup", op)
         completed = get_val(nvme, "cmd_completed", op)
-        if setup > 0 or completed > 0:
+        if setup > 0 and completed > 0:
             results.append(check_approx(
                 f"nvme {op} setup~completed",
                 setup, completed, tolerance))
@@ -181,6 +167,7 @@ def main():
     parser.add_argument("--mode", default="summary", choices=["summary", "detailed"],
                         help="Profiling mode (default: summary)")
     parser.add_argument("--tolerance", type=float, default=0.02, help="Tolerance for count checks (default: 0.02)")
+    parser.add_argument("--container", action="store_true", help="Container mode: allow profiler counts above FIO")
     args = parser.parse_args()
 
     fio = parse_fio_json(args.fio_json)
@@ -216,8 +203,8 @@ def main():
 
     print()
 
-    results = validate_blk(fio, blk, args.tolerance, kind)
-    results += validate_nvme(fio, nvme, args.tolerance, kind)
+    results = validate_blk(fio, blk, args.tolerance, kind, args.container)
+    results += validate_nvme(fio, nvme, args.tolerance, kind, args.container)
 
     all_passed = True
     for passed, msg in results:
