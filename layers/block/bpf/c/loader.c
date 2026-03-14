@@ -43,25 +43,45 @@ static void sig_handler(int sig)
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
 	const struct block_event *e = data;
+	char comm[17] = {};
+	memcpy(comm, e->comm, 16);
 
 	if (e->latency_ns > 0)
-		fprintf(output, "%llu,%s,%s,%u,%llu,%llu,0x%llx\n",
+		fprintf(output, "%llu,%s,%s,%u,%llu,%llu,0x%llx,%s\n",
 			e->timestamp_ns, event_name(e->event_type),
 			op_name(e->op), e->bytes, e->latency_ns,
-			e->sector, e->rq);
+			e->sector, e->rq, comm);
 	else
-		fprintf(output, "%llu,%s,%s,%u,,%llu,0x%llx\n",
+		fprintf(output, "%llu,%s,%s,%u,,%llu,0x%llx,%s\n",
 			e->timestamp_ns, event_name(e->event_type),
 			op_name(e->op), e->bytes,
-			e->sector, e->rq);
+			e->sector, e->rq, comm);
 
 	return 0;
 }
 
 static void usage(const char *prog)
 {
-	fprintf(stderr, "Usage: %s -o <output_csv> -f <comm_filter>\n", prog);
+	fprintf(stderr, "Usage: %s -o <output_csv> -f <comm_filter[,comm2,...]>\n", prog);
 	exit(1);
+}
+
+static int parse_comm_filters(struct standalone_bpf *skel, const char *filter)
+{
+	char buf[256];
+	strncpy(buf, filter, sizeof(buf) - 1);
+	buf[sizeof(buf) - 1] = '\0';
+
+	int count = 0;
+	char *saveptr = NULL;
+	char *token = strtok_r(buf, ",", &saveptr);
+	while (token && count < 8) {
+		strncpy((char *)skel->rodata->comm_filters[count], token, 15);
+		count++;
+		token = strtok_r(NULL, ",", &saveptr);
+	}
+	skel->rodata->num_comm_filters = count;
+	return count;
 }
 
 int main(int argc, char **argv)
@@ -97,10 +117,8 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	// Set filter in rodata
-	skel->rodata->has_comm_filter = true;
-	strncpy((char *)skel->rodata->comm_filter, filter,
-		sizeof(skel->rodata->comm_filter) - 1);
+	// Set filters in rodata
+	parse_comm_filters(skel, filter);
 
 	int err = standalone_bpf__load(skel);
 	if (err) {
@@ -123,7 +141,7 @@ int main(int argc, char **argv)
 		standalone_bpf__destroy(skel);
 		return 1;
 	}
-	fprintf(output, "timestamp_ns,event,op,bytes,latency_ns,sector,rq\n");
+	fprintf(output, "timestamp_ns,event,op,bytes,latency_ns,sector,rq,comm\n");
 
 	// Set up ring buffer
 	struct ring_buffer *rb = ring_buffer__new(

@@ -11,6 +11,7 @@ struct sc_enter_data {
 	__s64 offset;
 	__s64 bytes;    // count arg for IO syscalls, length for mmap
 	__u8  sc_idx;
+	__u8  comm[16];
 };
 
 // ── Maps ──
@@ -44,6 +45,7 @@ static __always_inline int handle_sc_enter(__u8 sc_idx, __s32 fd,
 		.bytes = bytes,
 		.sc_idx = sc_idx,
 	};
+	bpf_get_current_comm(&data.comm, sizeof(data.comm));
 	bpf_map_update_elem(&sc_start, &tid, &data, BPF_ANY);
 
 	// Emit enter event
@@ -57,6 +59,7 @@ static __always_inline int handle_sc_enter(__u8 sc_idx, __s32 fd,
 		e->fd = fd;
 		e->offset = offset;
 		e->tid = (__u32)tid;
+		__builtin_memcpy(e->comm, data.comm, 16);
 		bpf_ringbuf_submit(e, 0);
 	}
 
@@ -85,6 +88,7 @@ static __always_inline int handle_sc_exit(__s64 ret)
 		e->fd = data->fd;
 		e->offset = data->offset;
 		e->tid = (__u32)tid;
+		__builtin_memcpy(e->comm, data->comm, 16);
 		bpf_ringbuf_submit(e, 0);
 	}
 

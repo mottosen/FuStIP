@@ -32,6 +32,7 @@ struct fs_event {
 	__s32 fd;           // file descriptor (-1 if N/A)
 	__s64 offset;       // file offset (-1 if N/A)
 	__u32 tid;          // thread ID (correlation key)
+	__u8  comm[16];     // process name
 } __attribute__((packed));
 
 #endif // __FS_EVENT_H

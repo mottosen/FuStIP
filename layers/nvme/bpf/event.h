@@ -22,6 +22,7 @@ struct nvme_event {
   __u64 latency_ns; // setup→complete latency (only on complete)
   __u64 sector;     // rq->__sector (LBA)
   __u64 rq;         // request pointer (correlation ID)
+  __u8  comm[16];   // process name
 } __attribute__((packed));
 
 #endif // __NVME_EVENT_H

@@ -45,15 +45,17 @@ static void sig_handler(int sig) { running = 0; }
 
 static int handle_event(void *ctx, void *data, size_t data_sz) {
   const struct nvme_event *e = data;
+  char comm[17] = {};
+  memcpy(comm, e->comm, 16);
 
   if (e->latency_ns > 0)
-    fprintf(output, "%llu,%s,%s,%u,%llu,%llu,0x%llx\n", e->timestamp_ns,
+    fprintf(output, "%llu,%s,%s,%u,%llu,%llu,0x%llx,%s\n", e->timestamp_ns,
             event_name(e->event_type), op_name(e->op), e->bytes, e->latency_ns,
-            e->sector, e->rq);
+            e->sector, e->rq, comm);
   else
-    fprintf(output, "%llu,%s,%s,%u,,%llu,0x%llx\n", e->timestamp_ns,
+    fprintf(output, "%llu,%s,%s,%u,,%llu,0x%llx,%s\n", e->timestamp_ns,
             event_name(e->event_type), op_name(e->op), e->bytes, e->sector,
-            e->rq);
+            e->rq, comm);
 
   return 0;
 }
@@ -117,7 +119,7 @@ int main(int argc, char **argv) {
     standalone_bpf__destroy(skel);
     return 1;
   }
-  fprintf(output, "timestamp_ns,event,op,bytes,latency_ns,sector,rq\n");
+  fprintf(output, "timestamp_ns,event,op,bytes,latency_ns,sector,rq,comm\n");
 
   struct ring_buffer *rb = ring_buffer__new(bpf_map__fd(skel->maps.events),
                                             handle_event, NULL, NULL);
