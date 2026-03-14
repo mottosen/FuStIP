@@ -142,3 +142,9 @@ generate-detailed-stats: ensure-results-exists
 	$(Q)python "./util/generate_detailed_stats.py" "$(RESULTS_DIR)"
 
 	$(Q)echo -e "Stats generated!\n"
+
+.PHONY: visualize
+visualize: ensure-results-exists
+	$(Q)echo -e "\nGenerating block visualizations.."
+	$(Q)python "./util/visualize.py" "$(RESULTS_DIR)"
+	$(Q)echo -e "Visualizations generated!\n"

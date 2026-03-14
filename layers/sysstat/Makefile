@@ -84,6 +84,16 @@ parse: ensure-results-exists
 generate-stats: ensure-results-exists
 	$(Q)echo -e "\nGenerating sysstat stats.."
 
+ifdef COMM_FILTER
+	$(Q)python "./util/generate_stats.py" --process "$$(echo '$(COMM_FILTER)' | tr ',' ' ')" "$(RESULTS_DIR)"
+else
 	$(Q)python "./util/generate_stats.py" $(OPTIONS) "$(RESULTS_DIR)"
+endif
 
 	$(Q)echo -e "Stats generated!\n"
+
+.PHONY: visualize
+visualize: ensure-results-exists
+	$(Q)echo -e "\nGenerating sysstat visualizations.."
+	$(Q)python "./util/visualize.py" "$(RESULTS_DIR)"
+	$(Q)echo -e "Visualizations generated!\n"

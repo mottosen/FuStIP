@@ -138,3 +138,9 @@ else
 endif
 
 	$(Q)echo -e "Stats generated!\n"
+
+.PHONY: visualize
+visualize: ensure-results-exists
+	$(Q)echo -e "\nGenerating nvme visualizations.."
+	$(Q)python "./util/visualize.py" "$(RESULTS_DIR)"
+	$(Q)echo -e "Visualizations generated!\n"

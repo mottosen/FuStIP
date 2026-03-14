@@ -27,10 +27,11 @@ def parse_args(argv=None):
         help="Layers to target (repeatable, default: all)",
     )
     parent.add_argument("-m", "--mode", choices=["summary", "detailed"], default="summary")
-    parent.add_argument("-p", "--comm-filter", help="Process/command name filter (block, fs)")
+    parent.add_argument("-p", "--comm-filter", help="Process/command name filter, comma-separated for multiple (block, fs)")
     parent.add_argument("-c", "--container-filter", help="Container name filter (forces detailed)")
     parent.add_argument("-d", "--dev-filter", help="NVMe device filter (e.g. nvme0n1)")
     parent.add_argument("--clean", action="store_true", help="Clean results directory first")
+    parent.add_argument("--visualize", action="store_true", help="Generate visualization dashboards (detailed mode only)")
     parent.add_argument("--debug", action="store_true", help="Enable verbose Makefile output (DEBUG=1)")
     parent.add_argument("--dry", action="store_true", help="Print commands instead of executing")
 
@@ -76,6 +77,10 @@ def validate(args):
     if args.container_filter:
         args.mode = "detailed"
 
+    if args.visualize and args.mode != "detailed":
+        print("Error: --visualize requires detailed mode (-m detailed)", file=sys.stderr)
+        sys.exit(1)
+
     is_test = args.action == "test"
 
     if not args.container_filter:
@@ -113,6 +118,8 @@ def build_layer_vars(layer, args):
     if args.debug:
         vs.append("DEBUG=1")
     if layer == "sysstat":
+        if args.comm_filter:
+            vs.append(f"COMM_FILTER={args.comm_filter}")
         vs.append(f"RESULTS_DIR={args.results_dir}")
         return vs
 
@@ -183,6 +190,14 @@ def generate_test_commands(args):
     return cmds
 
 
+def generate_visualize_commands(args):
+    cmds = []
+    for layer in args.layers:
+        vs = build_layer_vars(layer, args)
+        cmds.append(f"make -C layers/{layer} visualize {' '.join(vs)}")
+    return cmds
+
+
 def main(argv=None):
     args = parse_args(argv)
     validate(args)
@@ -197,6 +212,9 @@ def main(argv=None):
         cmds.extend(generate_profile_commands(args))
     elif args.action == "test":
         cmds.extend(generate_test_commands(args))
+
+    if args.visualize:
+        cmds.extend(generate_visualize_commands(args))
 
     for cmd in cmds:
         print(cmd)
