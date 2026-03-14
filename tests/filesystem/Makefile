@@ -22,6 +22,8 @@ $(error MODE must be 'summary' or 'detailed' (got '$(MODE)'))
 endif
 endif
 
+MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+
 FS_DIR = ../../layers/fs
 SYSSTAT_DIR = ../../layers/sysstat
 
@@ -50,17 +52,6 @@ workload: $(WORK_JOBS)
 .PHONY: all
 all: validate workload
 
-.PHONY: reset-results
-reset-results:
-ifndef RESULTS_DIR
-	$(error RESULTS_DIR is not set)
-endif
-
-	$(Q)echo -e "Cleaning experiment results.."
-	$(Q)rm -rf $(RESULTS_DIR)/*
-
-	$(Q)echo -e "All cleaned up!\n"
-
 # ── Per-job pattern ──
 # Each target: start collection → run fio → stop collection → check results
 
@@ -71,6 +62,8 @@ else
     FS_OUT_FLAG = --fs-out $(RESULTS_DIR)/fs/trace.out
     MODE_FLAG =
 endif
+
+LAYERS ?= fs sysstat
 
 # Variables passed to layer Makefiles
 ifdef CONTAINER_FILTER
@@ -89,30 +82,29 @@ $(1): ensure-sudo
 	$(Q)echo -e "\n============================================================"
 	$(Q)echo -e "  Running: $(1)  [mode=$(MODE)]"
 	$(Q)echo -e "============================================================\n"
-	$(Q)$(MAKE) reset-results
-	$(Q)$(MAKE) -C $(FS_DIR) start-collection $(LAYER_VARS) $(REDIRECT)
-	$(Q)$(MAKE) -C $(SYSSTAT_DIR) start-collection RESULTS_DIR=$(RESULTS_DIR) $(REDIRECT)
+	$(if $(filter fs,$(LAYERS)),$(Q)$(MAKE) -C $(FS_DIR) start-collection $(LAYER_VARS) $(REDIRECT))
+	$(if $(filter sysstat,$(LAYERS)),$(Q)$(MAKE) -C $(SYSSTAT_DIR) start-collection RESULTS_DIR=$(RESULTS_DIR) $(REDIRECT))
 	$(Q)sleep 5
 	$(Q)mkdir -p $(RESULTS_DIR)/fio
 ifdef CONTAINER_FILTER
-	$(Q)FIO_DIR=$(dir $(FIO_FILE)) TEST_DIR=$(PWD) RESULTS_DIR=$(RESULTS_DIR) \
+	$(Q)FIO_DIR=$(dir $(FIO_FILE)) TEST_DIR=$(MAKEFILE_DIR) RESULTS_DIR=$(RESULTS_DIR) \
 		docker compose -f $(FIO_COMPOSE) run --rm --build --name $(CONTAINER_FILTER) \
 		fio-test ./jobs.fio \
 		--filename=$(FIO_FILE) --output-format=json \
 		--output=$(FIO_OUT) --section=$(1) \
 		$(REDIRECT)
 else
-	$(Q)sudo fio ./jobs.fio --filename=$(FIO_FILE) \
+	$(Q)sudo fio $(MAKEFILE_DIR)jobs.fio --filename=$(FIO_FILE) \
 		--output-format=json --output=$(FIO_OUT) \
 		--section=$(1)
 endif
 	$(Q)sleep 1
-	$(Q)$(MAKE) -C $(SYSSTAT_DIR) stop-collection $(REDIRECT)
-	$(Q)$(MAKE) -C $(FS_DIR) stop-collection $(LAYER_VARS) $(REDIRECT)
+	$(if $(filter sysstat,$(LAYERS)),$(Q)$(MAKE) -C $(SYSSTAT_DIR) stop-collection $(REDIRECT))
+	$(if $(filter fs,$(LAYERS)),$(Q)$(MAKE) -C $(FS_DIR) stop-collection $(LAYER_VARS) $(REDIRECT))
 	$(Q)sleep 1
-	$(Q)python check_test.py --job $(1) \
+	$(Q)python $(MAKEFILE_DIR)check_test.py --job $(1) \
 		--fio-json $(FIO_OUT) \
-		$(FS_OUT_FLAG) \
+		$(if $(filter fs,$(LAYERS)),$(FS_OUT_FLAG)) \
 		$(MODE_FLAG) \
 		$(TOLERANCE_FLAG) \
 		$(CONTAINER_FLAG)
