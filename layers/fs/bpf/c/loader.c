@@ -76,8 +76,8 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	else
 		fprintf(output, ",");
 
-	// tid,comm
-	fprintf(output, "%u,%s\n", e->tid, comm);
+	// tid,comm,inflight
+	fprintf(output, "%u,%s,%d\n", e->tid, comm, e->inflight);
 
 	return 0;
 }
@@ -160,7 +160,7 @@ int main(int argc, char **argv)
 		standalone_bpf__destroy(skel);
 		return 1;
 	}
-	fprintf(output, "timestamp_ns,event,syscall,bytes,latency_ns,fd,offset,tid,comm\n");
+	fprintf(output, "timestamp_ns,event,syscall,bytes,latency_ns,fd,offset,tid,comm,inflight\n");
 
 	struct ring_buffer *rb = ring_buffer__new(
 		bpf_map__fd(skel->maps.events), handle_event, NULL, NULL);

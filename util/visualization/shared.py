@@ -63,6 +63,26 @@ def plot_inflight_over_time(ax, df, enter_event, exit_event, type_col, ts_col, t
     ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
 
+def plot_inflight_from_column(ax, df, type_col, ts_col, types,
+                              inflight_col="inflight", title="Inflight Over Time"):
+    """Plot inflight from pre-computed column in event CSV."""
+    t_min = df[ts_col].min()
+    window_ns = 1_000_000_000
+    for i, typ in enumerate(types):
+        typ_df = df[df[type_col] == typ].sort_values(ts_col)
+        if typ_df.empty:
+            continue
+        secs = ((typ_df[ts_col].values - t_min) / window_ns).astype(int)
+        typ_df = typ_df.assign(sec=secs)
+        sampled = typ_df.groupby("sec")[inflight_col].last()
+        ax.plot(sampled.index, sampled.values.clip(min=0), label=typ,
+                color=_color_for(typ, i), linewidth=0.8)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Inflight")
+    ax.set_title(title)
+    ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
+
+
 def plot_cumulated_mb_over_time(ax, df, complete_event, type_col, ts_col, bytes_col, types):
     """Cumulative MB transferred in 1-second windows."""
     completed = df[df["event"] == complete_event]

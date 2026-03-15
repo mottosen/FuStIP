@@ -99,35 +99,55 @@ def generate_stats(csv_path):
                 raw_values_to_hist(group["bytes"].tolist())
             )
 
-    # Inflight time-series (computed from insert/complete event counts in 1s windows)
+    # Inflight time-series
     if len(all_events) > 1:
         t_min = all_events["timestamp_ns"].min()
-        t_max = all_events["timestamp_ns"].max()
         window_ns = 1_000_000_000  # 1 second
 
-        for stage, enter_evt, exit_evt in [("d_inflight", "issue", "complete"),
-                                           ("q_inflight", "insert", "issue")]:
-            stage_enter = df[df["event"] == enter_evt]
-            stage_exit = df[df["event"] == exit_evt]
-            if len(stage_enter) == 0:
-                continue
+        has_inflight_cols = "q_inflight" in df.columns and "d_inflight" in df.columns
 
-            result["tseries"][stage] = {}
-            for op in stage_enter["op"].unique():
-                enter_ts = stage_enter[stage_enter["op"] == op]["timestamp_ns"].values
-                exit_ts = stage_exit[stage_exit["op"] == op]["timestamp_ns"].values
-                points = []
-                t = t_min
-                sec = 0
-                while t <= t_max:
-                    inflight = int((enter_ts <= t).sum() - (exit_ts <= t).sum())
-                    h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
-                    points.append({"time": f"{h:02d}:{m:02d}:{s:02d}",
-                                   "value": max(0, inflight)})
-                    t += window_ns
-                    sec += 1
-                if points:
-                    result["tseries"][stage][op] = tseries_with_points(points)
+        if has_inflight_cols:
+            # Use pre-computed in-kernel inflight columns
+            for stage, col in [("q_inflight", "q_inflight"), ("d_inflight", "d_inflight")]:
+                result["tseries"][stage] = {}
+                for op in all_events["op"].unique():
+                    op_df = all_events[all_events["op"] == op].sort_values("timestamp_ns")
+                    secs = ((op_df["timestamp_ns"].values - t_min) / window_ns).astype(int)
+                    op_df = op_df.assign(sec=secs)
+                    sampled = op_df.groupby("sec")[col].last()
+                    points = []
+                    for s, v in sampled.items():
+                        h, m, ss = s // 3600, (s % 3600) // 60, s % 60
+                        points.append({"time": f"{h:02d}:{m:02d}:{ss:02d}",
+                                       "value": max(0, int(v))})
+                    if points:
+                        result["tseries"][stage][op] = tseries_with_points(points)
+        else:
+            # Fallback: compute from enter/exit event counts
+            t_max = all_events["timestamp_ns"].max()
+            for stage, enter_evt, exit_evt in [("d_inflight", "issue", "complete"),
+                                               ("q_inflight", "insert", "issue")]:
+                stage_enter = df[df["event"] == enter_evt]
+                stage_exit = df[df["event"] == exit_evt]
+                if len(stage_enter) == 0:
+                    continue
+
+                result["tseries"][stage] = {}
+                for op in stage_enter["op"].unique():
+                    enter_ts = stage_enter[stage_enter["op"] == op]["timestamp_ns"].values
+                    exit_ts = stage_exit[stage_exit["op"] == op]["timestamp_ns"].values
+                    points = []
+                    t = t_min
+                    sec = 0
+                    while t <= t_max:
+                        inflight = int((enter_ts <= t).sum() - (exit_ts <= t).sum())
+                        h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
+                        points.append({"time": f"{h:02d}:{m:02d}:{s:02d}",
+                                       "value": max(0, inflight)})
+                        t += window_ns
+                        sec += 1
+                    if points:
+                        result["tseries"][stage][op] = tseries_with_points(points)
 
     # Access pattern (sequential/random from sector addresses)
     if len(complete) > 0 and "sector" in complete.columns:
