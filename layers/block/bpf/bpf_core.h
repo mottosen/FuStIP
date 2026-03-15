@@ -40,6 +40,22 @@ struct {
 	__uint(max_entries, 1 << 28); // 256 MB
 } events SEC(".maps");
 
+// Per-op queue inflight counter (insert -> issue)
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 10);
+	__type(key, __u32);
+	__type(value, __s64);
+} q_inflight_counts SEC(".maps");
+
+// Per-op driver inflight counter (issue -> complete)
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 10);
+	__type(key, __u32);
+	__type(value, __s64);
+} d_inflight_counts SEC(".maps");
+
 // ── Inline probe handlers ──
 
 static __always_inline int handle_block_rq_insert(struct request *rq)
@@ -62,6 +78,17 @@ static __always_inline int handle_block_rq_insert(struct request *rq)
 	bpf_get_current_comm(&data.comm, sizeof(data.comm));
 	bpf_map_update_elem(&rq_metadata, &rq_key, &data, BPF_ANY);
 
+	// Atomically increment queue inflight; snapshot driver inflight
+	__u32 op_key = op;
+	__s64 *qcnt = bpf_map_lookup_elem(&q_inflight_counts, &op_key);
+	__s32 qi = 0;
+	if (qcnt)
+		qi = (__s32)(__sync_fetch_and_add(qcnt, 1) + 1);
+	__s64 *dcnt = bpf_map_lookup_elem(&d_inflight_counts, &op_key);
+	__s32 di = 0;
+	if (dcnt)
+		di = (__s32)*dcnt;
+
 	// Emit insert event
 	struct block_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (e) {
@@ -73,6 +100,8 @@ static __always_inline int handle_block_rq_insert(struct request *rq)
 		e->sector = sector;
 		e->rq = rq_key;
 		__builtin_memcpy(e->comm, data.comm, 16);
+		e->q_inflight = qi;
+		e->d_inflight = di;
 		bpf_ringbuf_submit(e, 0);
 	}
 
@@ -113,6 +142,23 @@ static __always_inline int handle_block_rq_issue(struct request *rq)
 		bpf_map_delete_elem(&insert_time, &rq_key);
 	}
 
+	// Decrement queue inflight only if this request went through insert;
+	// on schedulers like 'none', requests skip insert entirely.
+	__u32 op_key = op;
+	__s64 *qcnt = bpf_map_lookup_elem(&q_inflight_counts, &op_key);
+	__s32 qi = 0;
+	if (qcnt) {
+		if (t_insert)
+			qi = (__s32)(__sync_fetch_and_add(qcnt, -1) - 1);
+		else
+			qi = (__s32)*qcnt;
+	}
+	// Always increment driver inflight
+	__s64 *dcnt = bpf_map_lookup_elem(&d_inflight_counts, &op_key);
+	__s32 di = 0;
+	if (dcnt)
+		di = (__s32)(__sync_fetch_and_add(dcnt, 1) + 1);
+
 	// Emit issue event
 	struct block_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (e) {
@@ -124,6 +170,8 @@ static __always_inline int handle_block_rq_issue(struct request *rq)
 		e->sector = sector;
 		e->rq = rq_key;
 		__builtin_memcpy(e->comm, data.comm, 16);
+		e->q_inflight = qi;
+		e->d_inflight = di;
 		bpf_ringbuf_submit(e, 0);
 	}
 
@@ -149,6 +197,17 @@ static __always_inline int handle_block_rq_complete(struct request *rq)
 		return 0;
 	}
 
+	// Snapshot queue inflight; atomically decrement driver inflight
+	__u32 op_key = data->op;
+	__s64 *qcnt = bpf_map_lookup_elem(&q_inflight_counts, &op_key);
+	__s32 qi = 0;
+	if (qcnt)
+		qi = (__s32)*qcnt;
+	__s64 *dcnt = bpf_map_lookup_elem(&d_inflight_counts, &op_key);
+	__s32 di = 0;
+	if (dcnt)
+		di = (__s32)(__sync_fetch_and_add(dcnt, -1) - 1);
+
 	// Emit complete event
 	struct block_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (e) {
@@ -160,6 +219,8 @@ static __always_inline int handle_block_rq_complete(struct request *rq)
 		e->sector = data->sector;
 		e->rq = rq_key;
 		__builtin_memcpy(e->comm, data->comm, 16);
+		e->q_inflight = qi;
+		e->d_inflight = di;
 		bpf_ringbuf_submit(e, 0);
 	}
 
