@@ -98,7 +98,7 @@ else
 		--output-format=json --output=$(FIO_OUT) \
 		--section=$(1)
 endif
-	$(Q)sleep 1
+	$(Q)sleep 5
 	$(if $(filter sysstat,$(LAYERS)),$(Q)$(MAKE) -C $(SYSSTAT_DIR) stop-collection $(REDIRECT))
 	$(if $(filter fs,$(LAYERS)),$(Q)$(MAKE) -C $(FS_DIR) stop-collection $(LAYER_VARS) $(REDIRECT))
 	$(Q)sleep 1

@@ -100,7 +100,7 @@ else
 		--output-format=json --output=$(FIO_OUT) \
 		--section=$(1)
 endif
-	$(Q)sleep 1
+	$(Q)sleep 5
 	$(if $(filter nvme,$(LAYERS)),$(Q)$(MAKE) -C $(NVME_DIR) stop-collection $(LAYER_VARS) $(REDIRECT))
 	$(if $(filter block,$(LAYERS)),$(Q)$(MAKE) -C $(BLOCK_DIR) stop-collection $(LAYER_VARS) $(REDIRECT))
 	$(Q)sleep 1
