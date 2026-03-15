@@ -22,14 +22,13 @@ def parse_args(argv=None):
     parent.add_argument(
         "-l", "--layers",
         action="append",
-        choices=ALL_LAYERS + ["all"],
         default=None,
-        help="Layers to target (repeatable, default: all)",
+        help="Layers to target, comma-separated and/or repeatable (default: all)",
     )
     parent.add_argument("-m", "--mode", choices=["summary", "detailed"], default="summary")
     parent.add_argument("-p", "--comm-filter", help="Process/command name filter, comma-separated for multiple (block, fs)")
-    parent.add_argument("-c", "--container-filter", help="Container name filter (forces detailed)")
-    parent.add_argument("-d", "--dev-filter", help="NVMe device filter (e.g. nvme0n1)")
+    parent.add_argument("-c", "--container-filter", help="Container name filter, comma-separated for multiple (forces detailed)")
+    parent.add_argument("-d", "--dev-filter", help="NVMe device filter, comma-separated for multiple (e.g. nvme0n1,nvme1n1)")
     parent.add_argument("--clean", action="store_true", help="Clean results directory first")
     parent.add_argument("--visualize", action="store_true", help="Generate visualization dashboards (detailed mode only)")
     parent.add_argument("--debug", action="store_true", help="Enable verbose Makefile output (DEBUG=1)")
@@ -51,16 +50,27 @@ def parse_args(argv=None):
 
     args = parser.parse_args(argv)
 
-    # Normalise layers
+    # Flatten comma-separated values from repeated -l flags
     if args.layers is None:
         args.layers = list(ALL_LAYERS)
-    elif "all" in args.layers:
+        return args
+
+    raw = []
+    for item in args.layers:
+        raw.extend(item.split(","))
+
+    # Validate each token
+    valid = set(ALL_LAYERS + ["all"])
+    for token in raw:
+        if token not in valid:
+            parser.error(f"invalid layer: '{token}' (choose from {', '.join(sorted(valid))})")
+
+    if "all" in raw:
         args.layers = list(ALL_LAYERS)
     else:
-        # Deduplicate while preserving order
         seen = set()
         unique = []
-        for l in args.layers:
+        for l in raw:
             if l not in seen:
                 seen.add(l)
                 unique.append(l)

@@ -60,6 +60,23 @@ static int handle_event(void *ctx, void *data, size_t data_sz) {
   return 0;
 }
 
+static int parse_dev_filters(struct standalone_bpf *skel, const char *filter) {
+  char buf[256];
+  strncpy(buf, filter, sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = '\0';
+
+  int count = 0;
+  char *saveptr = NULL;
+  char *token = strtok_r(buf, ",", &saveptr);
+  while (token && count < 8) {
+    strncpy((char *)skel->rodata->dev_filters[count], token, 31);
+    count++;
+    token = strtok_r(NULL, ",", &saveptr);
+  }
+  skel->rodata->num_dev_filters = count;
+  return count;
+}
+
 static void usage(const char *prog) {
   fprintf(stderr, "Usage: %s -o <output_csv> -f <dev_filter>\n", prog);
   exit(1);
@@ -95,9 +112,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  skel->rodata->has_dev_filter = true;
-  strncpy((char *)skel->rodata->dev_filter, filter,
-          sizeof(skel->rodata->dev_filter) - 1);
+  parse_dev_filters(skel, filter);
 
   int err = standalone_bpf__load(skel);
   if (err) {

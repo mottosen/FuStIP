@@ -5,15 +5,16 @@
 #include <bpf/bpf_tracing.h>
 
 // Configurable filter (set by userspace via skeleton rodata)
-const volatile char dev_filter[32] = {};
-const volatile bool has_dev_filter = false;
+#define MAX_DEV_FILTERS 8
+const volatile char dev_filters[MAX_DEV_FILTERS][32] = {};
+const volatile __u8 num_dev_filters = 0;
 
 #include "../bpf_core.h"
 
 // ── Device filter helper ──
-// Checks if the request's disk name contains the filter string
+// Returns true if the request's disk name contains any filter substring
 static __always_inline bool dev_matches(struct request *req) {
-  if (!has_dev_filter)
+  if (num_dev_filters == 0)
     return true;
 
   char disk_name[32];
@@ -22,19 +23,25 @@ static __always_inline bool dev_matches(struct request *req) {
     return false;
   bpf_probe_read_kernel_str(&disk_name, sizeof(disk_name), &disk->disk_name);
 
-  // Substring search
-  for (int i = 0; i < 32; i++) {
-    if (disk_name[i] == '\0')
+  for (int f = 0; f < MAX_DEV_FILTERS; f++) {
+    if (f >= num_dev_filters)
       break;
-    bool match = true;
-    for (int j = 0; j < 32 && dev_filter[j] != '\0'; j++) {
-      if (i + j >= 32 || disk_name[i + j] != dev_filter[j]) {
-        match = false;
+    if (dev_filters[f][0] == '\0')
+      continue;
+    // Substring search: check if dev_filters[f] is contained in disk_name
+    for (int i = 0; i < 32; i++) {
+      if (disk_name[i] == '\0')
         break;
+      bool match = true;
+      for (int j = 0; j < 32 && dev_filters[f][j] != '\0'; j++) {
+        if (i + j >= 32 || disk_name[i + j] != dev_filters[f][j]) {
+          match = false;
+          break;
+        }
       }
+      if (match)
+        return true;
     }
-    if (match)
-      return true;
   }
   return false;
 }
