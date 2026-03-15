@@ -146,6 +146,13 @@ def build_layer_vars(layer, args):
     return vs
 
 
+def _concurrent(cmds):
+    """Wrap commands to run concurrently (background + wait)."""
+    if len(cmds) <= 1:
+        return cmds
+    return [f"{cmd} &" for cmd in cmds] + ["wait"]
+
+
 def generate_profile_commands(args):
     order = PROFILE_START_ORDER if args.sub_action == "start" else PROFILE_STOP_ORDER
     target = "start-collection" if args.sub_action == "start" else "stop-collection"
@@ -219,12 +226,12 @@ def main(argv=None):
         cmds.append(f"rm -rf {args.results_dir}/*")
 
     if args.action == "profile":
-        cmds.extend(generate_profile_commands(args))
+        cmds.extend(_concurrent(generate_profile_commands(args)))
     elif args.action == "test":
         cmds.extend(generate_test_commands(args))
 
     if args.visualize:
-        cmds.extend(generate_visualize_commands(args))
+        cmds.extend(_concurrent(generate_visualize_commands(args)))
 
     for cmd in cmds:
         print(cmd)
