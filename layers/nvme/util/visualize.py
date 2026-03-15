@@ -8,6 +8,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from visualization.shared import (build_dashboard, plot_cumulated_mb_over_time,
+                                   plot_inflight_from_column,
                                    plot_inflight_over_time, plot_io_latency_cdf,
                                    plot_io_size_cdf, plot_type_distribution)
 
@@ -20,12 +21,18 @@ def _build_row(label, df):
     complete = df[df["event"] == "complete"]
     types = sorted(complete["op"].dropna().unique())
     counts = complete.groupby("op").size().to_dict()
+    has_inflight = "inflight" in df.columns
+
+    if has_inflight:
+        inflight_fn = lambda ax, d=df, t=types: plot_inflight_from_column(ax, d, "op", "timestamp_ns", t)
+    else:
+        inflight_fn = lambda ax, d=df, t=types: plot_inflight_over_time(ax, d, "setup", "complete", "op", "timestamp_ns", t)
 
     return {
         "label": label,
         "plots": [
             lambda ax, c=counts: plot_type_distribution(ax, c),
-            lambda ax, d=df, t=types: plot_inflight_over_time(ax, d, "setup", "complete", "op", "timestamp_ns", t),
+            inflight_fn,
             lambda ax, d=df, t=types: plot_cumulated_mb_over_time(ax, d, "complete", "op", "timestamp_ns", "bytes", t),
             lambda ax, c=complete, t=types: plot_io_size_cdf(ax, c, "op", "bytes", t),
             lambda ax, c=complete, t=types: plot_io_latency_cdf(ax, c, "op", "latency_ns", t),
@@ -43,7 +50,8 @@ def main():
     print(f"Reading {csv_path.name}...")
     header = pd.read_csv(csv_path, nrows=0).columns.tolist()
     has_comm = "comm" in header
-    usecols = USECOLS + (["comm"] if has_comm else [])
+    has_inflight = "inflight" in header
+    usecols = USECOLS + (["comm"] if has_comm else []) + (["inflight"] if has_inflight else [])
     df = pd.read_csv(csv_path, usecols=usecols)
 
     rows = []

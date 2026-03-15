@@ -101,25 +101,43 @@ def generate_stats(csv_path):
     # Inflight time-series (IO syscalls only)
     if len(io_enters) > 0 and len(io_exits) > 0:
         t_min = df["timestamp_ns"].min()
-        t_max = df["timestamp_ns"].max()
         window_ns = 1_000_000_000
 
         result["tseries"]["sc_inflight"] = {}
-        for sc in io_enters["syscall"].unique():
-            enter_ts = io_enters[io_enters["syscall"] == sc]["timestamp_ns"].values
-            exit_ts = io_exits[io_exits["syscall"] == sc]["timestamp_ns"].values
-            points = []
-            t = t_min
-            sec = 0
-            while t <= t_max:
-                inflight = int((enter_ts <= t).sum() - (exit_ts <= t).sum())
-                h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
-                points.append({"time": f"{h:02d}:{m:02d}:{s:02d}",
-                               "value": max(0, inflight)})
-                t += window_ns
-                sec += 1
-            if points:
-                result["tseries"]["sc_inflight"][sc] = tseries_with_points(points)
+        io_events = df[df["syscall"].isin(IO_SYSCALLS)]
+
+        if "inflight" in df.columns:
+            # Use pre-computed in-kernel inflight column
+            for sc in io_events["syscall"].unique():
+                sc_df = io_events[io_events["syscall"] == sc].sort_values("timestamp_ns")
+                secs = ((sc_df["timestamp_ns"].values - t_min) / window_ns).astype(int)
+                sc_df = sc_df.assign(sec=secs)
+                sampled = sc_df.groupby("sec")["inflight"].last()
+                points = []
+                for s, v in sampled.items():
+                    h, m, ss = s // 3600, (s % 3600) // 60, s % 60
+                    points.append({"time": f"{h:02d}:{m:02d}:{ss:02d}",
+                                   "value": max(0, int(v))})
+                if points:
+                    result["tseries"]["sc_inflight"][sc] = tseries_with_points(points)
+        else:
+            # Fallback: compute from enter/exit event counts
+            t_max = df["timestamp_ns"].max()
+            for sc in io_enters["syscall"].unique():
+                enter_ts = io_enters[io_enters["syscall"] == sc]["timestamp_ns"].values
+                exit_ts = io_exits[io_exits["syscall"] == sc]["timestamp_ns"].values
+                points = []
+                t = t_min
+                sec = 0
+                while t <= t_max:
+                    inflight = int((enter_ts <= t).sum() - (exit_ts <= t).sum())
+                    h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
+                    points.append({"time": f"{h:02d}:{m:02d}:{s:02d}",
+                                   "value": max(0, inflight)})
+                    t += window_ns
+                    sec += 1
+                if points:
+                    result["tseries"]["sc_inflight"][sc] = tseries_with_points(points)
 
     # Access pattern (sequential/random from byte offsets, pread64/pwrite64 only)
     offset_syscalls = {"pread64", "pwrite64"}
