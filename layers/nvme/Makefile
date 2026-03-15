@@ -1,14 +1,11 @@
 ifdef DEBUG
     Q =
     ERR_REDIRECT =
-    MAKE_FLAGS =
 else
     Q = @
     ERR_REDIRECT = 2>/dev/null
-    MAKE_FLAGS = --no-print-directory
+    MAKEFLAGS += --no-print-directory
 endif
-
-MAKE := $(MAKE) $(MAKE_FLAGS)
 
 # If CONTAINER_FILTER is set, force detailed mode (IG backend)
 ifdef CONTAINER_FILTER
@@ -44,16 +41,11 @@ ensure-sudo:
 
 .PHONY: ensure-results-exists
 ensure-results-exists:
-	$(Q)echo -e "\nEnsuring results dir exists.."
-
 	$(Q)if [ ! -d "$(RESULTS_DIR)" ]; then \
 		echo "Results dir was not found: $(RESULTS_DIR)"; \
 		exit 1; \
 	fi
-
 	$(Q)mkdir -p "$(RESULTS_DIR)/nvme"
-
-	$(Q)echo -e "Results dir was found or created.\n"
 
 .PHONY: start-collection
 start-collection: ensure-results-exists ensure-sudo
@@ -101,40 +93,43 @@ endif
 
 .PHONY: stop-collection
 stop-collection:
-	$(Q)echo -e "\nStopping collection.."
-
 	$(Q)for pidfile in $(PIDS_DIR)/*.pid; do \
 		if [ -f "$$pidfile" ]; then \
 			kill $$(cat "$$pidfile") $(ERR_REDIRECT) 1>&2 || true; \
 		fi; \
 	done
-
 	$(Q)rm -rf "$(PIDS_DIR)"
-
-	$(Q)echo -e "Collection stopped!\n"
-
+	@echo "nvme collection stopped"
 	$(Q)sleep 2
 
 ifeq ($(MODE),detailed)
 ifdef CONTAINER_FILTER
-	$(Q)python "$(ROOT_DIR)/util/ig_to_csv.py" \
-		"$(RESULTS_DIR)/nvme/detailed.columns" \
-		"$(RESULTS_DIR)/nvme/detailed.csv" \
-		nvme
+	$(Q)if [ -f "$(RESULTS_DIR)/nvme/detailed.columns" ]; then \
+		python "$(ROOT_DIR)/util/ig_to_csv.py" \
+			"$(RESULTS_DIR)/nvme/detailed.columns" \
+			"$(RESULTS_DIR)/nvme/detailed.csv" \
+			nvme; \
+	fi
 endif
-	$(Q)$(MAKE) generate-stats
+	$(Q)if [ -f "$(RESULTS_DIR)/nvme/detailed.csv" ]; then \
+		$(MAKE) generate-stats; \
+	fi
 else
-	$(Q)$(MAKE) generate-stats
+	$(Q)if [ -f "$(RESULTS_DIR)/nvme/trace.out" ]; then \
+		$(MAKE) generate-stats; \
+	fi
 endif
 
 .PHONY: generate-stats
 generate-stats: ensure-results-exists
-	$(Q)echo -e "\nGenerating nvme layer stats.."
-
 ifeq ($(MODE),detailed)
-	$(Q)python "./util/generate_detailed_stats.py" "$(RESULTS_DIR)"
+	$(Q)python "./util/generate_detailed_stats.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) 1>/dev/null
 else
-	$(Q)python "./util/generate_summary_stats.py" "$(RESULTS_DIR)"
+	$(Q)python "./util/generate_summary_stats.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) 1>/dev/null
 endif
+	@echo "nvme stats generated"
 
-	$(Q)echo -e "Stats generated!\n"
+.PHONY: visualize
+visualize: ensure-results-exists
+	$(Q)python "./util/visualize.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) 1>/dev/null
+	$(Q)echo -e "nvme visualization generated"

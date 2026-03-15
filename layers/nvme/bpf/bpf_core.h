@@ -9,6 +9,7 @@ struct cmd_data {
   __u8 op;
   __u32 bytes;
   __u64 sector;
+  __u8 comm[16];
 };
 
 // ── Maps ──
@@ -59,6 +60,7 @@ static __always_inline int handle_nvme_fentry_setup(struct request *req) {
       .bytes = bytes,
       .sector = sector,
   };
+  bpf_get_current_comm(&data.comm, sizeof(data.comm));
   bpf_map_update_elem(&cmd_metadata, &rq_key, &data, BPF_ANY);
 
   // Bridge: store rq pointer for the rawtracepoint to pick up
@@ -99,6 +101,7 @@ static __always_inline int handle_nvme_rawtp_setup(void) {
     e->latency_ns = 0;
     e->sector = data->sector;
     e->rq = rq_key;
+    __builtin_memcpy(e->comm, data->comm, 16);
     bpf_ringbuf_submit(e, 0);
   }
 
@@ -134,6 +137,7 @@ static __always_inline int handle_nvme_complete(struct request *req) {
     e->latency_ns = latency;
     e->sector = data->sector;
     e->rq = rq_key;
+    __builtin_memcpy(e->comm, data->comm, 16);
     bpf_ringbuf_submit(e, 0);
   }
 

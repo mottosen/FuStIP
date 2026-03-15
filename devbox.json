@@ -19,8 +19,7 @@
     "RESULTS_DIR": "$PWD/results",
 
     "VENV_DIR": "./.venv",
-    "PIP_REQUIRE_VIRTUALENV": "true",
-    "PIP_REQUIRE_FILE": "./requirements.txt"
+    "PIP_REQUIRE_VIRTUALENV": "true"
   },
   "shell": {
     "init_hook": [
@@ -33,10 +32,7 @@
       "echo -e \"\\nDevbox started!\""
     ],
     "scripts": {
-      "update_pip": [
-        "python -m pip install --upgrade pip",
-        "python -m pip install -r $PIP_REQUIRE_FILE"
-      ],
+      "update_pip": ["pip install -r ./requirements.txt"],
       "install_ig": ["make -C ./subs/inspektor-gadget ig"]
     }
   }

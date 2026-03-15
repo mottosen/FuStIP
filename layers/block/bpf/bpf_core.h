@@ -9,6 +9,7 @@ struct rq_data {
 	__u8  op;
 	__u32 bytes;
 	__u64 sector;
+	__u8  comm[16];
 };
 
 // ── Maps ──
@@ -58,6 +59,7 @@ static __always_inline int handle_block_rq_insert(struct request *rq)
 		.bytes = bytes,
 		.sector = sector,
 	};
+	bpf_get_current_comm(&data.comm, sizeof(data.comm));
 	bpf_map_update_elem(&rq_metadata, &rq_key, &data, BPF_ANY);
 
 	// Emit insert event
@@ -70,6 +72,7 @@ static __always_inline int handle_block_rq_insert(struct request *rq)
 		e->latency_ns = 0;
 		e->sector = sector;
 		e->rq = rq_key;
+		__builtin_memcpy(e->comm, data.comm, 16);
 		bpf_ringbuf_submit(e, 0);
 	}
 
@@ -93,6 +96,13 @@ static __always_inline int handle_block_rq_issue(struct request *rq)
 		.bytes = bytes,
 		.sector = sector,
 	};
+
+	// Preserve comm from insert if available, else capture current
+	struct rq_data *old_data = bpf_map_lookup_elem(&rq_metadata, &rq_key);
+	if (old_data)
+		__builtin_memcpy(data.comm, old_data->comm, 16);
+	else
+		bpf_get_current_comm(&data.comm, sizeof(data.comm));
 	bpf_map_update_elem(&rq_metadata, &rq_key, &data, BPF_ANY);
 
 	// Compute queue latency (insert → issue)
@@ -113,6 +123,7 @@ static __always_inline int handle_block_rq_issue(struct request *rq)
 		e->latency_ns = queue_lat;
 		e->sector = sector;
 		e->rq = rq_key;
+		__builtin_memcpy(e->comm, data.comm, 16);
 		bpf_ringbuf_submit(e, 0);
 	}
 
@@ -148,6 +159,7 @@ static __always_inline int handle_block_rq_complete(struct request *rq)
 		e->latency_ns = driver_lat;
 		e->sector = data->sector;
 		e->rq = rq_key;
+		__builtin_memcpy(e->comm, data->comm, 16);
 		bpf_ringbuf_submit(e, 0);
 	}
 

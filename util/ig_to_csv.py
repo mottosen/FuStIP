@@ -56,8 +56,8 @@ def parse_columns(input_path):
 
 
 def convert_block(rows, writer):
-    """CSV: timestamp_ns,event,op,bytes,latency_ns,sector,rq"""
-    writer.writerow(["timestamp_ns", "event", "op", "bytes", "latency_ns", "sector", "rq"])
+    """CSV: timestamp_ns,event,op,bytes,latency_ns,sector,rq,comm"""
+    writer.writerow(["timestamp_ns", "event", "op", "bytes", "latency_ns", "sector", "rq", "comm"])
     for obj in rows:
         event_type = int(obj.get("event_type", 0))
         op = int(obj.get("op", 0))
@@ -70,12 +70,13 @@ def convert_block(rows, writer):
             latency if latency else "",
             obj.get("sector", 0),
             f"0x{int(obj.get('rq', 0)):x}",
+            obj.get("comm", ""),
         ])
 
 
 def convert_nvme(rows, writer):
-    """CSV: timestamp_ns,event,op,bytes,latency_ns,sector,rq"""
-    writer.writerow(["timestamp_ns", "event", "op", "bytes", "latency_ns", "sector", "rq"])
+    """CSV: timestamp_ns,event,op,bytes,latency_ns,sector,rq,comm"""
+    writer.writerow(["timestamp_ns", "event", "op", "bytes", "latency_ns", "sector", "rq", "comm"])
     for obj in rows:
         event_type = int(obj.get("event_type", 0))
         op = int(obj.get("op", 0))
@@ -88,12 +89,13 @@ def convert_nvme(rows, writer):
             latency if latency else "",
             obj.get("sector", 0),
             f"0x{int(obj.get('rq', 0)):x}",
+            obj.get("comm", ""),
         ])
 
 
 def convert_fs(rows, writer):
-    """CSV: timestamp_ns,event,syscall,bytes,latency_ns,fd,offset,tid"""
-    writer.writerow(["timestamp_ns", "event", "syscall", "bytes", "latency_ns", "fd", "offset", "tid"])
+    """CSV: timestamp_ns,event,syscall,bytes,latency_ns,fd,offset,tid,comm"""
+    writer.writerow(["timestamp_ns", "event", "syscall", "bytes", "latency_ns", "fd", "offset", "tid", "comm"])
     for obj in rows:
         event_type = int(obj.get("event_type", 0))
         syscall = int(obj.get("syscall", 0))
@@ -110,6 +112,7 @@ def convert_fs(rows, writer):
             fd if fd != -1 else "",
             offset if offset != -1 else "",
             obj.get("tid", 0),
+            obj.get("comm", ""),
         ])
 
 
