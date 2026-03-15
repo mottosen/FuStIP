@@ -41,10 +41,18 @@ def main():
         sys.exit(1)
 
     print(f"Reading {csv_path.name}...")
-    df = pd.read_csv(csv_path, usecols=USECOLS)
+    header = pd.read_csv(csv_path, nrows=0).columns.tolist()
+    has_comm = "comm" in header
+    usecols = USECOLS + (["comm"] if has_comm else [])
+    df = pd.read_csv(csv_path, usecols=usecols)
 
-    # NVMe filters by device — show all IO in one row
-    rows = [_build_row("nvme", df)]
+    rows = []
+    if has_comm:
+        for comm_val in sorted(df["comm"].dropna().unique()):
+            comm_df = df[df["comm"] == comm_val]
+            rows.append(_build_row(comm_val, comm_df))
+    else:
+        rows.append(_build_row("nvme", df))
 
     output = results_dir / "visualizations" / "nvme-dashboard.png"
     build_dashboard(
