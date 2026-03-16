@@ -27,6 +27,9 @@ int BPF_PROG(ig_block_rq_insert, struct request *rq) {
 
 SEC("raw_tracepoint/block_rq_issue")
 int BPF_PROG(ig_block_rq_issue, struct request *rq) {
+  u64 mntns_id = gadget_get_current_mntns_id();
+  if (gadget_should_discard_mntns_id(mntns_id))
+    return 0;
   return handle_block_rq_issue(rq);
 }
 
