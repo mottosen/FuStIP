@@ -45,6 +45,7 @@ IG_TAG ?= fustip-fs:latest
 .PHONY: ig-build
 ig-build:
 	$(Q)echo "  IG-BUILD $(IG_TAG)"
+	$(Q)sudo $(IG) image rm $(IG_TAG) 2>/dev/null || true
 	$(Q)sudo $(IG) image build -f ig-build.yaml -t $(IG_TAG) .
 
 # ── Clean ──

@@ -108,7 +108,7 @@ ifdef CONTAINER_FILTER
 		python "$(ROOT_DIR)/util/ig_to_csv.py" \
 			"$(RESULTS_DIR)/nvme/detailed.columns" \
 			"$(RESULTS_DIR)/nvme/detailed.csv" \
-			nvme; \
+			nvme $(REDIRECT); \
 	fi
 endif
 	$(Q)if [ -f "$(RESULTS_DIR)/nvme/detailed.csv" ]; then \

@@ -107,7 +107,7 @@ ifdef CONTAINER_FILTER
 		python "$(ROOT_DIR)/util/ig_to_csv.py" \
 			"$(RESULTS_DIR)/fs/detailed.columns" \
 			"$(RESULTS_DIR)/fs/detailed.csv" \
-			fs; \
+			fs $(REDIRECT); \
 	fi
 endif
 	$(Q)if [ -f "$(RESULTS_DIR)/fs/detailed.csv" ]; then \
