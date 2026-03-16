@@ -28,3 +28,13 @@ datasources:
         annotations:
           description: Request pointer (correlation ID)
           columns.maxwidth: "24"
+      comm:
+        annotations:
+          description: Process name
+          columns.maxwidth: "16"
+      q_inflight:
+        annotations:
+          description: Queue inflight count (insert->issue)
+      d_inflight:
+        annotations:
+          description: Driver inflight count (issue->complete)

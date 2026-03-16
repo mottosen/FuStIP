@@ -12,6 +12,12 @@ struct cmd_data {
   __u8 comm[16];
 };
 
+// ── Per-(op, comm) key for inflight counters ──
+struct inflight_key {
+  __u8  op;
+  char  comm[16];
+};
+
 // ── Maps ──
 
 // fentry → rawtracepoint bridge: tid → rq pointer
@@ -43,11 +49,11 @@ struct {
   __uint(max_entries, 1 << 28); // 256 MB
 } events SEC(".maps");
 
-// Per-op inflight counter (atomically incremented/decremented)
+// Per-(op, comm) inflight counter (atomically incremented/decremented)
 struct {
-  __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, 10);
-  __type(key, __u32);
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 256);
+  __type(key, struct inflight_key);
   __type(value, __s64);
 } inflight_counts SEC(".maps");
 
@@ -101,8 +107,12 @@ static __always_inline int handle_nvme_rawtp_setup(void) {
 
   // Atomically increment inflight counter (outside ringbuf reserve so
   // counter stays accurate even when ring buffer drops events)
-  __u32 op_key = data->op;
-  __s64 *cnt = bpf_map_lookup_elem(&inflight_counts, &op_key);
+  struct inflight_key ikey = {};
+  ikey.op = data->op;
+  __builtin_memcpy(ikey.comm, data->comm, 16);
+  __s64 zero = 0;
+  bpf_map_update_elem(&inflight_counts, &ikey, &zero, BPF_NOEXIST);
+  __s64 *cnt = bpf_map_lookup_elem(&inflight_counts, &ikey);
   __s32 cur_inflight = 0;
   if (cnt)
     cur_inflight = (__s32)(__sync_fetch_and_add(cnt, 1) + 1);
@@ -145,8 +155,10 @@ static __always_inline int handle_nvme_complete(struct request *req) {
   }
 
   // Atomically decrement inflight counter
-  __u32 op_key = data->op;
-  __s64 *cnt = bpf_map_lookup_elem(&inflight_counts, &op_key);
+  struct inflight_key ikey = {};
+  ikey.op = data->op;
+  __builtin_memcpy(ikey.comm, data->comm, 16);
+  __s64 *cnt = bpf_map_lookup_elem(&inflight_counts, &ikey);
   __s32 cur_inflight = 0;
   if (cnt)
     cur_inflight = (__s32)(__sync_fetch_and_add(cnt, -1) - 1);

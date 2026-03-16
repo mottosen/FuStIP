@@ -12,6 +12,12 @@ struct rq_data {
 	__u8  comm[16];
 };
 
+// ── Per-(op, comm) key for inflight counters ──
+struct inflight_key {
+	__u8  op;
+	char  comm[16];
+};
+
 // ── Maps ──
 
 struct {
@@ -40,19 +46,19 @@ struct {
 	__uint(max_entries, 1 << 28); // 256 MB
 } events SEC(".maps");
 
-// Per-op queue inflight counter (insert -> issue)
+// Per-(op, comm) queue inflight counter (insert -> issue)
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 10);
-	__type(key, __u32);
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);
+	__type(key, struct inflight_key);
 	__type(value, __s64);
 } q_inflight_counts SEC(".maps");
 
-// Per-op driver inflight counter (issue -> complete)
+// Per-(op, comm) driver inflight counter (issue -> complete)
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 10);
-	__type(key, __u32);
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);
+	__type(key, struct inflight_key);
 	__type(value, __s64);
 } d_inflight_counts SEC(".maps");
 
@@ -79,12 +85,17 @@ static __always_inline int handle_block_rq_insert(struct request *rq)
 	bpf_map_update_elem(&rq_metadata, &rq_key, &data, BPF_ANY);
 
 	// Atomically increment queue inflight; snapshot driver inflight
-	__u32 op_key = op;
-	__s64 *qcnt = bpf_map_lookup_elem(&q_inflight_counts, &op_key);
+	struct inflight_key ikey = {};
+	ikey.op = op;
+	__builtin_memcpy(ikey.comm, data.comm, 16);
+	__s64 zero = 0;
+	bpf_map_update_elem(&q_inflight_counts, &ikey, &zero, BPF_NOEXIST);
+	__s64 *qcnt = bpf_map_lookup_elem(&q_inflight_counts, &ikey);
 	__s32 qi = 0;
 	if (qcnt)
 		qi = (__s32)(__sync_fetch_and_add(qcnt, 1) + 1);
-	__s64 *dcnt = bpf_map_lookup_elem(&d_inflight_counts, &op_key);
+	bpf_map_update_elem(&d_inflight_counts, &ikey, &zero, BPF_NOEXIST);
+	__s64 *dcnt = bpf_map_lookup_elem(&d_inflight_counts, &ikey);
 	__s32 di = 0;
 	if (dcnt)
 		di = (__s32)*dcnt;
@@ -144,8 +155,10 @@ static __always_inline int handle_block_rq_issue(struct request *rq)
 
 	// Decrement queue inflight only if this request went through insert;
 	// on schedulers like 'none', requests skip insert entirely.
-	__u32 op_key = op;
-	__s64 *qcnt = bpf_map_lookup_elem(&q_inflight_counts, &op_key);
+	struct inflight_key ikey = {};
+	ikey.op = op;
+	__builtin_memcpy(ikey.comm, data.comm, 16);
+	__s64 *qcnt = bpf_map_lookup_elem(&q_inflight_counts, &ikey);
 	__s32 qi = 0;
 	if (qcnt) {
 		if (t_insert)
@@ -154,7 +167,9 @@ static __always_inline int handle_block_rq_issue(struct request *rq)
 			qi = (__s32)*qcnt;
 	}
 	// Always increment driver inflight
-	__s64 *dcnt = bpf_map_lookup_elem(&d_inflight_counts, &op_key);
+	__s64 zero = 0;
+	bpf_map_update_elem(&d_inflight_counts, &ikey, &zero, BPF_NOEXIST);
+	__s64 *dcnt = bpf_map_lookup_elem(&d_inflight_counts, &ikey);
 	__s32 di = 0;
 	if (dcnt)
 		di = (__s32)(__sync_fetch_and_add(dcnt, 1) + 1);
@@ -198,12 +213,14 @@ static __always_inline int handle_block_rq_complete(struct request *rq)
 	}
 
 	// Snapshot queue inflight; atomically decrement driver inflight
-	__u32 op_key = data->op;
-	__s64 *qcnt = bpf_map_lookup_elem(&q_inflight_counts, &op_key);
+	struct inflight_key ikey = {};
+	ikey.op = data->op;
+	__builtin_memcpy(ikey.comm, data->comm, 16);
+	__s64 *qcnt = bpf_map_lookup_elem(&q_inflight_counts, &ikey);
 	__s32 qi = 0;
 	if (qcnt)
 		qi = (__s32)*qcnt;
-	__s64 *dcnt = bpf_map_lookup_elem(&d_inflight_counts, &op_key);
+	__s64 *dcnt = bpf_map_lookup_elem(&d_inflight_counts, &ikey);
 	__s32 di = 0;
 	if (dcnt)
 		di = (__s32)(__sync_fetch_and_add(dcnt, -1) - 1);

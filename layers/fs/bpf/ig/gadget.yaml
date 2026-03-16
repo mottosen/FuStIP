@@ -31,3 +31,10 @@ datasources:
       tid:
         annotations:
           description: Thread ID (correlation key)
+      comm:
+        annotations:
+          description: Process name
+          columns.maxwidth: "16"
+      inflight:
+        annotations:
+          description: In-flight count for this syscall

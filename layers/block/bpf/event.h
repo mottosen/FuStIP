@@ -23,7 +23,7 @@ struct block_event {
 	__u64 latency_ns;   // queue lat (issue), driver lat (complete), 0 (insert)
 	__u64 sector;       // rq->__sector
 	__u64 rq;           // request pointer (correlation ID)
-	__u8  comm[16];     // process name
+	char  comm[16];     // process name
 	__s32 q_inflight;   // queue inflight (insert -> issue)
 	__s32 d_inflight;   // driver inflight (issue -> complete)
 } __attribute__((packed));

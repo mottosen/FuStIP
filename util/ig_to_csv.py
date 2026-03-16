@@ -56,8 +56,8 @@ def parse_columns(input_path):
 
 
 def convert_block(rows, writer):
-    """CSV: timestamp_ns,event,op,bytes,latency_ns,sector,rq,comm"""
-    writer.writerow(["timestamp_ns", "event", "op", "bytes", "latency_ns", "sector", "rq", "comm"])
+    """CSV: timestamp_ns,event,op,bytes,latency_ns,sector,rq,comm,q_inflight,d_inflight"""
+    writer.writerow(["timestamp_ns", "event", "op", "bytes", "latency_ns", "sector", "rq", "comm", "q_inflight", "d_inflight"])
     for obj in rows:
         event_type = int(obj.get("event_type", 0))
         op = int(obj.get("op", 0))
@@ -71,12 +71,14 @@ def convert_block(rows, writer):
             obj.get("sector", 0),
             f"0x{int(obj.get('rq', 0)):x}",
             obj.get("comm", ""),
+            obj.get("q_inflight", 0),
+            obj.get("d_inflight", 0),
         ])
 
 
 def convert_nvme(rows, writer):
-    """CSV: timestamp_ns,event,op,bytes,latency_ns,sector,rq,comm"""
-    writer.writerow(["timestamp_ns", "event", "op", "bytes", "latency_ns", "sector", "rq", "comm"])
+    """CSV: timestamp_ns,event,op,bytes,latency_ns,sector,rq,comm,inflight"""
+    writer.writerow(["timestamp_ns", "event", "op", "bytes", "latency_ns", "sector", "rq", "comm", "inflight"])
     for obj in rows:
         event_type = int(obj.get("event_type", 0))
         op = int(obj.get("op", 0))
@@ -90,6 +92,7 @@ def convert_nvme(rows, writer):
             obj.get("sector", 0),
             f"0x{int(obj.get('rq', 0)):x}",
             obj.get("comm", ""),
+            obj.get("inflight", 0),
         ])
 
 

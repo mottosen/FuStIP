@@ -14,6 +14,12 @@ struct sc_enter_data {
 	__u8  comm[16];
 };
 
+// ── Per-(syscall, comm) key for inflight counters ──
+struct inflight_key {
+	__u8  sc_idx;
+	char  comm[16];
+};
+
 // ── Maps ──
 
 // Enter timestamp + args: tid → sc_enter_data
@@ -29,11 +35,11 @@ struct {
 	__uint(max_entries, 1 << 28); // 256 MB
 } events SEC(".maps");
 
-// Per-syscall inflight counter (atomically incremented/decremented)
+// Per-(syscall, comm) inflight counter (atomically incremented/decremented)
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 13); // SC_MAX
-	__type(key, __u32);
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);
+	__type(key, struct inflight_key);
 	__type(value, __s64);
 } inflight_counts SEC(".maps");
 
@@ -57,8 +63,12 @@ static __always_inline int handle_sc_enter(__u8 sc_idx, __s32 fd,
 	bpf_map_update_elem(&sc_start, &tid, &data, BPF_ANY);
 
 	// Atomically increment inflight counter
-	__u32 sc_key = sc_idx;
-	__s64 *cnt = bpf_map_lookup_elem(&inflight_counts, &sc_key);
+	struct inflight_key ikey = {};
+	ikey.sc_idx = sc_idx;
+	__builtin_memcpy(ikey.comm, data.comm, 16);
+	__s64 zero = 0;
+	bpf_map_update_elem(&inflight_counts, &ikey, &zero, BPF_NOEXIST);
+	__s64 *cnt = bpf_map_lookup_elem(&inflight_counts, &ikey);
 	__s32 cur_inflight = 0;
 	if (cnt)
 		cur_inflight = (__s32)(__sync_fetch_and_add(cnt, 1) + 1);
@@ -94,8 +104,10 @@ static __always_inline int handle_sc_exit(__s64 ret)
 	__u64 latency = now - data->ts;
 
 	// Atomically decrement inflight counter
-	__u32 sc_key = data->sc_idx;
-	__s64 *cnt = bpf_map_lookup_elem(&inflight_counts, &sc_key);
+	struct inflight_key ikey = {};
+	ikey.sc_idx = data->sc_idx;
+	__builtin_memcpy(ikey.comm, data->comm, 16);
+	__s64 *cnt = bpf_map_lookup_elem(&inflight_counts, &ikey);
 	__s32 cur_inflight = 0;
 	if (cnt)
 		cur_inflight = (__s32)(__sync_fetch_and_add(cnt, -1) - 1);
