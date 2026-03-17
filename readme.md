@@ -9,17 +9,16 @@ system profile. For bpf, the tool uses two modes:
     on the tools/functionality the tool provides. This mode will output the
     aggregated results at the end of the script.
 - _detailed_: using `c` wrapper scripts, providing deeper insights and a time
-    series output - currently csv, which may be changed/expanded later.
+    series output - currently formatted as csv.
 
 The interface of the tool will be described in more detail below, but some
 general details on filtering are:
 
-- Both _summary_ and _detailed_ mode can filter by `comm` (command name), and
-    also must be filtered by `dev` (device name) for NVMe profiling.
-- For _detailed_ mode, two options are currently (exclusively) available; filter
+- Both _summary_ and _detailed_ mode can profile by `comm` (command name) for
+    command filtering, and `dev` (device name) for NVMe device filtering.
+- For _detailed_ mode, two options are currently available; filter
     by `comm`/`dev` or `container`. Container filtering uses mount namespace
-    matching directly in BPF, with dynamic resolution of the container's
-    namespace at runtime.
+    to dynamically resolve the container's namespace at runtime.
 
 
 ## Repo Structure
@@ -59,10 +58,10 @@ needed.
 
 ## Test Suite
 The tool aims to ensure stability through a _Flexible I/O Tester_ (fio) test
-suite, providing different workloads for validation tool correctness under both
+suite, providing different workloads for validating tool correctness under both
 low and high load. Please, refer to the test dir for details on this, and note
-that it is divided into fs+syswide/block+nvme workload, basically differentiating
-between syscalls and requests inside the kernel.
+that it is divided into fs+syswide and block+nvme workload, basically
+differentiating between syscalls and requests inside the kernel.
 
 These workloads are inspired by mimicking Vector DB workloads, as this tool has
 been build concurrently with such exploration, but should be expanded in the future.
