@@ -8,8 +8,25 @@
 #define MAX_DEV_FILTERS 8
 const volatile char dev_filters[MAX_DEV_FILTERS][32] = {};
 const volatile __u8 num_dev_filters = 0;
+const volatile bool filter_by_mntns = false;
 
 #include "../bpf_core.h"
+
+// ── Mount namespace filter map (populated dynamically by loader) ──
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, __u64);
+  __type(value, __u32);
+  __uint(max_entries, 8);
+} mntns_filter SEC(".maps");
+
+static __always_inline bool mntns_matches(void) {
+  if (!filter_by_mntns)
+    return true;
+  struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+  __u64 mntns_id = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
+  return bpf_map_lookup_elem(&mntns_filter, &mntns_id) != NULL;
+}
 
 // ── Device filter helper ──
 // Returns true if the request's disk name contains any filter substring
@@ -48,7 +65,7 @@ static __always_inline bool dev_matches(struct request *req) {
 
 SEC("fentry/nvme_setup_cmd")
 int BPF_PROG(nvme_setup_cmd, void *ns, struct request *req) {
-  if (!dev_matches(req))
+  if (!dev_matches(req) || !mntns_matches())
     return 0;
   return handle_nvme_fentry_setup(req);
 }

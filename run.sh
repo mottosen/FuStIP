@@ -19,5 +19,5 @@ CMDS="$(python "$SCRIPT_DIR/util/cli_parser.py" "$@")"
 if [ "$DRY" = true ]; then
   echo "$CMDS"
 else
-  echo "$CMDS" | bash
+  bash -c "$CMDS"
 fi

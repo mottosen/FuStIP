@@ -37,16 +37,6 @@ standalone: c/loader.c c/standalone.skel.h
 	$(Q)echo "  CC      c/standalone"
 	$(Q)$(CC) -g -O2 -Wall -Ic/ -o c/standalone $< -lbpf -lelf -lz
 
-# ── IG gadget build ──
-
-IG ?= $(ROOT_DIR)/subs/inspektor-gadget/ig
-IG_TAG ?= fustip-nvme:latest
-
-.PHONY: ig-build
-ig-build:
-	$(Q)echo "  IG-BUILD $(IG_TAG)"
-	$(Q)sudo $(IG) image build -f ig-build.yaml -t $(IG_TAG) .
-
 # ── Clean ──
 
 clean:

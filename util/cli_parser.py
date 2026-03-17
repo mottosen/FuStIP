@@ -187,7 +187,7 @@ def generate_test_commands(args):
             vs.append(f"LAYERS={' '.join(block_nvme_layers)}")
         vs.append(f"FIO_FILE={args.fio_file}")
         vs.append(f"RESULTS_DIR={args.results_dir}")
-        cmds.append(f"make -C tests/block_nvme all {' '.join(vs)}")
+        cmds.append(f"make -C tests/block_nvme all {' '.join(vs)} || echo '!! block_nvme suite failed'")
 
     if filesystem_layers:
         vs = []
@@ -202,7 +202,7 @@ def generate_test_commands(args):
             vs.append(f"LAYERS={' '.join(filesystem_layers)}")
         vs.append(f"FIO_FILE={args.fio_file}")
         vs.append(f"RESULTS_DIR={args.results_dir}")
-        cmds.append(f"make -C tests/filesystem all {' '.join(vs)}")
+        cmds.append(f"make -C tests/filesystem all {' '.join(vs)} || echo '!! filesystem suite failed'")
 
     return cmds
 
