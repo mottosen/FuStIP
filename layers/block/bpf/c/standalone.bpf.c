@@ -8,8 +8,26 @@
 #define MAX_COMM_FILTERS 8
 const volatile char comm_filters[MAX_COMM_FILTERS][16] = {};
 const volatile __u8 num_comm_filters = 0;
+const volatile bool filter_by_mntns = false;
 
 #include "../bpf_core.h"
+
+// ── Mount namespace filter map (populated dynamically by loader) ──
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u64);
+	__type(value, __u32);
+	__uint(max_entries, 8);
+} mntns_filter SEC(".maps");
+
+static __always_inline bool mntns_matches(void)
+{
+	if (!filter_by_mntns)
+		return true;
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	__u64 mntns_id = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
+	return bpf_map_lookup_elem(&mntns_filter, &mntns_id) != NULL;
+}
 
 // ── Comm filter helper ──
 // Returns true if current task's comm contains any filter substring
@@ -47,7 +65,7 @@ static __always_inline bool comm_matches(void)
 SEC("raw_tracepoint/block_rq_insert")
 int BPF_PROG(block_rq_insert, struct request *rq)
 {
-	if (!comm_matches())
+	if (!comm_matches() || !mntns_matches())
 		return 0;
 	return handle_block_rq_insert(rq);
 }
@@ -55,7 +73,7 @@ int BPF_PROG(block_rq_insert, struct request *rq)
 SEC("raw_tracepoint/block_rq_issue")
 int BPF_PROG(block_rq_issue, struct request *rq)
 {
-	if (!comm_matches())
+	if (!comm_matches() || !mntns_matches())
 		return 0;
 	return handle_block_rq_issue(rq);
 }

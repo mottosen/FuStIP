@@ -7,7 +7,7 @@ else
     MAKEFLAGS += --no-print-directory
 endif
 
-# If CONTAINER_FILTER is set, force detailed mode (IG backend)
+# If CONTAINER_FILTER is set, force detailed mode
 ifdef CONTAINER_FILTER
 MODE := detailed
 endif
@@ -21,11 +21,6 @@ endif
 
 BPFTRACE := $(shell which bpftrace)
 PIDS_DIR = /tmp/bpftrace_block-pids
-
-IG ?= $(ROOT_DIR)/subs/inspektor-gadget/ig
-IG_TAG ?= fustip-block:latest
-RUNC ?= $(shell d=$$(dirname $$(cat /proc/$$(pgrep -x dockerd)/cmdline 2>/dev/null | tr '\0' '\n' | head -1)) && \
-	test -x "$$d/runc" && readlink -f "$$d/runc" || which runc 2>/dev/null)
 
 INTERVAL ?= 1
 
@@ -58,28 +53,23 @@ endif
 	$(Q)mkdir -p "$(PIDS_DIR)"
 
 ifeq ($(MODE),detailed)
-ifdef CONTAINER_FILTER
-	$(Q)echo -e "\nStarting IG collection (container: $(CONTAINER_FILTER)).."
-
-	$(Q)$(MAKE) -C bpf ig-build
-
-	$(Q)sudo RUNTIME_PATH=$(RUNC) $(IG) run $(IG_TAG) --verify-image=false -c $(CONTAINER_FILTER) -o columns \
-		> "$(RESULTS_DIR)/block/detailed.columns" \
-		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/ig.pid"
-
-	$(Q)echo -e "IG collection is running!\n"
-else
 	$(Q)echo -e "\nStarting detailed collection.."
 
 	$(Q)$(MAKE) -C bpf standalone
 
+ifdef CONTAINER_FILTER
+	$(Q)sudo ./bpf/c/standalone \
+		-o "$(RESULTS_DIR)/block/detailed.csv" \
+		-c $(CONTAINER_FILTER) \
+		$(ERR_REDIRECT) 1>&2 & echo $$! > "$(PIDS_DIR)/detailed.pid"
+else
 	$(Q)sudo ./bpf/c/standalone \
 		-o "$(RESULTS_DIR)/block/detailed.csv" \
 		-f $(COMM_FILTER) \
 		$(ERR_REDIRECT) 1>&2 & echo $$! > "$(PIDS_DIR)/detailed.pid"
+endif
 
 	$(Q)echo -e "Detailed collection is running!\n"
-endif
 else
 	$(Q)echo -e "\nStarting bpftrace collection.."
 
@@ -103,14 +93,6 @@ stop-collection:
 	$(Q)sleep 2
 
 ifeq ($(MODE),detailed)
-ifdef CONTAINER_FILTER
-	$(Q)if [ -f "$(RESULTS_DIR)/block/detailed.columns" ]; then \
-		python "$(ROOT_DIR)/util/ig_to_csv.py" \
-			"$(RESULTS_DIR)/block/detailed.columns" \
-			"$(RESULTS_DIR)/block/detailed.csv" \
-			block $(REDIRECT); \
-	fi
-endif
 	$(Q)if [ -f "$(RESULTS_DIR)/block/detailed.csv" ]; then \
 		$(MAKE) generate-detailed-stats; \
 	fi
