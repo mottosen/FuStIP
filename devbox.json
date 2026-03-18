@@ -32,8 +32,7 @@
       "echo -e \"\\nDevbox started!\""
     ],
     "scripts": {
-      "update_pip": ["pip install -r ./requirements.txt"],
-      "install_ig": ["make -C ./subs/inspektor-gadget ig"]
+      "update_pip": ["pip install -r ./requirements.txt"]
     }
   }
 }
