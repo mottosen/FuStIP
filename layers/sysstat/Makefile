@@ -1,9 +1,11 @@
 ifdef DEBUG
     Q =
     ERR_REDIRECT =
+    OUT_REDIRECT =
 else
     Q = @
     ERR_REDIRECT = 2>/dev/null
+    OUT_REDIRECT = 1>/dev/null
     MAKEFLAGS += --no-print-directory
 endif
 
@@ -46,12 +48,15 @@ start-collection: ensure-results-exists ensure-sudo
 stop-collection:
 	$(Q)for pidfile in $(PIDS_DIR)/*.pid; do \
 		if [ -f "$$pidfile" ]; then \
-			kill $$(cat "$$pidfile") $(ERR_REDIRECT) || true; \
+			pid=$$(cat "$$pidfile"); \
+			kill $$pid $(ERR_REDIRECT) || true; \
+			i=0; while [ -d "/proc/$$pid" ] && [ $$i -lt 50 ]; do \
+				sleep 0.2; i=$$((i+1)); \
+			done; \
 		fi; \
 	done
 	$(Q)rm -rf "$(PIDS_DIR)"
 	@echo "sysstat collection stopped"
-	$(Q)sleep 2
 	$(Q)if [ -f "$(RESULTS_DIR)/sysstat/pidstat.out" ]; then \
 		$(MAKE) parse && $(MAKE) generate-stats; \
 	fi
@@ -59,19 +64,23 @@ stop-collection:
 .PHONY: parse
 parse: ensure-results-exists
 	$(Q)python "./util/parse_output.py" "$(RESULTS_DIR)/sysstat" \
-		$(ERR_REDIRECT) 1>/dev/null
+		$(ERR_REDIRECT) $(OUT_REDIRECT)
 	$(Q)rm "$(RESULTS_DIR)/sysstat/pidstat.out"
 
 .PHONY: generate-stats
 generate-stats: ensure-results-exists
 ifdef COMM_FILTER
-	$(Q)python "./util/generate_stats.py" --process "$$(echo '$(COMM_FILTER)' | tr ',' ' ')" "$(RESULTS_DIR)" $(ERR_REDIRECT) 1>/dev/null
+	$(Q)python "./util/generate_stats.py" --process "$$(echo '$(COMM_FILTER)' | tr ',' ' ')" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
 else
-	$(Q)python "./util/generate_stats.py" $(OPTIONS) "$(RESULTS_DIR)" $(ERR_REDIRECT) 1>/dev/null
+	$(Q)python "./util/generate_stats.py" $(OPTIONS) "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
 endif
 	@echo "sysstat stats generated"
 
 .PHONY: visualize
 visualize: ensure-results-exists
-	$(Q)python "./util/visualize.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) 1>/dev/null
+ifdef COMM_FILTER
+	$(Q)python "./util/visualize.py" --process "$$(echo '$(COMM_FILTER)' | tr ',' ' ')" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
+else
+	$(Q)python "./util/visualize.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
+endif
 	$(Q)echo -e "sysstat visualization generated"
