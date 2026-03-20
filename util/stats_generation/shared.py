@@ -354,6 +354,15 @@ def derive_throughput(counters, duration_s, count_map, bytes_map):
     return {"iops": iops, "throughput_mb_s": throughput}
 
 
+def histogram_stats_only(buckets):
+    """Compute stats from histogram buckets without preserving bucket data.
+
+    Input: [{"lo": int, "hi": int, "count": int}, ...]
+    Output: {"count", "min", "max", "mean", "p1", "p5", "p50", "p95", "p99"}
+    """
+    return histogram_stats({"points": [], "ranges": buckets})
+
+
 def raw_values_to_hist(values):
     """Bin raw numeric values into exact 2^i points and inter-power ranges.
 
@@ -518,15 +527,12 @@ def compute_access_pattern(sectors, bytes_list):
       gap == 0 → sequential, gap > 0 → random
 
     Returns: {"total_ios", "sequential_count", "random_count",
-              "sequential_pct", "random_pct",
-              "gap_histogram": {"points": [...], "ranges": [...], "stats": {...}}}
+              "sequential_pct", "random_pct"}
     """
     n = len(sectors)
     if n < 2:
-        empty = {"points": [], "ranges": []}
         return {"total_ios": n, "sequential_count": 0, "random_count": 0,
-                "sequential_pct": 0, "random_pct": 0,
-                "gap_histogram": {**empty, "stats": histogram_stats(empty)}}
+                "sequential_pct": 0, "random_pct": 0}
 
     gaps = []
     for i in range(n - 1):
@@ -544,7 +550,6 @@ def compute_access_pattern(sectors, bytes_list):
         "random_count": rnd_count,
         "sequential_pct": round(100 * seq_count / total_gaps, 2),
         "random_pct": round(100 * rnd_count / total_gaps, 2),
-        "gap_histogram": histogram_with_data(raw_values_to_hist(gaps)),
     }
 
 
@@ -560,10 +565,8 @@ def compute_fs_access_pattern(offsets, bytes_list):
     """
     n = len(offsets)
     if n < 2:
-        empty = {"points": [], "ranges": []}
         return {"total_ios": n, "sequential_count": 0, "random_count": 0,
-                "sequential_pct": 0, "random_pct": 0,
-                "gap_histogram": {**empty, "stats": histogram_stats(empty)}}
+                "sequential_pct": 0, "random_pct": 0}
 
     gaps = []
     for i in range(n - 1):
@@ -581,5 +584,4 @@ def compute_fs_access_pattern(offsets, bytes_list):
         "random_count": rnd_count,
         "sequential_pct": round(100 * seq_count / total_gaps, 2),
         "random_pct": round(100 * rnd_count / total_gaps, 2),
-        "gap_histogram": histogram_with_data(raw_values_to_hist(gaps)),
     }
