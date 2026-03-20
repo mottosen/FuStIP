@@ -80,10 +80,6 @@ def parse_args(argv=None):
 
 
 def validate(args):
-    if args.comm_filter and args.container_filter:
-        print("Error: -p/--comm-filter and -c/--container-filter are mutually exclusive", file=sys.stderr)
-        sys.exit(1)
-
     if args.container_filter:
         args.mode = "detailed"
 
@@ -95,8 +91,8 @@ def validate(args):
 
     if not args.container_filter:
         if "nvme" in args.layers:
-            if not args.dev_filter:
-                print("Error: nvme layer requires -d/--dev-filter", file=sys.stderr)
+            if not args.dev_filter and not args.comm_filter:
+                print("Error: nvme layer requires -d/--dev-filter or -p/--comm-filter", file=sys.stderr)
                 sys.exit(1)
 
         if not is_test and ("block" in args.layers or "fs" in args.layers):
@@ -135,11 +131,16 @@ def build_layer_vars(layer, args):
 
     if args.container_filter:
         vs.append(f"CONTAINER_FILTER={args.container_filter}")
-    else:
+    if not args.container_filter:
         vs.append(f"MODE={args.mode}")
-        if layer == "nvme":
+
+    if layer == "nvme":
+        if args.dev_filter:
             vs.append(f"DEV_FILTER={args.dev_filter}")
-        elif layer in ("block", "fs"):
+        if args.comm_filter:
+            vs.append(f"COMM_FILTER={args.comm_filter}")
+    elif layer in ("block", "fs"):
+        if args.comm_filter:
             vs.append(f"COMM_FILTER={args.comm_filter}")
 
     vs.append(f"RESULTS_DIR={args.results_dir}")
