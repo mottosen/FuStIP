@@ -45,20 +45,21 @@ rawtracepoint:block_rq_issue
     }
     else
     {
-        @rq_direct_dispatch[0] = count();
+        @rq_direct_dispatch[@blk_op[$op]] = count();
     }
 }
 
 rawtracepoint:block_rq_complete
 {
     $rq = (struct request *)arg0;
+    $op = (uint64)($rq->cmd_flags & 0xFF);
+
     $t_issue = @rq_issue_time[(uint64)$rq];
     if ($t_issue)
     {
         $now = nsecs;
         $bytes = (uint64)$rq->__data_len;
         $sector = $rq->__sector;
-        $op = (uint64)($rq->cmd_flags & 0xFF);
 
         @rq_completed[@blk_op[$op]] = count();
 
@@ -70,7 +71,7 @@ rawtracepoint:block_rq_complete
     }
     else
     {
-        @rq_untracked_complete[0] = count();
+        @rq_untracked_complete[@blk_op[$op]] = count();
     }
 }
 
