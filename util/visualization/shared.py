@@ -23,14 +23,16 @@ def _color_for(typ, idx=0):
 
 
 def plot_type_distribution(ax, counts_by_type):
-    """Pie chart of IO type distribution."""
+    """Pie chart of IO type distribution with side legend."""
     types = list(counts_by_type.keys())
     counts = [counts_by_type[t] for t in types]
     total = sum(counts)
     colors = [_color_for(t, i) for i, t in enumerate(types)]
-    labels = [f"{t}\n{c} ({c / total * 100:.1f}%)" for t, c in zip(types, counts)]
+    labels = [f"{t}: {c} ({c / total * 100:.1f}%)" for t, c in zip(types, counts)]
 
-    ax.pie(counts, labels=labels, colors=colors, startangle=90)
+    wedges, _ = ax.pie(counts, colors=colors, startangle=90)
+    ax.legend(wedges, labels, fontsize="small", loc="center left",
+              bbox_to_anchor=(1.02, 0.5))
     ax.set_title("Type Distribution")
 
 
@@ -151,6 +153,31 @@ def plot_io_latency_cdf(ax, df, type_col, latency_col, types):
     ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
 
+def plot_gap_cdf(ax, df, type_col, sector_or_offset_col, bytes_col, types,
+                 sector_divisor=512, xlabel="Gap (sectors)"):
+    """CDF of address gaps between successive IOs per type (submission order).
+
+    sector_divisor: 512 for sector-based (block/nvme), 1 for byte offsets (fs).
+    """
+    for i, typ in enumerate(types):
+        sub = df[df[type_col] == typ].sort_values("timestamp_ns")
+        locations = sub[sector_or_offset_col].dropna().values
+        sizes = sub[bytes_col].values[:len(locations)]
+        if len(locations) < 2:
+            continue
+        expected = locations[:-1] + sizes[:len(locations) - 1] // sector_divisor
+        gaps = np.abs(locations[1:] - expected)
+        sorted_gaps = np.sort(gaps)
+        cdf = np.arange(1, len(sorted_gaps) + 1) / len(sorted_gaps) * 100
+        ax.plot(sorted_gaps, cdf, label=typ, color=_color_for(typ, i), linewidth=0.8)
+
+    ax.set_xscale("symlog")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Cumulative %")
+    ax.set_title("Gap CDF")
+    ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
+
+
 def build_dashboard(rows, col_titles, title, output_path):
     """Build a multi-row dashboard.
 
@@ -173,10 +200,12 @@ def build_dashboard(rows, col_titles, title, output_path):
             ax = axes[r, c]
             plot_fn(ax)
 
-    # Unify y-axes per column
+    # Unify y-axes per column, starting at 0 for non-negative data
     for c in range(ncols):
         y_min = min(axes[r, c].get_ylim()[0] for r in range(nrows))
         y_max = max(axes[r, c].get_ylim()[1] for r in range(nrows))
+        if y_min >= 0:
+            y_min = 0
         for r in range(nrows):
             axes[r, c].set_ylim(y_min, y_max)
 
