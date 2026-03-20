@@ -8,7 +8,11 @@
 #define MAX_DEV_FILTERS 8
 const volatile char dev_filters[MAX_DEV_FILTERS][32] = {};
 const volatile __u8 num_dev_filters = 0;
+#define MAX_COMM_FILTERS 8
+const volatile char comm_filters[MAX_COMM_FILTERS][16] = {};
+const volatile __u8 num_comm_filters = 0;
 const volatile bool filter_by_mntns = false;
+const volatile bool filter_or_mode = false;
 
 #include "../bpf_core.h"
 
@@ -26,6 +30,37 @@ static __always_inline bool mntns_matches(void) {
   struct task_struct *task = (struct task_struct *)bpf_get_current_task();
   __u64 mntns_id = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
   return bpf_map_lookup_elem(&mntns_filter, &mntns_id) != NULL;
+}
+
+// ── Comm filter helper ──
+// Returns true if current task's comm contains any filter substring
+static __always_inline bool comm_matches(void) {
+  if (num_comm_filters == 0)
+    return true;
+
+  char comm[16];
+  bpf_get_current_comm(&comm, sizeof(comm));
+
+  for (int f = 0; f < MAX_COMM_FILTERS; f++) {
+    if (f >= num_comm_filters)
+      break;
+    if (comm_filters[f][0] == '\0')
+      continue;
+    for (int i = 0; i < 16; i++) {
+      if (comm[i] == '\0')
+        break;
+      bool match = true;
+      for (int j = 0; j < 16 && comm_filters[f][j] != '\0'; j++) {
+        if (i + j >= 16 || comm[i + j] != comm_filters[f][j]) {
+          match = false;
+          break;
+        }
+      }
+      if (match)
+        return true;
+    }
+  }
+  return false;
 }
 
 // ── Device filter helper ──
@@ -65,8 +100,16 @@ static __always_inline bool dev_matches(struct request *req) {
 
 SEC("fentry/nvme_setup_cmd")
 int BPF_PROG(nvme_setup_cmd, void *ns, struct request *req) {
-  if (!dev_matches(req) || !mntns_matches())
-    return 0;
+  if (filter_or_mode) {
+    // OR between host identification (dev AND comm) and container (mntns)
+    bool host_match = dev_matches(req) && comm_matches();
+    if (!host_match && !mntns_matches())
+      return 0;
+  } else {
+    // AND: all active filters must independently match
+    if (!dev_matches(req) || !comm_matches() || !mntns_matches())
+      return 0;
+  }
   return handle_nvme_fentry_setup(req);
 }
 
