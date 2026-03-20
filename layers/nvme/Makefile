@@ -1,9 +1,11 @@
 ifdef DEBUG
     Q =
     ERR_REDIRECT =
+    OUT_REDIRECT =
 else
     Q = @
     ERR_REDIRECT = 2>/dev/null
+    OUT_REDIRECT = 1>/dev/null
     MAKEFLAGS += --no-print-directory
 endif
 
@@ -46,7 +48,9 @@ ensure-results-exists:
 start-collection: ensure-results-exists ensure-sudo
 ifndef CONTAINER_FILTER
 ifndef DEV_FILTER
-	$(error DEV_FILTER is not set (set DEV_FILTER or CONTAINER_FILTER))
+ifndef COMM_FILTER
+	$(error DEV_FILTER or COMM_FILTER is not set (set DEV_FILTER, COMM_FILTER, or CONTAINER_FILTER))
+endif
 endif
 endif
 
@@ -57,23 +61,20 @@ ifeq ($(MODE),detailed)
 
 	$(Q)$(MAKE) -C bpf standalone
 
-ifdef CONTAINER_FILTER
+	$(Q)sudo rm -f "$(RESULTS_DIR)/nvme/detailed.csv" "$(RESULTS_DIR)/nvme/counters.json" $(ERR_REDIRECT) || true
+	$(Q)touch "$(RESULTS_DIR)/nvme/detailed.csv" "$(RESULTS_DIR)/nvme/counters.json"
 	$(Q)sudo ./bpf/c/standalone \
 		-o "$(RESULTS_DIR)/nvme/detailed.csv" \
-		-c $(CONTAINER_FILTER) \
+		$(if $(DEV_FILTER),-f $(DEV_FILTER)) \
+		$(if $(COMM_FILTER),-p $(COMM_FILTER)) \
+		$(if $(CONTAINER_FILTER),-c $(CONTAINER_FILTER)) \
 		$(ERR_REDIRECT) 1>&2 & echo $$! > "$(PIDS_DIR)/detailed.pid"
-else
-	$(Q)sudo ./bpf/c/standalone \
-		-o "$(RESULTS_DIR)/nvme/detailed.csv" \
-		-f $(DEV_FILTER) \
-		$(ERR_REDIRECT) 1>&2 & echo $$! > "$(PIDS_DIR)/detailed.pid"
-endif
 
 	$(Q)echo -e "Detailed collection is running!\n"
 else
 	$(Q)echo -e "\nStarting bpftrace collection.."
 
-	$(Q)sudo $(BPFTRACE) ./bt/trace.bt $(DEV_FILTER) \
+	$(Q)sudo $(BPFTRACE) ./bt/trace.bt "$(if $(DEV_FILTER),$(DEV_FILTER),_)" "$(if $(COMM_FILTER),$(COMM_FILTER),_)" \
 		--no-warnings \
 		-o "$(RESULTS_DIR)/nvme/trace.out" \
 		$(ERR_REDIRECT) 1>&2 & echo $$! > "$(PIDS_DIR)/trace.pid"
@@ -85,12 +86,15 @@ endif
 stop-collection:
 	$(Q)for pidfile in $(PIDS_DIR)/*.pid; do \
 		if [ -f "$$pidfile" ]; then \
-			kill $$(cat "$$pidfile") $(ERR_REDIRECT) 1>&2 || true; \
+			pid=$$(cat "$$pidfile"); \
+			kill $$pid $(ERR_REDIRECT) 1>&2 || true; \
+			i=0; while [ -d "/proc/$$pid" ] && [ $$i -lt 50 ]; do \
+				sleep 0.2; i=$$((i+1)); \
+			done; \
 		fi; \
 	done
 	$(Q)rm -rf "$(PIDS_DIR)"
 	@echo "nvme collection stopped"
-	$(Q)sleep 2
 
 ifeq ($(MODE),detailed)
 	$(Q)if [ -f "$(RESULTS_DIR)/nvme/detailed.csv" ]; then \
@@ -105,13 +109,13 @@ endif
 .PHONY: generate-stats
 generate-stats: ensure-results-exists
 ifeq ($(MODE),detailed)
-	$(Q)python "./util/generate_detailed_stats.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) 1>/dev/null
+	$(Q)python "./util/generate_detailed_stats.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
 else
-	$(Q)python "./util/generate_summary_stats.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) 1>/dev/null
+	$(Q)python "./util/generate_summary_stats.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
 endif
 	@echo "nvme stats generated"
 
 .PHONY: visualize
 visualize: ensure-results-exists
-	$(Q)python "./util/visualize.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) 1>/dev/null
+	$(Q)python "./util/visualize.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
 	$(Q)echo -e "nvme visualization generated"

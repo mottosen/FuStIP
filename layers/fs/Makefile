@@ -1,9 +1,11 @@
 ifdef DEBUG
     Q =
     ERR_REDIRECT =
+    OUT_REDIRECT =
 else
     Q = @
     ERR_REDIRECT = 2>/dev/null
+    OUT_REDIRECT = 1>/dev/null
     MAKEFLAGS += --no-print-directory
 endif
 
@@ -57,17 +59,13 @@ ifeq ($(MODE),detailed)
 
 	$(Q)$(MAKE) -C bpf standalone
 
-ifdef CONTAINER_FILTER
+	$(Q)sudo rm -f "$(RESULTS_DIR)/fs/detailed.csv" "$(RESULTS_DIR)/fs/counters.json" $(ERR_REDIRECT) || true
+	$(Q)touch "$(RESULTS_DIR)/fs/detailed.csv" "$(RESULTS_DIR)/fs/counters.json"
 	$(Q)sudo ./bpf/c/standalone \
 		-o "$(RESULTS_DIR)/fs/detailed.csv" \
-		-c $(CONTAINER_FILTER) \
+		$(if $(COMM_FILTER),-f $(COMM_FILTER)) \
+		$(if $(CONTAINER_FILTER),-c $(CONTAINER_FILTER)) \
 		$(ERR_REDIRECT) 1>&2 & echo $$! > "$(PIDS_DIR)/detailed.pid"
-else
-	$(Q)sudo ./bpf/c/standalone \
-		-o "$(RESULTS_DIR)/fs/detailed.csv" \
-		-f $(COMM_FILTER) \
-		$(ERR_REDIRECT) 1>&2 & echo $$! > "$(PIDS_DIR)/detailed.pid"
-endif
 
 	$(Q)echo -e "Detailed collection is running!\n"
 else
@@ -84,12 +82,15 @@ endif
 stop-collection:
 	$(Q)for pidfile in $(PIDS_DIR)/*.pid; do \
 		if [ -f "$$pidfile" ]; then \
-			kill $$(cat "$$pidfile") $(ERR_REDIRECT) 1>&2 || true; \
+			pid=$$(cat "$$pidfile"); \
+			kill $$pid $(ERR_REDIRECT) 1>&2 || true; \
+			i=0; while [ -d "/proc/$$pid" ] && [ $$i -lt 50 ]; do \
+				sleep 0.2; i=$$((i+1)); \
+			done; \
 		fi; \
 	done
 	$(Q)rm -rf "$(PIDS_DIR)"
 	@echo "fs collection stopped"
-	$(Q)sleep 2
 
 ifeq ($(MODE),detailed)
 	$(Q)if [ -f "$(RESULTS_DIR)/fs/detailed.csv" ]; then \
@@ -103,15 +104,15 @@ endif
 
 .PHONY: generate-stats
 generate-stats: ensure-results-exists
-	$(Q)python "./util/generate_summary_stats.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) 1>/dev/null
+	$(Q)python "./util/generate_summary_stats.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
 	@echo "fs stats generated"
 
 .PHONY: generate-detailed-stats
 generate-detailed-stats: ensure-results-exists
-	$(Q)python "./util/generate_detailed_stats.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) 1>/dev/null
+	$(Q)python "./util/generate_detailed_stats.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
 	@echo "fs stats generated"
 
 .PHONY: visualize
 visualize: ensure-results-exists
-	$(Q)python "./util/visualize.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) 1>/dev/null
+	$(Q)python "./util/visualize.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
 	$(Q)echo -e "fs visualization generated"
