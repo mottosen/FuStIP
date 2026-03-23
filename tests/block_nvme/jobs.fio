@@ -34,30 +34,45 @@ stonewall
 ; QD=1, short runtime, single op type.  Each job targets one
 ; metric to verify exact match with FIO.
 
+; Sequential read counting — QD=1, 128K sequential reads.
+; Verifies profiler captures exact IO count and byte total.
+; Expected access pattern: sequential.
 [val_seqread]
 rw=read
 bs=128k
 iodepth=1
 stonewall
 
+; Sequential write counting — QD=1, 128K sequential writes.
+; Verifies profiler captures exact IO count and byte total.
+; Expected access pattern: sequential.
 [val_seqwrite]
 rw=write
 bs=128k
 iodepth=1
 stonewall
 
+; Random read counting — QD=1, 4K random reads.
+; Verifies profiler captures exact IO count and byte total.
+; Expected access pattern: random.
 [val_randread]
 rw=randread
 bs=4k
 iodepth=1
 stonewall
 
+; Random write counting — QD=1, 4K random writes.
+; Verifies profiler captures exact IO count and byte total.
+; Expected access pattern: random.
 [val_randwrite]
 rw=randwrite
 bs=4k
 iodepth=1
 stonewall
 
+; Mixed random read/write — QD=1, 50/50 4K random reads+writes.
+; Verifies profiler correctly splits and counts mixed IO.
+; Expected access pattern: random.
 [val_randrw]
 rw=randrw
 rwmixread=50
@@ -65,7 +80,9 @@ bs=4k
 iodepth=1
 stonewall
 
-; High QD stress — maximize NVMe inflights (4 threads × QD256 = 1024 slots)
+; High QD stress — maximize NVMe inflights (4 threads × QD256 = 1024 slots).
+; Tests profiler under extreme queue depth / concurrency.
+; Expected access pattern: random.
 [val_high_qd]
 rw=randread
 bs=4k
@@ -80,7 +97,9 @@ stonewall
 ; ============================================================
 ; Longer runtime, larger file, higher queue depths.
 
-; ANN vector search — random 4K reads across index structures
+; ANN vector search — random 4K reads across index structures.
+; Simulates vector similarity search access pattern.
+; Expected access pattern: random.
 [work_index_search]
 time_based=1
 rw=randread
@@ -90,7 +109,9 @@ size=16G
 runtime=30
 stonewall
 
-; Batch vector insert — sequential large writes
+; Batch vector insert — sequential large writes.
+; Simulates bulk data ingestion with sequential 128K writes.
+; Expected access pattern: sequential.
 [work_bulk_insert]
 time_based=1
 rw=write
@@ -100,7 +121,9 @@ size=16G
 runtime=30
 stonewall
 
-; Background compaction — read old segments, write new ones
+; Background compaction — read old segments, write new ones.
+; Simulates LSM/segment compaction with mixed random 128K IO.
+; Expected access pattern: random.
 [work_compaction]
 time_based=1
 rw=randrw
@@ -111,7 +134,9 @@ size=16G
 runtime=30
 stonewall
 
-; Concurrent queries (reads) + inserts (writes)
+; Concurrent queries (reads) + inserts (writes).
+; Simulates mixed query+insert workload with 70/30 random 4K IO.
+; Expected access pattern: random.
 [work_query_insert]
 time_based=1
 rw=randrw
@@ -122,7 +147,9 @@ size=16G
 runtime=30
 stonewall
 
-; Full table/partition sequential scan
+; Full table/partition sequential scan.
+; Simulates brute-force scan with sequential 128K reads.
+; Expected access pattern: sequential.
 [work_scan]
 time_based=1
 rw=read
@@ -132,7 +159,9 @@ size=16G
 runtime=30
 stonewall
 
-; Stress test — max inflight random reads
+; Stress test — max inflight random reads/writes (8 threads).
+; Tests profiler under extreme concurrency and event rate.
+; Expected access pattern: random.
 [work_high_qd]
 time_based=1
 rw=randrw
@@ -141,4 +170,53 @@ iodepth=256
 numjobs=8
 size=16G
 runtime=30
+stonewall
+
+
+; ============================================================
+;  C  Stress — sustained profiling over long durations
+; ============================================================
+; High-rate mixed random IO to stress profiler event handling,
+; ring buffer throughput, and counter accuracy over time.
+
+; 2-minute sustained mixed random IO — baseline stress test.
+; 4 threads × QD128 = 512 in-flight IOs, 4K random reads/writes.
+; Expected access pattern: random.
+[stress_2m]
+time_based=1
+rw=randrw
+rwmixread=50
+bs=4k
+iodepth=128
+numjobs=4
+size=16G
+runtime=120
+stonewall
+
+; 5-minute sustained — tests profiler stability over medium duration.
+; Same parameters as stress_2m with extended runtime.
+; Expected access pattern: random.
+[stress_5m]
+time_based=1
+rw=randrw
+rwmixread=50
+bs=4k
+iodepth=128
+numjobs=4
+size=16G
+runtime=300
+stonewall
+
+; 10-minute sustained — longest stress test, exercises prolonged collection.
+; Same parameters as stress_2m with extended runtime.
+; Expected access pattern: random.
+[stress_10m]
+time_based=1
+rw=randrw
+rwmixread=50
+bs=4k
+iodepth=128
+numjobs=4
+size=16G
+runtime=600
 stonewall
