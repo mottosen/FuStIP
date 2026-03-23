@@ -46,7 +46,12 @@ def parse_args(argv=None):
     profile_sub.add_parser("start", parents=[parent], help="Start profiling")
     profile_sub.add_parser("stop", parents=[parent], help="Stop profiling")
 
-    action_sub.add_parser("test", parents=[parent], help="Run test suite(s)")
+    test_parser = action_sub.add_parser("test", help="Run test suite(s)")
+    test_sub = test_parser.add_subparsers(dest="sub_action", required=True)
+    test_sub.add_parser("validate", parents=[parent], help="Run validation jobs")
+    test_sub.add_parser("vdb", parents=[parent], help="Run VDB-like workload jobs")
+    test_sub.add_parser("stress", parents=[parent], help="Run stress (long-duration) jobs")
+    test_sub.add_parser("all", parents=[parent], help="Run all test jobs")
 
     args = parser.parse_args(argv)
 
@@ -165,8 +170,17 @@ def generate_profile_commands(args):
     return cmds
 
 
+TEST_TARGET_MAP = {
+    "validate": "validate",
+    "vdb": "workload",
+    "stress": "stress",
+    "all": "all",
+}
+
+
 def generate_test_commands(args):
     selected = set(args.layers)
+    target = TEST_TARGET_MAP[args.sub_action]
     cmds = []
 
     # Determine which layers within each suite are selected
@@ -188,7 +202,7 @@ def generate_test_commands(args):
             vs.append(f"LAYERS={' '.join(block_nvme_layers)}")
         vs.append(f"FIO_FILE={args.fio_file}")
         vs.append(f"RESULTS_DIR={args.results_dir}")
-        cmds.append(f"make -C tests/block_nvme all {' '.join(vs)} || echo '!! block_nvme suite failed'")
+        cmds.append(f"make -C tests/block_nvme {target} {' '.join(vs)} || echo '!! block_nvme suite failed'")
 
     if filesystem_layers:
         vs = []
@@ -203,7 +217,7 @@ def generate_test_commands(args):
             vs.append(f"LAYERS={' '.join(filesystem_layers)}")
         vs.append(f"FIO_FILE={args.fio_file}")
         vs.append(f"RESULTS_DIR={args.results_dir}")
-        cmds.append(f"make -C tests/filesystem all {' '.join(vs)} || echo '!! filesystem suite failed'")
+        cmds.append(f"make -C tests/filesystem {target} {' '.join(vs)} || echo '!! filesystem suite failed'")
 
     return cmds
 
