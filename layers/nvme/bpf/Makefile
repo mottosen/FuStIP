@@ -2,6 +2,7 @@ ifdef DEBUG
     Q =
 else
     Q = @
+    MAKEFLAGS += --no-print-directory
 endif
 
 CLANG := $(shell which clang)

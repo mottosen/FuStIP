@@ -1,14 +1,11 @@
 ifdef DEBUG
     Q =
     REDIRECT =
-    MAKE_FLAGS =
 else
     Q = @
     REDIRECT = 1>/dev/null 2>&1
-    MAKE_FLAGS = --no-print-directory
+    MAKE_FLAGS += --no-print-directory
 endif
-
-MAKE := $(MAKE) $(MAKE_FLAGS)
 
 # If CONTAINER_FILTER is set, force detailed mode
 ifdef CONTAINER_FILTER
