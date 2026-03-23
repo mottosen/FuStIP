@@ -40,6 +40,48 @@ def parse_detailed_stats(path):
     return stats.get("counters", {})
 
 
+def parse_access_pattern(path):
+    """Extract access_pattern section from detailed-stats.json."""
+    with open(path) as f:
+        stats = json.load(f)
+    return stats.get("access_pattern", {})
+
+
+SEQUENTIAL_JOBS = {"val_seqread", "val_seqwrite", "work_bulk_insert", "work_scan"}
+
+
+def expected_access_pattern(job_name):
+    """Return 'sequential' or 'random' based on job's FIO rw type."""
+    return "sequential" if job_name in SEQUENTIAL_JOBS else "random"
+
+
+def validate_access_pattern(job_name, access_pattern, label, ops, tolerance,
+                            lookup_key=None):
+    """Check rnd/seq classification matches expected pattern.
+
+    Uses the same tolerance as count checks: dominant pattern must be
+    >= (1 - tolerance) * 100 percent.  Default 2% -> requires >= 98%.
+    """
+    expected = expected_access_pattern(job_name)
+    threshold_pct = (1.0 - tolerance) * 100
+    results = []
+    pattern_data = access_pattern.get(lookup_key or label, {})
+
+    for op in ops:
+        entry = pattern_data.get(op, {})
+        seq_pct = entry.get("sequential_pct", 0)
+        rnd_pct = entry.get("random_pct", 0)
+        actual_pct = seq_pct if expected == "sequential" else rnd_pct
+
+        passed = actual_pct >= threshold_pct
+        tag = "PASS" if passed else "FAIL"
+        msg = (f"[{tag}] {label} {op} access pattern: "
+               f"expected={expected}, seq={seq_pct:.1f}%, rnd={rnd_pct:.1f}%")
+        results.append((passed, msg))
+
+    return results
+
+
 def get_val(data, map_name, key, default=0):
     """Safely get a value from parsed bpftrace data."""
     return data.get(map_name, {}).get(key, default)
@@ -180,37 +222,64 @@ def main():
         nvme = parse_counters(args.nvme_out)
 
     kind = classify_job(fio)
+    if args.mode == "detailed":
+        ops = {"read": ["read"], "write": ["write"], "mixed": ["read", "write"]}[kind]
 
     print(f"\n=== {args.job} (mode={args.mode}) ===")
 
-    print(f"  FIO:   read_ios={fio['read_ios']}  read_bytes={fio['read_bytes']}"
+    print(f"  FIO:  read_ios={fio['read_ios']}  read_bytes={fio['read_bytes']}"
           f"  write_ios={fio['write_ios']}  write_bytes={fio['write_bytes']}")
 
+    print("")
     for op in ("read", "write"):
-        prefix = "  BLK:  " if op == "read" else "        "
-        print(f"{prefix}{op}:  "
+        prefix = "BLK:" if op == "read" else ""
+        print(f"  {prefix:6}{op + ':':6}"
               f"  queued={get_val(blk, 'rq_queued', op)}"
               f"  issued={get_val(blk, 'rq_issued', op)}"
               f"  completed={get_val(blk, 'rq_completed', op)}"
               f"  bytes={get_val(blk, 'rq_total_bytes', op)}")
 
+    print("")
     for op in ("read", "write"):
-        prefix = "  NVME: " if op == "read" else "        "
-        print(f"{prefix}{op}:  "
+        prefix = "NVME:" if op == "read" else ""
+        print(f"  {prefix:6}{op + ':':6}"
               f"  setup={get_val(nvme, 'cmd_setup', op)}"
               f"  completed={get_val(nvme, 'cmd_completed', op)}"
               f"  bytes={get_val(nvme, 'cmd_total_bytes', op)}")
 
     print()
 
-    results = validate_blk(fio, blk, args.tolerance, kind, args.container)
-    results += validate_nvme(fio, nvme, args.tolerance, kind, args.container)
-
     all_passed = True
-    for passed, msg in results:
+
+    blk_results = validate_blk(fio, blk, args.tolerance, kind, args.container)
+    for passed, msg in blk_results:
         print(f"  {msg}")
         if not passed:
             all_passed = False
+
+    if args.mode == "detailed":
+        blk_ap = parse_access_pattern(args.block_out)
+        for passed, msg in validate_access_pattern(args.job, blk_ap, "blk", ops, args.tolerance,
+                                                   lookup_key="rq_sectors"):
+            print(f"  {msg}")
+            if not passed:
+                all_passed = False
+
+    print()
+
+    nvme_results = validate_nvme(fio, nvme, args.tolerance, kind, args.container)
+    for passed, msg in nvme_results:
+        print(f"  {msg}")
+        if not passed:
+            all_passed = False
+
+    if args.mode == "detailed":
+        nvme_ap = parse_access_pattern(args.nvme_out)
+        for passed, msg in validate_access_pattern(args.job, nvme_ap, "nvme", ops, args.tolerance,
+                                                   lookup_key="cmd_sectors"):
+            print(f"  {msg}")
+            if not passed:
+                all_passed = False
 
     print()
     if all_passed:

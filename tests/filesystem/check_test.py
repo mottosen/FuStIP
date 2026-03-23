@@ -41,6 +41,48 @@ def parse_detailed_stats(path):
     return stats.get("counters", {})
 
 
+def parse_access_pattern(path):
+    """Extract access_pattern section from detailed-stats.json."""
+    with open(path) as f:
+        stats = json.load(f)
+    return stats.get("access_pattern", {})
+
+
+SEQUENTIAL_JOBS = {"val_seqread", "val_seqwrite", "work_bulk_insert", "work_scan"}
+
+
+def expected_access_pattern(job_name):
+    """Return 'sequential' or 'random' based on job's FIO rw type."""
+    return "sequential" if job_name in SEQUENTIAL_JOBS else "random"
+
+
+def validate_access_pattern(job_name, access_pattern, label, ops, tolerance,
+                            lookup_key=None):
+    """Check rnd/seq classification matches expected pattern.
+
+    Uses the same tolerance as count checks: dominant pattern must be
+    >= (1 - tolerance) * 100 percent.  Default 2% -> requires >= 98%.
+    """
+    expected = expected_access_pattern(job_name)
+    threshold_pct = (1.0 - tolerance) * 100
+    results = []
+    pattern_data = access_pattern.get(lookup_key or label, {})
+
+    for op in ops:
+        entry = pattern_data.get(op, {})
+        seq_pct = entry.get("sequential_pct", 0)
+        rnd_pct = entry.get("random_pct", 0)
+        actual_pct = seq_pct if expected == "sequential" else rnd_pct
+
+        passed = actual_pct >= threshold_pct
+        tag = "PASS" if passed else "FAIL"
+        msg = (f"[{tag}] {label} {op} access pattern: "
+               f"expected={expected}, seq={seq_pct:.1f}%, rnd={rnd_pct:.1f}%")
+        results.append((passed, msg))
+
+    return results
+
+
 def get_val(data, map_name, key, default=0):
     """Safely get a value from parsed bpftrace data."""
     return data.get(map_name, {}).get(key, default)
@@ -166,12 +208,13 @@ def main():
 
     print(f"\n=== {args.job} (mode={args.mode}) ===")
 
-    print(f"  FIO:   read_ios={fio['read_ios']}  read_bytes={fio['read_bytes']}"
+    print(f"  FIO:  read_ios={fio['read_ios']}  read_bytes={fio['read_bytes']}"
           f"  write_ios={fio['write_ios']}  write_bytes={fio['write_bytes']}")
 
+    print("")
     for i, sc in enumerate((read_key, write_key)):
-        prefix = "  FS:   " if i == 0 else "        "
-        print(f"{prefix}{sc}:  "
+        prefix = "FS:" if i == 0 else ""
+        print(f"  {prefix:6}{sc + ':':9}"
               f"  entered={get_val(fs, 'sc_entered', sc)}"
               f"  completed={get_val(fs, 'sc_completed', sc)}"
               f"  bytes={get_val(fs, 'sc_total_bytes', sc)}")
@@ -180,7 +223,7 @@ def main():
     aux_parts = [f"{sc}={get_val(fs, 'sc_count', sc)}" for sc in AUXILIARY_SYSCALLS
                  if get_val(fs, "sc_count", sc) > 0]
     if aux_parts:
-        print(f"  AUX:   {', '.join(aux_parts)}")
+        print(f"        {', '.join(aux_parts)}")
 
     print()
 
@@ -193,6 +236,15 @@ def main():
         print(f"  {msg}")
         if not passed:
             all_passed = False
+
+    if args.mode == "detailed":
+        ops = {"read": [read_key], "write": [write_key], "mixed": [read_key, write_key]}[kind]
+        fs_ap = parse_access_pattern(args.fs_out)
+        for passed, msg in validate_access_pattern(args.job, fs_ap, "fs", ops, args.tolerance,
+                                                   lookup_key="sc_offsets"):
+            print(f"  {msg}")
+            if not passed:
+                all_passed = False
 
     print()
     if all_passed:
