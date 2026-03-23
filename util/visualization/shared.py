@@ -1,18 +1,19 @@
 """Shared plotting utilities for FuStIP visualization dashboards."""
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
 TYPE_COLORS = {
-    "read": "#1f77b4",
-    "write": "#ff7f0e",
-    "pread64": "#1f77b4",
-    "pwrite64": "#ff7f0e",
-    "flush": "#2ca02c",
-    "discard": "#d62728",
-    "write_zeros": "#9467bd",
+    "read": "#cecece",
+    "write": "#a559aa",
+    "pread64": "#59a89c",
+    "pwrite64": "#f0c571",
+    "flush": "#e02b35",
+    "discard": "#082a54",
+    "write_zeros": "#d47264",
 }
 
 DEFAULT_COLOR_CYCLE = plt.rcParams["axes.prop_cycle"].by_key()["color"]
