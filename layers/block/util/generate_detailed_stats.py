@@ -4,9 +4,12 @@
 Reads detailed.csv from the results directory, computes aggregate
 statistics matching the summary stats JSON structure, and writes JSON.
 
-Uses two CSV passes to limit peak memory on large files:
-  Pass 1: counters, distributions, tseries (no sector/rq/comm columns)
-  Pass 2: access pattern (no latency_ns/rq/comm/inflight columns)
+Uses multiple independent Polars lazy scans with projection pushdown
+to limit peak memory on large files (100M+ rows):
+  Scan 1: counters, duration, event counts (streamable)
+  Scan 2: distributions (driver/queue latencies, sizes per op)
+  Scan 3: inflight time-series (queue + driver stages)
+  Scan 4: access pattern (sector gap analysis from issue events)
 
 Usage:
     python ./util/generate_detailed_stats.py <results_dir>
@@ -17,7 +20,7 @@ import json
 import sys
 from pathlib import Path
 
-import pandas as pd
+import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from stats_generation.shared import (compute_access_pattern,
@@ -26,6 +29,11 @@ from stats_generation.shared import (compute_access_pattern,
                                      tseries_stats)
 
 LAYER_PREFIX = "block"
+
+
+def _sec_to_time(s):
+    h, m, ss = s // 3600, (s % 3600) // 60, s % 60
+    return f"{h:02d}:{m:02d}:{ss:02d}"
 
 
 def generate_stats(csv_path):
@@ -38,44 +46,61 @@ def generate_stats(csv_path):
     has_d_inflight = "d_inflight" in header
     has_sector = "sector" in header
 
-    # --- Pass 1: Counters, distributions, tseries ---
-    main_cols = ["event", "op", "timestamp_ns", "bytes", "latency_ns"]
-    if has_q_inflight:
-        main_cols.append("q_inflight")
-    if has_d_inflight:
-        main_cols.append("d_inflight")
+    # --- Scan 1: Counters, duration, event counts ---
+    lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "op": pl.Utf8})
 
-    df = pd.read_csv(csv_path, usecols=main_cols,
-                     dtype={"event": "category", "op": "category"})
+    agg = (lf.filter(pl.col("event").is_in(["insert", "issue", "complete"]))
+             .group_by("event", "op")
+             .agg(
+                 pl.len().alias("count"),
+                 pl.col("bytes").sum().alias("total_bytes"),
+                 pl.col("timestamp_ns").min().alias("ts_min"),
+                 pl.col("timestamp_ns").max().alias("ts_max"),
+             )
+             .collect())
 
-    complete = df[df["event"] == "complete"]
-    all_events = df[df["event"].isin(["insert", "issue", "complete"])]
-
-    # Duration from first to last event
-    if len(all_events) > 1:
-        duration_ns = int(all_events["timestamp_ns"].max() - all_events["timestamp_ns"].min())
+    # Duration from all events
+    ts_min = agg["ts_min"].min()
+    ts_max = agg["ts_max"].max()
+    if ts_min is not None and ts_max is not None and ts_max > ts_min:
+        duration_ns = int(ts_max - ts_min)
         duration_s = duration_ns / 1e9
     else:
         duration_s = 0
 
-    # Build counters from complete events
+    # Build counters
     counters = {}
 
-    completed_counts = complete.groupby("op").size().to_dict()
-    counters["rq_completed"] = completed_counts
+    complete_rows = agg.filter(pl.col("event") == "complete")
+    if len(complete_rows) > 0:
+        counters["rq_completed"] = dict(zip(
+            complete_rows["op"].to_list(),
+            [int(v) for v in complete_rows["count"].to_list()]
+        ))
+        counters["rq_total_bytes"] = dict(zip(
+            complete_rows["op"].to_list(),
+            [int(v) for v in complete_rows["total_bytes"].to_list()]
+        ))
 
-    byte_sums = complete.groupby("op")["bytes"].sum().to_dict()
-    counters["rq_total_bytes"] = {k: int(v) for k, v in byte_sums.items()}
+    issue_rows = agg.filter(pl.col("event") == "issue")
+    if len(issue_rows) > 0:
+        counters["rq_issued"] = dict(zip(
+            issue_rows["op"].to_list(),
+            [int(v) for v in issue_rows["count"].to_list()]
+        ))
 
-    # Issue counts (from issue events)
-    issue_events = df[df["event"] == "issue"]
-    if len(issue_events) > 0:
-        counters["rq_issued"] = issue_events.groupby("op").size().to_dict()
+    insert_rows = agg.filter(pl.col("event") == "insert")
+    if len(insert_rows) > 0:
+        counters["rq_queued"] = dict(zip(
+            insert_rows["op"].to_list(),
+            [int(v) for v in insert_rows["count"].to_list()]
+        ))
 
-    # Queue counts (from insert events)
-    insert_events = df[df["event"] == "insert"]
-    if len(insert_events) > 0:
-        counters["rq_queued"] = insert_events.groupby("op").size().to_dict()
+    # Event counts for data quality (avoids separate CSV pass)
+    event_counts = dict(zip(
+        agg.group_by("event").agg(pl.col("count").sum())["event"].to_list(),
+        agg.group_by("event").agg(pl.col("count").sum())["count"].to_list(),
+    ))
 
     result = {
         "counters": counters,
@@ -88,106 +113,134 @@ def generate_stats(csv_path):
     throughput = derive_throughput(counters, duration_s, "rq_completed", "rq_total_bytes")
     result["derived"].update(throughput)
 
-    # Distributions (stats only, no histogram bucket data)
+    del agg
+
+    # --- Scan 2: Distributions ---
+    lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "op": pl.Utf8})
+
     # Driver latencies (from complete events)
-    driver_lat = complete[complete["latency_ns"].notna()]
-    if len(driver_lat) > 0:
+    driver_lat_df = (lf.filter(pl.col("event") == "complete")
+                       .filter(pl.col("latency_ns").is_not_null())
+                       .select("op", "latency_ns")
+                       .collect())
+    if len(driver_lat_df) > 0:
         result["distributions"]["driver_latencies"] = {}
-        for op, group in driver_lat.groupby("op"):
-            result["distributions"]["driver_latencies"][op] = series_stats(
-                group["latency_ns"].tolist()
-            )
+        for op in driver_lat_df["op"].unique().sort().to_list():
+            vals = driver_lat_df.filter(pl.col("op") == op)["latency_ns"].to_numpy()
+            result["distributions"]["driver_latencies"][op] = series_stats(vals)
+    del driver_lat_df
 
-    # Queue latencies (from issue events with latency)
-    queue_lat = issue_events[issue_events["latency_ns"].notna()]
-    if len(queue_lat) > 0:
+    # Queue latencies (from issue events)
+    lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "op": pl.Utf8})
+    queue_lat_df = (lf.filter(pl.col("event") == "issue")
+                      .filter(pl.col("latency_ns").is_not_null())
+                      .select("op", "latency_ns")
+                      .collect())
+    if len(queue_lat_df) > 0:
         result["distributions"]["queue_latencies"] = {}
-        for op, group in queue_lat.groupby("op"):
-            result["distributions"]["queue_latencies"][op] = series_stats(
-                group["latency_ns"].tolist()
-            )
+        for op in queue_lat_df["op"].unique().sort().to_list():
+            vals = queue_lat_df.filter(pl.col("op") == op)["latency_ns"].to_numpy()
+            result["distributions"]["queue_latencies"][op] = series_stats(vals)
+    del queue_lat_df
 
-    # IO sizes
-    if len(complete) > 0:
+    # IO sizes (from complete events)
+    lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "op": pl.Utf8})
+    size_df = (lf.filter(pl.col("event") == "complete")
+                 .select("op", "bytes")
+                 .collect())
+    if len(size_df) > 0:
         result["distributions"]["rq_sizes"] = {}
-        for op, group in complete.groupby("op"):
-            result["distributions"]["rq_sizes"][op] = series_stats(
-                group["bytes"].tolist()
-            )
+        for op in size_df["op"].unique().sort().to_list():
+            vals = size_df.filter(pl.col("op") == op)["bytes"].to_numpy()
+            result["distributions"]["rq_sizes"][op] = series_stats(vals)
+    del size_df
 
-    # Inflight time-series
-    if len(all_events) > 1:
-        t_min = all_events["timestamp_ns"].min()
-        window_ns = 1_000_000_000  # 1 second
+    # --- Scan 3: Inflight time-series ---
+    if duration_s > 0:
+        window_ns = 1_000_000_000
 
         if has_q_inflight and has_d_inflight:
-            # Use pre-computed in-kernel inflight columns
+            lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "op": pl.Utf8})
+            inf_df = (lf.filter(pl.col("event").is_in(["insert", "issue", "complete"]))
+                        .select("op", "timestamp_ns", "q_inflight", "d_inflight")
+                        .sort("timestamp_ns")
+                        .with_columns(
+                            ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
+                        )
+                        .group_by("op", "sec")
+                        .agg(
+                            pl.col("q_inflight").last(),
+                            pl.col("d_inflight").last(),
+                        )
+                        .sort("op", "sec")
+                        .collect())
+
             for stage, col in [("q_inflight", "q_inflight"), ("d_inflight", "d_inflight")]:
                 result["tseries"][stage] = {}
-                for op in all_events["op"].unique():
-                    op_df = all_events[all_events["op"] == op].sort_values("timestamp_ns")
-                    secs = ((op_df["timestamp_ns"].values - t_min) / window_ns).astype(int)
-                    op_df = op_df.assign(sec=secs)
-                    sampled = op_df.groupby("sec")[col].last()
-                    points = []
-                    for s, v in sampled.items():
-                        h, m, ss = s // 3600, (s % 3600) // 60, s % 60
-                        points.append({"time": f"{h:02d}:{m:02d}:{ss:02d}",
-                                       "value": max(0, int(v))})
+                for op in inf_df["op"].unique().sort().to_list():
+                    op_df = inf_df.filter(pl.col("op") == op)
+                    points = [
+                        {"time": _sec_to_time(int(s)), "value": max(0, int(v))}
+                        for s, v in zip(op_df["sec"].to_list(), op_df[col].to_list())
+                    ]
                     if points:
                         result["tseries"][stage][op] = tseries_stats(points)
+            del inf_df
         else:
             # Fallback: compute from enter/exit event counts
-            t_max = all_events["timestamp_ns"].max()
+            lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "op": pl.Utf8})
+            ev_df = (lf.filter(pl.col("event").is_in(["insert", "issue", "complete"]))
+                       .select("event", "op", "timestamp_ns")
+                       .collect())
+
             for stage, enter_evt, exit_evt in [("d_inflight", "issue", "complete"),
-                                               ("q_inflight", "insert", "issue")]:
-                stage_enter = df[df["event"] == enter_evt]
-                stage_exit = df[df["event"] == exit_evt]
+                                                ("q_inflight", "insert", "issue")]:
+                stage_enter = ev_df.filter(pl.col("event") == enter_evt)
+                stage_exit = ev_df.filter(pl.col("event") == exit_evt)
                 if len(stage_enter) == 0:
                     continue
 
                 result["tseries"][stage] = {}
-                for op in stage_enter["op"].unique():
-                    enter_ts = stage_enter[stage_enter["op"] == op]["timestamp_ns"].values
-                    exit_ts = stage_exit[stage_exit["op"] == op]["timestamp_ns"].values
+                for op in stage_enter["op"].unique().sort().to_list():
+                    enter_ts = stage_enter.filter(pl.col("op") == op)["timestamp_ns"].to_numpy()
+                    exit_ts = stage_exit.filter(pl.col("op") == op)["timestamp_ns"].to_numpy()
                     points = []
-                    t = t_min
+                    t = ts_min
                     sec = 0
-                    while t <= t_max:
+                    while t <= ts_max:
                         inflight = int((enter_ts <= t).sum() - (exit_ts <= t).sum())
-                        h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
-                        points.append({"time": f"{h:02d}:{m:02d}:{s:02d}",
-                                       "value": max(0, inflight)})
+                        points.append({"time": _sec_to_time(sec), "value": max(0, inflight)})
                         t += window_ns
                         sec += 1
                     if points:
                         result["tseries"][stage][op] = tseries_stats(points)
+            del ev_df
 
-    del df  # Free pass 1 DataFrame
-
-    # --- Pass 2: Access pattern ---
+    # --- Scan 4: Access pattern ---
     if has_sector:
-        ap_cols = ["event", "op", "timestamp_ns", "sector", "bytes"]
-        df = pd.read_csv(csv_path, usecols=ap_cols,
-                         dtype={"event": "category", "op": "category"})
+        lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "op": pl.Utf8})
+        issue_df = (lf.filter(pl.col("event") == "issue")
+                      .filter(pl.col("sector").is_not_null())
+                      .select("op", "timestamp_ns", "sector", "bytes")
+                      .sort("timestamp_ns")
+                      .collect())
 
-        issue_events = df[df["event"] == "issue"]
-        if len(issue_events) > 0:
+        if len(issue_df) > 0:
             result["access_pattern"] = {"rq_sectors": {}}
-            for op, group in issue_events.sort_values("timestamp_ns").groupby("op"):
-                sectors = group["sector"].dropna().astype(int).tolist()
-                bytes_list = group.loc[group["sector"].notna(), "bytes"].astype(int).tolist()
+            for op in issue_df["op"].unique().sort().to_list():
+                op_df = issue_df.filter(pl.col("op") == op)
+                sectors = op_df["sector"].cast(pl.Int64).to_numpy()
+                bytes_list = op_df["bytes"].cast(pl.Int64).to_numpy()
                 if len(sectors) >= 2:
                     result["access_pattern"]["rq_sectors"][op] = compute_access_pattern(
                         sectors, bytes_list
                     )
+        del issue_df
 
-        del df  # Free pass 2 DataFrame
-
-    return result
+    return result, event_counts
 
 
-def load_data_quality(layer_dir, csv_file):
+def load_data_quality(layer_dir, event_counts):
     """Load per-type counters.json and compute data quality metrics."""
     counters_file = layer_dir / "counters.json"
     if not counters_file.exists():
@@ -195,9 +248,6 @@ def load_data_quality(layer_dir, csv_file):
     try:
         with open(counters_file) as f:
             counters = json.load(f)
-
-        # Read only the event column for per-type received counts
-        events = pd.read_csv(csv_file, usecols=["event"], dtype={"event": "category"})["event"]
 
         per_event_type = {}
         total_generated = 0
@@ -207,7 +257,7 @@ def load_data_quality(layer_dir, csv_file):
             entry = counters.get(event_type, {})
             gen = entry.get("generated", 0)
             drop = entry.get("dropped", 0)
-            received = int((events == event_type).sum())
+            received = int(event_counts.get(event_type, 0))
             total_generated += gen
             total_dropped += drop
             per_event_type[event_type] = {
@@ -247,9 +297,9 @@ def main():
         sys.exit(1)
 
     print(f"Processing {csv_file.name}...")
-    stats = generate_stats(csv_file)
+    stats, event_counts = generate_stats(csv_file)
 
-    dq = load_data_quality(layer_dir, csv_file)
+    dq = load_data_quality(layer_dir, event_counts)
     if dq:
         stats["data_quality"] = dq
     # Always remove counters.json — transient file consumed by stats generation

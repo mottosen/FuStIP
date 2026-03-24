@@ -4,7 +4,7 @@
 import sys
 from pathlib import Path
 
-import pandas as pd
+import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 import numpy as np
@@ -28,21 +28,21 @@ def _compute_rw_gaps(tracker_df, sc_type):
     Replays openat/close/lseek/read/write events to reconstruct file positions,
     then computes gaps between successive IOs per fd.
 
-    Uses numpy arrays for fast iteration (avoids pandas iterrows overhead).
+    Uses numpy arrays for fast iteration (avoids per-row overhead).
     """
     # Pre-filter to only events that affect position or are target enters
     mask = (
-        ((tracker_df["event"] == "exit") & tracker_df["syscall"].isin({"openat", "lseek", sc_type})) |
-        ((tracker_df["event"] == "enter") & tracker_df["syscall"].isin({sc_type, "close"}))
+        ((pl.col("event") == "exit") & pl.col("syscall").is_in(["openat", "lseek", sc_type])) |
+        ((pl.col("event") == "enter") & pl.col("syscall").is_in([sc_type, "close"]))
     )
-    df = tracker_df[mask].sort_values("timestamp_ns")
+    df = tracker_df.filter(mask).sort("timestamp_ns")
 
-    # Extract numpy arrays for fast access (no pandas per-row overhead)
-    events = df["event"].to_numpy(dtype=str)
-    syscalls = df["syscall"].to_numpy(dtype=str)
-    tids = df["tid"].to_numpy(dtype="float64")
-    fds = df["fd"].to_numpy(dtype="float64")
-    bytes_arr = df["bytes"].to_numpy(dtype="float64")
+    # Extract numpy arrays for fast access (no per-row overhead)
+    events = df["event"].to_numpy(allow_copy=True).astype(str)
+    syscalls = df["syscall"].to_numpy(allow_copy=True).astype(str)
+    tids = df["tid"].to_numpy(allow_copy=True).astype("float64")
+    fds = df["fd"].to_numpy(allow_copy=True).astype("float64")
+    bytes_arr = df["bytes"].to_numpy(allow_copy=True).astype("float64")
 
     pos = {}           # (tid, fd) -> current file position
     fd_positions = {}  # fd -> [(position, size), ...]
@@ -107,16 +107,17 @@ def _plot_fs_gap_cdf(ax, df, types, tracker_df=None):
     pread64/pwrite64: per-fd gaps using explicit offsets from enter events.
     read/write: per-fd gaps using position tracking (openat/lseek/close replay).
     """
-    enters = df[df["event"] == "enter"]
+    enters = df.filter(pl.col("event") == "enter")
 
     for i, typ in enumerate(types):
         if typ in ("pread64", "pwrite64"):
             # Per-fd gap computation using explicit offsets
-            sub = enters[enters["syscall"] == typ].sort_values("timestamp_ns")
+            sub = enters.filter(pl.col("syscall") == typ).sort("timestamp_ns")
             all_gaps = []
-            for _, fd_group in sub.groupby("fd"):
-                locations = fd_group["offset"].dropna().values
-                sizes = fd_group["bytes"].values[:len(locations)]
+            for fd_val in sub.drop_nulls("fd")["fd"].unique().to_list():
+                fd_group = sub.filter(pl.col("fd") == fd_val)
+                locations = fd_group.drop_nulls("offset")["offset"].to_numpy()
+                sizes = fd_group["bytes"].to_numpy()[:len(locations)]
                 if len(locations) < 2:
                     continue
                 expected = locations[:-1] + sizes[:len(locations) - 1]
@@ -150,9 +151,9 @@ def _build_row(label, df, tracker_df=None):
     """
     if tracker_df is None:
         tracker_df = df
-    exits = df[df["event"] == "exit"]
-    types = sorted(exits["syscall"].dropna().unique())
-    counts = exits.groupby("syscall").size().to_dict()
+    exits = df.filter(pl.col("event") == "exit")
+    types = sorted(exits.drop_nulls("syscall")["syscall"].unique().sort().to_list())
+    counts = dict(zip(*exits.group_by("syscall").len().select("syscall", "len").get_columns()))
     has_inflight = "inflight" in df.columns
 
     if has_inflight:
@@ -181,27 +182,23 @@ def main():
         sys.exit(1)
 
     print(f"Reading {csv_path.name}...")
-    header = pd.read_csv(csv_path, nrows=0).columns.tolist()
+    with open(csv_path) as f:
+        header = f.readline().strip().split(",")
     has_comm = "comm" in header
     has_inflight = "inflight" in header
     usecols = USECOLS + (["comm"] if has_comm else []) + (["inflight"] if has_inflight else [])
 
-    # Use category dtype for string columns to reduce memory
-    cat_cols = {"event": "category", "syscall": "category"}
-    if has_comm:
-        cat_cols["comm"] = "category"
-
     # Load tracker syscalls (IO + openat/close/lseek for position tracking)
-    full_df = pd.read_csv(csv_path, usecols=usecols, dtype=cat_cols)
-    full_df = full_df[full_df["syscall"].isin(TRACKER_SYSCALLS)].copy()
+    full_df = pl.read_csv(csv_path, columns=usecols)
+    full_df = full_df.filter(pl.col("syscall").is_in(list(TRACKER_SYSCALLS)))
     # IO-only view for most plots
-    df = full_df[full_df["syscall"].isin(IO_SYSCALLS)]
+    df = full_df.filter(pl.col("syscall").is_in(list(IO_SYSCALLS)))
 
     rows = []
     if has_comm:
-        for comm_val in sorted(df["comm"].dropna().unique()):
-            comm_df = df[df["comm"] == comm_val]
-            tracker_df = full_df[full_df["comm"] == comm_val]
+        for comm_val in sorted(df.drop_nulls("comm")["comm"].unique().sort().to_list()):
+            comm_df = df.filter(pl.col("comm") == comm_val)
+            tracker_df = full_df.filter(pl.col("comm") == comm_val)
             rows.append(_build_row(comm_val, comm_df, tracker_df))
     else:
         rows.append(_build_row("fs", df, full_df))

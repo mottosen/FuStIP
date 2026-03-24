@@ -5,6 +5,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import polars as pl
 
 TYPE_COLORS = {
     "read": "#cecece",
@@ -39,13 +40,14 @@ def plot_type_distribution(ax, counts_by_type):
 
 def plot_inflight_over_time(ax, df, enter_event, exit_event, type_col, ts_col, types, title="Inflight Over Time"):
     """Per-type inflight count in 1-second windows."""
-    t_min = df[ts_col].min()
-    t_max = df[ts_col].max()
+    ts_vals = df[ts_col].to_numpy()
+    t_min = int(ts_vals.min())
+    t_max = int(ts_vals.max())
     window_ns = 1_000_000_000
 
     for i, typ in enumerate(types):
-        enter_ts = df[(df["event"] == enter_event) & (df[type_col] == typ)][ts_col].values
-        exit_ts = df[(df["event"] == exit_event) & (df[type_col] == typ)][ts_col].values
+        enter_ts = df.filter((pl.col("event") == enter_event) & (pl.col(type_col) == typ))[ts_col].to_numpy()
+        exit_ts = df.filter((pl.col("event") == exit_event) & (pl.col(type_col) == typ))[ts_col].to_numpy()
         if len(enter_ts) == 0:
             continue
         times = []
@@ -72,14 +74,16 @@ def plot_inflight_from_column(ax, df, type_col, ts_col, types,
     t_min = df[ts_col].min()
     window_ns = 1_000_000_000
     for i, typ in enumerate(types):
-        typ_df = df[df[type_col] == typ].sort_values(ts_col)
-        if typ_df.empty:
+        typ_df = df.filter(pl.col(type_col) == typ).sort(ts_col)
+        if len(typ_df) == 0:
             continue
-        secs = ((typ_df[ts_col].values - t_min) / window_ns).astype(int)
-        typ_df = typ_df.assign(sec=secs)
-        sampled = typ_df.groupby("sec")[inflight_col].last()
-        ax.plot(sampled.index, sampled.values.clip(min=0), label=typ,
-                color=_color_for(typ, i), linewidth=0.8)
+        ts_arr = typ_df[ts_col].to_numpy()
+        secs = ((ts_arr - t_min) / window_ns).astype(int)
+        typ_df = typ_df.with_columns(pl.Series("sec", secs))
+        sampled = typ_df.group_by("sec").agg(pl.col(inflight_col).last()).sort("sec")
+        ax.plot(sampled["sec"].to_numpy(),
+                sampled[inflight_col].to_numpy().clip(min=0),
+                label=typ, color=_color_for(typ, i), linewidth=0.8)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Inflight")
     ax.set_title(title)
@@ -88,17 +92,18 @@ def plot_inflight_from_column(ax, df, type_col, ts_col, types,
 
 def plot_cumulated_mb_over_time(ax, df, complete_event, type_col, ts_col, bytes_col, types):
     """Cumulative MB transferred in 1-second windows."""
-    completed = df[df["event"] == complete_event]
-    t_min = df[ts_col].min()
-    t_max = df[ts_col].max()
+    completed = df.filter(pl.col("event") == complete_event)
+    ts_vals = df[ts_col].to_numpy()
+    t_min = int(ts_vals.min())
+    t_max = int(ts_vals.max())
     window_ns = 1_000_000_000
 
     for i, typ in enumerate(types):
-        typ_df = completed[completed[type_col] == typ]
+        typ_df = completed.filter(pl.col(type_col) == typ)
         if len(typ_df) == 0:
             continue
-        ts = typ_df[ts_col].values
-        bts = typ_df[bytes_col].values
+        ts = typ_df[ts_col].to_numpy()
+        bts = typ_df[bytes_col].to_numpy()
         times = []
         cumul = []
         t = t_min
@@ -122,7 +127,7 @@ def plot_cumulated_mb_over_time(ax, df, complete_event, type_col, ts_col, bytes_
 def plot_io_size_cdf(ax, df, type_col, bytes_col, types):
     """CDF of IO sizes per type, log-scale x-axis."""
     for i, typ in enumerate(types):
-        vals = df[df[type_col] == typ][bytes_col].dropna().values
+        vals = df.filter(pl.col(type_col) == typ).drop_nulls(bytes_col)[bytes_col].to_numpy()
         if len(vals) == 0:
             continue
         sorted_vals = np.sort(vals)
@@ -139,7 +144,7 @@ def plot_io_size_cdf(ax, df, type_col, bytes_col, types):
 def plot_io_latency_cdf(ax, df, type_col, latency_col, types):
     """CDF of IO latencies per type, log-scale x-axis."""
     for i, typ in enumerate(types):
-        vals = df[df[type_col] == typ][latency_col].dropna().values
+        vals = df.filter(pl.col(type_col) == typ).drop_nulls(latency_col)[latency_col].to_numpy()
         vals = vals[vals > 0]
         if len(vals) == 0:
             continue
@@ -161,9 +166,9 @@ def plot_gap_cdf(ax, df, type_col, sector_or_offset_col, bytes_col, types,
     sector_divisor: 512 for sector-based (block/nvme), 1 for byte offsets (fs).
     """
     for i, typ in enumerate(types):
-        sub = df[df[type_col] == typ].sort_values("timestamp_ns")
-        locations = sub[sector_or_offset_col].dropna().values
-        sizes = sub[bytes_col].values[:len(locations)]
+        sub = df.filter(pl.col(type_col) == typ).sort("timestamp_ns")
+        locations = sub.drop_nulls(sector_or_offset_col)[sector_or_offset_col].to_numpy()
+        sizes = sub[bytes_col].to_numpy()[:len(locations)]
         if len(locations) < 2:
             continue
         expected = locations[:-1] + sizes[:len(locations) - 1] // sector_divisor

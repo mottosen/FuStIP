@@ -4,9 +4,12 @@
 Reads detailed.csv from the results directory, computes aggregate
 statistics matching the summary stats JSON structure, and writes JSON.
 
-Uses two CSV passes to limit peak memory on large files:
-  Pass 1: counters, distributions, tseries (no tid/fd/offset columns)
-  Pass 2: access pattern (no latency_ns/inflight columns)
+Uses multiple independent Polars lazy scans with projection pushdown
+to limit peak memory on large files (100M+ rows):
+  Scan 1: counters, duration, event counts (streamable)
+  Scan 2: distributions (latency/size stats per syscall)
+  Scan 3: inflight time-series
+  Scan 4: access pattern (pread64/pwrite64 offsets + read/write position tracking)
 
 Usage:
     python ./util/generate_detailed_stats.py <results_dir>
@@ -18,7 +21,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from stats_generation.shared import (compute_fs_access_pattern,
@@ -32,49 +35,36 @@ LAYER_PREFIX = "fs"
 IO_SYSCALLS = {"read", "write", "pread64", "pwrite64"}
 
 
-def _cat_code(cat_accessor, name):
-    """Return the integer category code for *name*, or -1 if absent."""
-    cats = cat_accessor.categories
-    return int(cats.get_loc(name)) if name in cats else -1
+def _sec_to_time(s):
+    h, m, ss = s // 3600, (s % 3600) // 60, s % 60
+    return f"{h:02d}:{m:02d}:{ss:02d}"
 
 
 def compute_rw_access_pattern(df):
     """Compute access pattern for read/write using position reconstruction.
 
-    Expects a pre-filtered DataFrame with only relevant syscalls
+    Expects a pre-filtered Polars DataFrame with only relevant syscalls
     (read, write, openat, lseek, close) and columns:
     event, syscall, timestamp_ns, tid, fd, bytes.
 
-    Uses numpy arrays with category codes for fast scalar access,
-    avoiding iterrows() overhead on large DataFrames.
+    Uses numpy arrays for fast scalar access in the state machine loop.
     """
-    df.sort_values("timestamp_ns", inplace=True)
+    df = df.sort("timestamp_ns")
 
-    # Category codes → int8 arrays for fast integer comparison
-    ev_cat = df["event"].cat
-    ev_codes = ev_cat.codes.to_numpy(dtype="int8")
-    ENTER = _cat_code(ev_cat, "enter")
-    EXIT = _cat_code(ev_cat, "exit")
+    # Extract numpy arrays for fast access
+    events = df["event"].to_numpy(allow_copy=True).astype(str)
+    syscalls = df["syscall"].to_numpy(allow_copy=True).astype(str)
+    tids = df["tid"].to_numpy(allow_copy=True).astype("float64")
+    fds = df["fd"].to_numpy(allow_copy=True).astype("float64")
+    bytes_arr = df["bytes"].to_numpy(allow_copy=True).astype("float64")
 
-    sc_cat = df["syscall"].cat
-    sc_codes = sc_cat.codes.to_numpy(dtype="int8")
-    READ = _cat_code(sc_cat, "read")
-    WRITE = _cat_code(sc_cat, "write")
-    OPENAT = _cat_code(sc_cat, "openat")
-    LSEEK = _cat_code(sc_cat, "lseek")
-    CLOSE = _cat_code(sc_cat, "close")
-
-    tids = df["tid"].to_numpy(dtype="float64")
-    fds = df["fd"].to_numpy(dtype="float64")
-    bytes_arr = df["bytes"].to_numpy(dtype="float64")
-
-    n = len(ev_codes)
+    n = len(events)
     pos = {}  # (tid, fd) -> file position
     rw_positions = {}  # "read"/"write" -> [(offset, bytes), ...]
 
     for i in range(n):
-        ev = ev_codes[i]
-        sc = sc_codes[i]
+        ev = events[i]
+        sc = syscalls[i]
         tid_v = tids[i]
         fd_v = fds[i]
         bv = bytes_arr[i]
@@ -84,30 +74,29 @@ def compute_rw_access_pattern(df):
         fd_ok = fd_v == fd_v and fd_v >= 0
 
         # Record position for read/write enter events (before state update)
-        if ev == ENTER and (sc == READ or sc == WRITE) and tid_ok and fd_ok:
+        if ev == "enter" and (sc == "read" or sc == "write") and tid_ok and fd_ok:
             key = (int(tid_v), int(fd_v))
             if key in pos:
                 bv_int = int(bv) if bv == bv and bv > 0 else 0
-                sc_name = "read" if sc == READ else "write"
-                rw_positions.setdefault(sc_name, []).append((pos[key], bv_int))
+                rw_positions.setdefault(sc, []).append((pos[key], bv_int))
 
         # Update position state
-        if ev == EXIT:
-            if sc == OPENAT:
+        if ev == "exit":
+            if sc == "openat":
                 ret = int(bv) if bv == bv else -1
                 if ret >= 0 and tid_ok:
                     pos[(int(tid_v), ret)] = 0
-            elif sc == LSEEK:
+            elif sc == "lseek":
                 ret = int(bv) if bv == bv else -1
                 if ret >= 0 and fd_ok and tid_ok:
                     pos[(int(tid_v), int(fd_v))] = ret
-            elif sc == READ or sc == WRITE:
+            elif sc == "read" or sc == "write":
                 ret = int(bv) if bv == bv else 0
                 if ret > 0 and fd_ok and tid_ok:
                     key = (int(tid_v), int(fd_v))
                     if key in pos:
                         pos[key] += ret
-        elif ev == ENTER and sc == CLOSE:
+        elif ev == "enter" and sc == "close":
             if fd_ok and tid_ok:
                 pos.pop((int(tid_v), int(fd_v)), None)
 
@@ -132,49 +121,73 @@ def generate_stats(csv_path):
     has_inflight = "inflight" in header
     has_offset = "offset" in header
 
-    # --- Pass 1: Counters, distributions, derived, tseries ---
-    main_cols = ["event", "syscall", "timestamp_ns", "bytes", "latency_ns"]
-    if has_inflight:
-        main_cols.append("inflight")
+    io_syscalls_list = list(IO_SYSCALLS)
 
-    df = pd.read_csv(csv_path, usecols=main_cols,
-                     dtype={"event": "category", "syscall": "category"})
+    # --- Scan 1: Counters, duration, event counts ---
+    lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "syscall": pl.Utf8})
 
-    exits = df[df["event"] == "exit"]
-    enters = df[df["event"] == "enter"]
+    # Get per-(event, syscall) aggregates
+    agg = (lf.group_by("event", "syscall")
+             .agg(
+                 pl.len().alias("count"),
+                 pl.col("bytes").sum().alias("total_bytes"),
+                 pl.col("timestamp_ns").min().alias("ts_min"),
+                 pl.col("timestamp_ns").max().alias("ts_max"),
+                 # Sum of positive bytes for sc_total_bytes
+                 pl.col("bytes").filter(pl.col("bytes") > 0).sum().alias("pos_bytes"),
+             )
+             .collect())
 
-    # Duration
-    if len(df) > 1:
-        duration_ns = int(df["timestamp_ns"].max() - df["timestamp_ns"].min())
+    # Duration from all events
+    ts_min = agg["ts_min"].min()
+    ts_max = agg["ts_max"].max()
+    if ts_min is not None and ts_max is not None and ts_max > ts_min:
+        duration_ns = int(ts_max - ts_min)
         duration_s = duration_ns / 1e9
     else:
         duration_s = 0
-
-    # IO exits (read/write/pread64/pwrite64)
-    io_exits = exits[exits["syscall"].isin(IO_SYSCALLS)]
 
     # Build counters
     counters = {}
 
     # sc_completed: count of exit events per IO syscall
-    if len(io_exits) > 0:
-        counters["sc_completed"] = io_exits.groupby("syscall").size().to_dict()
+    exit_io = agg.filter((pl.col("event") == "exit") & pl.col("syscall").is_in(io_syscalls_list))
+    if len(exit_io) > 0:
+        counters["sc_completed"] = dict(zip(
+            exit_io["syscall"].to_list(),
+            [int(v) for v in exit_io["count"].to_list()]
+        ))
 
     # sc_entered: count of enter events per IO syscall
-    io_enters = enters[enters["syscall"].isin(IO_SYSCALLS)]
-    if len(io_enters) > 0:
-        counters["sc_entered"] = io_enters.groupby("syscall").size().to_dict()
+    enter_io = agg.filter((pl.col("event") == "enter") & pl.col("syscall").is_in(io_syscalls_list))
+    if len(enter_io) > 0:
+        counters["sc_entered"] = dict(zip(
+            enter_io["syscall"].to_list(),
+            [int(v) for v in enter_io["count"].to_list()]
+        ))
 
-    # sc_total_bytes: sum of bytes (from exit events, positive returns only)
-    positive_exits = io_exits[io_exits["bytes"] > 0]
-    if len(positive_exits) > 0:
-        byte_sums = positive_exits.groupby("syscall")["bytes"].sum().to_dict()
-        counters["sc_total_bytes"] = {k: int(v) for k, v in byte_sums.items()}
+    # sc_total_bytes: sum of positive bytes from exit IO events
+    if len(exit_io) > 0:
+        pos_bytes_rows = exit_io.filter(pl.col("pos_bytes") > 0)
+        if len(pos_bytes_rows) > 0:
+            counters["sc_total_bytes"] = dict(zip(
+                pos_bytes_rows["syscall"].to_list(),
+                [int(v) for v in pos_bytes_rows["pos_bytes"].to_list()]
+            ))
 
     # sc_count: count of non-IO syscalls (enter events)
-    non_io_enters = enters[~enters["syscall"].isin(IO_SYSCALLS)]
+    non_io_enters = agg.filter((pl.col("event") == "enter") & ~pl.col("syscall").is_in(io_syscalls_list))
     if len(non_io_enters) > 0:
-        counters["sc_count"] = non_io_enters.groupby("syscall").size().to_dict()
+        counters["sc_count"] = dict(zip(
+            non_io_enters["syscall"].to_list(),
+            [int(v) for v in non_io_enters["count"].to_list()]
+        ))
+
+    # Event counts for data quality (avoids separate CSV pass)
+    event_counts = dict(zip(
+        agg.group_by("event").agg(pl.col("count").sum())["event"].to_list(),
+        agg.group_by("event").agg(pl.col("count").sum())["count"].to_list(),
+    ))
 
     result = {
         "counters": counters,
@@ -187,96 +200,119 @@ def generate_stats(csv_path):
     throughput = derive_throughput(counters, duration_s, "sc_completed", "sc_total_bytes")
     result["derived"].update(throughput)
 
-    # Distributions (stats only, no histogram bucket data)
-    lat_exits = io_exits[io_exits["latency_ns"].notna() & (io_exits["latency_ns"] > 0)]
-    if len(lat_exits) > 0:
+    del agg
+
+    # --- Scan 2: Distributions ---
+    # Latencies (from exit IO events with valid latency)
+    lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "syscall": pl.Utf8})
+    lat_df = (lf.filter(pl.col("event") == "exit")
+                .filter(pl.col("syscall").is_in(io_syscalls_list))
+                .filter(pl.col("latency_ns").is_not_null() & (pl.col("latency_ns") > 0))
+                .select("syscall", "latency_ns")
+                .collect())
+    if len(lat_df) > 0:
         result["distributions"]["sc_latencies"] = {}
-        for sc, group in lat_exits.groupby("syscall"):
-            result["distributions"]["sc_latencies"][sc] = series_stats(
-                group["latency_ns"].tolist()
-            )
+        for sc in lat_df["syscall"].unique().sort().to_list():
+            vals = lat_df.filter(pl.col("syscall") == sc)["latency_ns"].to_numpy()
+            result["distributions"]["sc_latencies"][sc] = series_stats(vals)
+    del lat_df
 
-    if len(positive_exits) > 0:
+    # Sizes (from exit IO events with positive bytes)
+    lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "syscall": pl.Utf8})
+    size_df = (lf.filter(pl.col("event") == "exit")
+                 .filter(pl.col("syscall").is_in(io_syscalls_list))
+                 .filter(pl.col("bytes") > 0)
+                 .select("syscall", "bytes")
+                 .collect())
+    if len(size_df) > 0:
         result["distributions"]["sc_sizes"] = {}
-        for sc, group in positive_exits.groupby("syscall"):
-            result["distributions"]["sc_sizes"][sc] = series_stats(
-                group["bytes"].tolist()
-            )
+        for sc in size_df["syscall"].unique().sort().to_list():
+            vals = size_df.filter(pl.col("syscall") == sc)["bytes"].to_numpy()
+            result["distributions"]["sc_sizes"][sc] = series_stats(vals)
+    del size_df
 
-    # Inflight time-series (IO syscalls only)
-    if len(io_enters) > 0 and len(io_exits) > 0:
-        t_min = df["timestamp_ns"].min()
+    # --- Scan 3: Inflight time-series (IO syscalls only) ---
+    if duration_s > 0:
         window_ns = 1_000_000_000
-
         result["tseries"]["sc_inflight"] = {}
-        io_events = df[df["syscall"].isin(IO_SYSCALLS)]
 
-        if has_inflight and "inflight" in df.columns:
-            # Use pre-computed in-kernel inflight column
-            for sc in io_events["syscall"].unique():
-                sc_df = io_events[io_events["syscall"] == sc].sort_values("timestamp_ns")
-                secs = ((sc_df["timestamp_ns"].values - t_min) / window_ns).astype(int)
-                sc_df = sc_df.assign(sec=secs)
-                sampled = sc_df.groupby("sec")["inflight"].last()
-                points = []
-                for s, v in sampled.items():
-                    h, m, ss = s // 3600, (s % 3600) // 60, s % 60
-                    points.append({"time": f"{h:02d}:{m:02d}:{ss:02d}",
-                                   "value": max(0, int(v))})
+        if has_inflight:
+            lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "syscall": pl.Utf8})
+            inf_df = (lf.filter(pl.col("syscall").is_in(io_syscalls_list))
+                        .select("syscall", "timestamp_ns", "inflight")
+                        .sort("timestamp_ns")
+                        .with_columns(
+                            ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
+                        )
+                        .group_by("syscall", "sec")
+                        .agg(pl.col("inflight").last())
+                        .sort("syscall", "sec")
+                        .collect())
+
+            for sc in inf_df["syscall"].unique().sort().to_list():
+                sc_df = inf_df.filter(pl.col("syscall") == sc)
+                points = [
+                    {"time": _sec_to_time(int(s)), "value": max(0, int(v))}
+                    for s, v in zip(sc_df["sec"].to_list(), sc_df["inflight"].to_list())
+                ]
                 if points:
                     result["tseries"]["sc_inflight"][sc] = tseries_stats(points)
+            del inf_df
         else:
             # Fallback: compute from enter/exit event counts
-            t_max = df["timestamp_ns"].max()
-            for sc in io_enters["syscall"].unique():
-                enter_ts = io_enters[io_enters["syscall"] == sc]["timestamp_ns"].values
-                exit_ts = io_exits[io_exits["syscall"] == sc]["timestamp_ns"].values
+            lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "syscall": pl.Utf8})
+            ev_df = (lf.filter(pl.col("syscall").is_in(io_syscalls_list))
+                       .select("event", "syscall", "timestamp_ns")
+                       .collect())
+
+            io_enters = ev_df.filter(pl.col("event") == "enter")
+            io_exits = ev_df.filter(pl.col("event") == "exit")
+
+            for sc in io_enters["syscall"].unique().sort().to_list():
+                enter_ts = io_enters.filter(pl.col("syscall") == sc)["timestamp_ns"].to_numpy()
+                exit_ts = io_exits.filter(pl.col("syscall") == sc)["timestamp_ns"].to_numpy()
                 points = []
-                t = t_min
+                t = ts_min
                 sec = 0
-                while t <= t_max:
+                while t <= ts_max:
                     inflight = int((enter_ts <= t).sum() - (exit_ts <= t).sum())
-                    h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
-                    points.append({"time": f"{h:02d}:{m:02d}:{s:02d}",
-                                   "value": max(0, inflight)})
+                    points.append({"time": _sec_to_time(sec), "value": max(0, inflight)})
                     t += window_ns
                     sec += 1
                 if points:
                     result["tseries"]["sc_inflight"][sc] = tseries_stats(points)
+            del ev_df
 
-    del df  # Free pass 1 DataFrame
-
-    # --- Pass 2: Access pattern ---
-    ap_cols = ["event", "syscall", "timestamp_ns", "tid", "fd", "bytes"]
-    if has_offset:
-        ap_cols.append("offset")
-
-    df = pd.read_csv(csv_path, usecols=ap_cols,
-                     dtype={"event": "category", "syscall": "category"})
-
-    io_enters = df[(df["event"] == "enter") & df["syscall"].isin(IO_SYSCALLS)]
+    # --- Scan 4: Access pattern ---
+    result["access_pattern"] = {"sc_offsets": {}}
 
     # pread64/pwrite64: use explicit offsets from enter events
-    offset_syscalls = {"pread64", "pwrite64"}
-    result["access_pattern"] = {"sc_offsets": {}}
     if has_offset:
-        offset_enters = io_enters[
-            io_enters["syscall"].isin(offset_syscalls) & io_enters["offset"].notna()
-        ]
-        if len(offset_enters) >= 2:
-            for sc, group in offset_enters.sort_values("timestamp_ns").groupby("syscall"):
-                offsets = group["offset"].astype(int).tolist()
-                bytes_list = group["bytes"].astype(int).tolist()
+        lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "syscall": pl.Utf8})
+        offset_df = (lf.filter(pl.col("event") == "enter")
+                       .filter(pl.col("syscall").is_in(["pread64", "pwrite64"]))
+                       .filter(pl.col("offset").is_not_null())
+                       .select("syscall", "timestamp_ns", "offset", "bytes")
+                       .sort("timestamp_ns")
+                       .collect())
+
+        if len(offset_df) >= 2:
+            for sc in offset_df["syscall"].unique().sort().to_list():
+                sc_df = offset_df.filter(pl.col("syscall") == sc)
+                offsets = sc_df["offset"].cast(pl.Int64).to_numpy()
+                bytes_list = sc_df["bytes"].cast(pl.Int64).to_numpy()
                 if len(offsets) >= 2:
                     result["access_pattern"]["sc_offsets"][sc] = compute_fs_access_pattern(
                         offsets, bytes_list
                     )
+        del offset_df
 
     # read/write: pre-filter to relevant syscalls, reconstruct positions
-    rw_relevant = {"read", "write", "openat", "lseek", "close"}
-    rw_cols = ["event", "syscall", "timestamp_ns", "tid", "fd", "bytes"]
-    rw_df = df.loc[df["syscall"].isin(rw_relevant), rw_cols].copy()
-    del df  # Free pass 2 full DataFrame
+    rw_relevant = ["read", "write", "openat", "lseek", "close"]
+    lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "syscall": pl.Utf8})
+    rw_df = (lf.filter(pl.col("syscall").is_in(rw_relevant))
+               .select("event", "syscall", "timestamp_ns", "tid", "fd", "bytes")
+               .collect())
 
     rw_pattern = compute_rw_access_pattern(rw_df)
     del rw_df
@@ -284,10 +320,10 @@ def generate_stats(csv_path):
     for sc, pat in rw_pattern.items():
         result["access_pattern"]["sc_offsets"][sc] = pat
 
-    return result
+    return result, event_counts
 
 
-def load_data_quality(layer_dir, csv_file):
+def load_data_quality(layer_dir, event_counts):
     """Load per-type counters.json and compute data quality metrics."""
     counters_file = layer_dir / "counters.json"
     if not counters_file.exists():
@@ -295,9 +331,6 @@ def load_data_quality(layer_dir, csv_file):
     try:
         with open(counters_file) as f:
             counters = json.load(f)
-
-        # Read only the event column for per-type received counts
-        events = pd.read_csv(csv_file, usecols=["event"], dtype={"event": "category"})["event"]
 
         per_event_type = {}
         total_generated = 0
@@ -307,7 +340,7 @@ def load_data_quality(layer_dir, csv_file):
             entry = counters.get(event_type, {})
             gen = entry.get("generated", 0)
             drop = entry.get("dropped", 0)
-            received = int((events == event_type).sum())
+            received = int(event_counts.get(event_type, 0))
             total_generated += gen
             total_dropped += drop
             per_event_type[event_type] = {
@@ -347,9 +380,9 @@ def main():
         sys.exit(1)
 
     print(f"Processing {csv_file.name}...")
-    stats = generate_stats(csv_file)
+    stats, event_counts = generate_stats(csv_file)
 
-    dq = load_data_quality(layer_dir, csv_file)
+    dq = load_data_quality(layer_dir, event_counts)
     if dq:
         stats["data_quality"] = dq
     # Always remove counters.json — transient file consumed by stats generation
