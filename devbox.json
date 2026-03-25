@@ -2,11 +2,9 @@
   "packages": {
     "python": {"version": "3.14"},
     "python314Packages.pip": {"version": "25.3"},
-
-    "bpftrace": {"version": "0.24.2"},
-    "sysstat": {"version": "12.7.7"},
     "fio": {"version": "3.41"},
-
+    "sysstat": {"version": "12.7.7"},
+    "bpftrace": {"version": "0.24.2"},
     "clang_18": {"version": "18.1.8"},
     "bpftools": {"version": "6.18.7"},
     "libbpf": {"version": "1.6.3"},
