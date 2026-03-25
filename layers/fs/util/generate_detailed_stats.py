@@ -94,7 +94,7 @@ def compute_rw_access_pattern(df):
 
     n = len(events)
     pos = {}  # (tid, fd) -> file position
-    rw_positions = {}  # "read"/"write" -> [(offset, bytes), ...]
+    rw_positions = {}  # "read"/"write" -> {fd: [(offset, bytes), ...]}
 
     for i in range(n):
         ev = events[i]
@@ -112,7 +112,7 @@ def compute_rw_access_pattern(df):
             key = (int(tid_v), int(fd_v))
             if key in pos:
                 bv_int = int(bv) if bv == bv and bv > 0 else 0
-                rw_positions.setdefault(sc, []).append((pos[key], bv_int))
+                rw_positions.setdefault(sc, {}).setdefault(int(fd_v), []).append((pos[key], bv_int))
 
         # Update position state
         if ev == "exit":
@@ -136,12 +136,29 @@ def compute_rw_access_pattern(df):
 
     result = {}
     for sc in ("read", "write"):
-        positions = rw_positions.get(sc, [])
-        if len(positions) < 2:
-            continue
-        offsets = [p[0] for p in positions]
-        bytes_list = [p[1] for p in positions]
-        result[sc] = compute_fs_access_pattern(offsets, bytes_list)
+        fd_groups = rw_positions.get(sc, {})
+        total_ios = 0
+        seq_count = 0
+        rnd_count = 0
+        for fd_positions in fd_groups.values():
+            total_ios += len(fd_positions)
+            if len(fd_positions) < 2:
+                continue
+            offsets = [p[0] for p in fd_positions]
+            bytes_list = [p[1] for p in fd_positions]
+            pat = compute_fs_access_pattern(offsets, bytes_list)
+            seq_count += pat["sequential_count"]
+            rnd_count += pat["random_count"]
+
+        total_gaps = seq_count + rnd_count
+        if total_gaps > 0:
+            result[sc] = {
+                "total_ios": total_ios,
+                "sequential_count": seq_count,
+                "random_count": rnd_count,
+                "sequential_pct": round(100 * seq_count / total_gaps, 2),
+                "random_pct": round(100 * rnd_count / total_gaps, 2),
+            }
 
     return result
 
@@ -290,21 +307,42 @@ def generate_stats(csv_path):
     print("  Scan 4: access pattern...", flush=True)
     result["access_pattern"] = {"sc_offsets": {}}
 
-    # pread64/pwrite64: per-syscall scan with explicit offsets
+    # pread64/pwrite64: per-syscall scan with explicit offsets, per-fd analysis
     if has_offset:
         for sc in ["pread64", "pwrite64"]:
             lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
             sc_df = (lf.filter((pl.col("event") == "enter") & (pl.col("syscall") == sc)
                                & pl.col("offset").is_not_null())
-                       .select("timestamp_ns", "offset", "bytes")
+                       .select("timestamp_ns", "offset", "bytes", "fd")
                        .sort("timestamp_ns")
                        .collect(engine="streaming"))
-            if len(sc_df) >= 2:
-                offsets = sc_df["offset"].cast(pl.Int64).to_numpy()
-                bytes_list = sc_df["bytes"].cast(pl.Int64).to_numpy()
-                result["access_pattern"]["sc_offsets"][sc] = compute_fs_access_pattern(
-                    offsets, bytes_list
-                )
+            if len(sc_df) < 2:
+                del sc_df
+                continue
+
+            total_ios = 0
+            seq_count = 0
+            rnd_count = 0
+            for fd_val in sc_df.drop_nulls("fd")["fd"].unique().to_list():
+                fd_group = sc_df.filter(pl.col("fd") == fd_val)
+                total_ios += len(fd_group)
+                if len(fd_group) < 2:
+                    continue
+                offsets = fd_group["offset"].cast(pl.Int64).to_numpy()
+                bytes_list = fd_group["bytes"].cast(pl.Int64).to_numpy()
+                pat = compute_fs_access_pattern(offsets, bytes_list)
+                seq_count += pat["sequential_count"]
+                rnd_count += pat["random_count"]
+
+            total_gaps = seq_count + rnd_count
+            if total_gaps > 0:
+                result["access_pattern"]["sc_offsets"][sc] = {
+                    "total_ios": total_ios,
+                    "sequential_count": seq_count,
+                    "random_count": rnd_count,
+                    "sequential_pct": round(100 * seq_count / total_gaps, 2),
+                    "random_pct": round(100 * rnd_count / total_gaps, 2),
+                }
             del sc_df
 
     # read/write: pre-filter to relevant syscalls, reconstruct positions
