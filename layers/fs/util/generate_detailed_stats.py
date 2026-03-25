@@ -7,9 +7,9 @@ statistics matching the summary stats JSON structure, and writes JSON.
 Uses multiple independent Polars lazy scans with projection pushdown
 to limit peak memory on large files (100M+ rows):
   Scan 1: counters, duration, event counts (streamable)
-  Scan 2: distributions (latency/size stats per syscall)
-  Scan 3: inflight time-series
-  Scan 4: access pattern (pread64/pwrite64 offsets + read/write position tracking)
+  Scan 2: distributions (Polars-native quantiles, ~4-row result)
+  Scan 3: inflight time-series (aggregated per-second counts)
+  Scan 4: access pattern (per-syscall scans + read/write position tracking)
 
 Usage:
     python ./util/generate_detailed_stats.py <results_dir>
@@ -26,7 +26,6 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from stats_generation.shared import (compute_fs_access_pattern,
                                      derive_throughput,
-                                     series_stats,
                                      tseries_stats)
 
 LAYER_PREFIX = "fs"
@@ -34,10 +33,45 @@ LAYER_PREFIX = "fs"
 # IO syscalls that have meaningful bytes/latency for histograms
 IO_SYSCALLS = {"read", "write", "pread64", "pwrite64"}
 
+SCHEMA = {"event": pl.Utf8, "syscall": pl.Utf8, "latency_ns": pl.Int64, "offset": pl.Int64}
+
 
 def _sec_to_time(s):
     h, m, ss = s // 3600, (s % 3600) // 60, s % 60
     return f"{h:02d}:{m:02d}:{ss:02d}"
+
+
+def _series_stats_exprs(col):
+    """Polars aggregation expressions for distribution stats."""
+    c = pl.col(col)
+    return [
+        c.count().alias("count"),
+        c.min().alias("min"),
+        c.max().alias("max"),
+        c.mean().alias("mean"),
+        c.quantile(0.01, interpolation="linear").alias("p1"),
+        c.quantile(0.05, interpolation="linear").alias("p5"),
+        c.quantile(0.50, interpolation="linear").alias("p50"),
+        c.quantile(0.95, interpolation="linear").alias("p95"),
+        c.quantile(0.99, interpolation="linear").alias("p99"),
+    ]
+
+
+def _row_to_stats(row):
+    """Convert a Polars agg row dict to series_stats-compatible dict."""
+    def _val(v):
+        return round(float(v), 2) if v is not None else 0.0
+    return {
+        "count": int(row["count"]) if row["count"] is not None else 0,
+        "min": _val(row["min"]),
+        "max": _val(row["max"]),
+        "mean": _val(row["mean"]),
+        "p1": _val(row["p1"]),
+        "p5": _val(row["p5"]),
+        "p50": _val(row["p50"]),
+        "p95": _val(row["p95"]),
+        "p99": _val(row["p99"]),
+    }
 
 
 def compute_rw_access_pattern(df):
@@ -118,39 +152,36 @@ def generate_stats(csv_path):
     # Check header for optional columns
     with open(csv_path) as f:
         header = f.readline().strip().split(",")
-    has_inflight = "inflight" in header
     has_offset = "offset" in header
 
     io_syscalls_list = list(IO_SYSCALLS)
 
     # --- Scan 1: Counters, duration, event counts ---
-    lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "syscall": pl.Utf8})
+    print("  Scan 1: counters...", flush=True)
+    lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
 
-    # Get per-(event, syscall) aggregates
+    # Get per-(event, syscall) aggregates — streaming to avoid 15GB+ materialization
     agg = (lf.group_by("event", "syscall")
              .agg(
                  pl.len().alias("count"),
                  pl.col("bytes").sum().alias("total_bytes"),
                  pl.col("timestamp_ns").min().alias("ts_min"),
                  pl.col("timestamp_ns").max().alias("ts_max"),
-                 # Sum of positive bytes for sc_total_bytes
-                 pl.col("bytes").filter(pl.col("bytes") > 0).sum().alias("pos_bytes"),
+                 pl.when(pl.col("bytes") > 0).then(pl.col("bytes")).otherwise(0).sum().alias("pos_bytes"),
              )
-             .collect())
+             .collect(engine="streaming"))
 
     # Duration from all events
     ts_min = agg["ts_min"].min()
     ts_max = agg["ts_max"].max()
     if ts_min is not None and ts_max is not None and ts_max > ts_min:
-        duration_ns = int(ts_max - ts_min)
-        duration_s = duration_ns / 1e9
+        duration_s = (ts_max - ts_min) / 1e9
     else:
         duration_s = 0
 
     # Build counters
     counters = {}
 
-    # sc_completed: count of exit events per IO syscall
     exit_io = agg.filter((pl.col("event") == "exit") & pl.col("syscall").is_in(io_syscalls_list))
     if len(exit_io) > 0:
         counters["sc_completed"] = dict(zip(
@@ -158,7 +189,6 @@ def generate_stats(csv_path):
             [int(v) for v in exit_io["count"].to_list()]
         ))
 
-    # sc_entered: count of enter events per IO syscall
     enter_io = agg.filter((pl.col("event") == "enter") & pl.col("syscall").is_in(io_syscalls_list))
     if len(enter_io) > 0:
         counters["sc_entered"] = dict(zip(
@@ -166,7 +196,6 @@ def generate_stats(csv_path):
             [int(v) for v in enter_io["count"].to_list()]
         ))
 
-    # sc_total_bytes: sum of positive bytes from exit IO events
     if len(exit_io) > 0:
         pos_bytes_rows = exit_io.filter(pl.col("pos_bytes") > 0)
         if len(pos_bytes_rows) > 0:
@@ -175,7 +204,6 @@ def generate_stats(csv_path):
                 [int(v) for v in pos_bytes_rows["pos_bytes"].to_list()]
             ))
 
-    # sc_count: count of non-IO syscalls (enter events)
     non_io_enters = agg.filter((pl.col("event") == "enter") & ~pl.col("syscall").is_in(io_syscalls_list))
     if len(non_io_enters) > 0:
         counters["sc_count"] = dict(zip(
@@ -184,10 +212,8 @@ def generate_stats(csv_path):
         ))
 
     # Event counts for data quality (avoids separate CSV pass)
-    event_counts = dict(zip(
-        agg.group_by("event").agg(pl.col("count").sum())["event"].to_list(),
-        agg.group_by("event").agg(pl.col("count").sum())["count"].to_list(),
-    ))
+    event_agg = agg.group_by("event").agg(pl.col("count").sum())
+    event_counts = dict(zip(event_agg["event"].to_list(), event_agg["count"].to_list()))
 
     result = {
         "counters": counters,
@@ -196,123 +222,97 @@ def generate_stats(csv_path):
         "tseries": {},
     }
 
-    # Derived throughput
     throughput = derive_throughput(counters, duration_s, "sc_completed", "sc_total_bytes")
     result["derived"].update(throughput)
 
     del agg
 
-    # --- Scan 2: Distributions ---
-    # Latencies (from exit IO events with valid latency)
-    lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "syscall": pl.Utf8})
-    lat_df = (lf.filter(pl.col("event") == "exit")
-                .filter(pl.col("syscall").is_in(io_syscalls_list))
-                .filter(pl.col("latency_ns").is_not_null() & (pl.col("latency_ns") > 0))
-                .select("syscall", "latency_ns")
-                .collect())
-    if len(lat_df) > 0:
-        result["distributions"]["sc_latencies"] = {}
-        for sc in lat_df["syscall"].unique().sort().to_list():
-            vals = lat_df.filter(pl.col("syscall") == sc)["latency_ns"].to_numpy()
-            result["distributions"]["sc_latencies"][sc] = series_stats(vals)
-    del lat_df
+    # --- Scan 2: Distributions (Polars-native quantiles, no data in Python) ---
+    print("  Scan 2: distributions...", flush=True)
+    lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+    lat_stats = (lf.filter(pl.col("event") == "exit")
+                   .filter(pl.col("syscall").is_in(io_syscalls_list))
+                   .filter(pl.col("latency_ns").is_not_null() & (pl.col("latency_ns") > 0))
+                   .group_by("syscall")
+                   .agg(_series_stats_exprs("latency_ns"))
+                   .sort("syscall")
+                   .collect(engine="streaming"))
+    if len(lat_stats) > 0:
+        result["distributions"]["sc_latencies"] = {
+            row["syscall"]: _row_to_stats(row)
+            for row in lat_stats.iter_rows(named=True)
+        }
+    del lat_stats
 
-    # Sizes (from exit IO events with positive bytes)
-    lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "syscall": pl.Utf8})
-    size_df = (lf.filter(pl.col("event") == "exit")
-                 .filter(pl.col("syscall").is_in(io_syscalls_list))
-                 .filter(pl.col("bytes") > 0)
-                 .select("syscall", "bytes")
-                 .collect())
-    if len(size_df) > 0:
-        result["distributions"]["sc_sizes"] = {}
-        for sc in size_df["syscall"].unique().sort().to_list():
-            vals = size_df.filter(pl.col("syscall") == sc)["bytes"].to_numpy()
-            result["distributions"]["sc_sizes"][sc] = series_stats(vals)
-    del size_df
+    lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+    size_stats = (lf.filter(pl.col("event") == "exit")
+                    .filter(pl.col("syscall").is_in(io_syscalls_list))
+                    .filter(pl.col("bytes") > 0)
+                    .group_by("syscall")
+                    .agg(_series_stats_exprs("bytes"))
+                    .sort("syscall")
+                    .collect(engine="streaming"))
+    if len(size_stats) > 0:
+        result["distributions"]["sc_sizes"] = {
+            row["syscall"]: _row_to_stats(row)
+            for row in size_stats.iter_rows(named=True)
+        }
+    del size_stats
 
-    # --- Scan 3: Inflight time-series (IO syscalls only) ---
+    # --- Scan 3: Inflight time-series (aggregated, no full-data collect) ---
+    print("  Scan 3: tseries...", flush=True)
     if duration_s > 0:
         window_ns = 1_000_000_000
         result["tseries"]["sc_inflight"] = {}
 
-        if has_inflight:
-            lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "syscall": pl.Utf8})
-            inf_df = (lf.filter(pl.col("syscall").is_in(io_syscalls_list))
-                        .select("syscall", "timestamp_ns", "inflight")
-                        .sort("timestamp_ns")
-                        .with_columns(
-                            ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
-                        )
-                        .group_by("syscall", "sec")
-                        .agg(pl.col("inflight").last())
-                        .sort("syscall", "sec")
-                        .collect())
+        lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+        inf_df = (lf.filter(pl.col("syscall").is_in(io_syscalls_list))
+                    .with_columns(
+                        ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
+                    )
+                    .group_by("syscall", "sec")
+                    .agg(pl.col("inflight").last())
+                    .sort("syscall", "sec")
+                    .collect(engine="streaming"))
 
-            for sc in inf_df["syscall"].unique().sort().to_list():
-                sc_df = inf_df.filter(pl.col("syscall") == sc)
-                points = [
-                    {"time": _sec_to_time(int(s)), "value": max(0, int(v))}
-                    for s, v in zip(sc_df["sec"].to_list(), sc_df["inflight"].to_list())
-                ]
-                if points:
-                    result["tseries"]["sc_inflight"][sc] = tseries_stats(points)
-            del inf_df
-        else:
-            # Fallback: compute from enter/exit event counts
-            lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "syscall": pl.Utf8})
-            ev_df = (lf.filter(pl.col("syscall").is_in(io_syscalls_list))
-                       .select("event", "syscall", "timestamp_ns")
-                       .collect())
-
-            io_enters = ev_df.filter(pl.col("event") == "enter")
-            io_exits = ev_df.filter(pl.col("event") == "exit")
-
-            for sc in io_enters["syscall"].unique().sort().to_list():
-                enter_ts = io_enters.filter(pl.col("syscall") == sc)["timestamp_ns"].to_numpy()
-                exit_ts = io_exits.filter(pl.col("syscall") == sc)["timestamp_ns"].to_numpy()
-                points = []
-                t = ts_min
-                sec = 0
-                while t <= ts_max:
-                    inflight = int((enter_ts <= t).sum() - (exit_ts <= t).sum())
-                    points.append({"time": _sec_to_time(sec), "value": max(0, inflight)})
-                    t += window_ns
-                    sec += 1
-                if points:
-                    result["tseries"]["sc_inflight"][sc] = tseries_stats(points)
-            del ev_df
+        for sc in inf_df["syscall"].unique().sort().to_list():
+            sc_df = inf_df.filter(pl.col("syscall") == sc)
+            points = [
+                {"time": _sec_to_time(int(s)), "value": max(0, int(v))}
+                for s, v in zip(sc_df["sec"].to_list(), sc_df["inflight"].to_list())
+                if v is not None
+            ]
+            if points:
+                result["tseries"]["sc_inflight"][sc] = tseries_stats(points)
+        del inf_df
 
     # --- Scan 4: Access pattern ---
+    print("  Scan 4: access pattern...", flush=True)
     result["access_pattern"] = {"sc_offsets": {}}
 
-    # pread64/pwrite64: use explicit offsets from enter events
+    # pread64/pwrite64: per-syscall scan with explicit offsets
     if has_offset:
-        lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "syscall": pl.Utf8})
-        offset_df = (lf.filter(pl.col("event") == "enter")
-                       .filter(pl.col("syscall").is_in(["pread64", "pwrite64"]))
-                       .filter(pl.col("offset").is_not_null())
-                       .select("syscall", "timestamp_ns", "offset", "bytes")
+        for sc in ["pread64", "pwrite64"]:
+            lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+            sc_df = (lf.filter((pl.col("event") == "enter") & (pl.col("syscall") == sc)
+                               & pl.col("offset").is_not_null())
+                       .select("timestamp_ns", "offset", "bytes")
                        .sort("timestamp_ns")
-                       .collect())
-
-        if len(offset_df) >= 2:
-            for sc in offset_df["syscall"].unique().sort().to_list():
-                sc_df = offset_df.filter(pl.col("syscall") == sc)
+                       .collect(engine="streaming"))
+            if len(sc_df) >= 2:
                 offsets = sc_df["offset"].cast(pl.Int64).to_numpy()
                 bytes_list = sc_df["bytes"].cast(pl.Int64).to_numpy()
-                if len(offsets) >= 2:
-                    result["access_pattern"]["sc_offsets"][sc] = compute_fs_access_pattern(
-                        offsets, bytes_list
-                    )
-        del offset_df
+                result["access_pattern"]["sc_offsets"][sc] = compute_fs_access_pattern(
+                    offsets, bytes_list
+                )
+            del sc_df
 
     # read/write: pre-filter to relevant syscalls, reconstruct positions
     rw_relevant = ["read", "write", "openat", "lseek", "close"]
-    lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "syscall": pl.Utf8})
+    lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
     rw_df = (lf.filter(pl.col("syscall").is_in(rw_relevant))
                .select("event", "syscall", "timestamp_ns", "tid", "fd", "bytes")
-               .collect())
+               .collect(engine="streaming"))
 
     rw_pattern = compute_rw_access_pattern(rw_df)
     del rw_df

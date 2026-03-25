@@ -7,8 +7,8 @@ statistics matching the summary stats JSON structure, and writes JSON.
 Uses multiple independent Polars lazy scans with projection pushdown
 to limit peak memory on large files (100M+ rows):
   Scan 1: counters, duration, event counts (streamable)
-  Scan 2: distributions (latency/size stats per op)
-  Scan 3: inflight time-series
+  Scan 2: distributions (Polars-native quantiles, ~2-row result)
+  Scan 3: inflight time-series (aggregated per-second)
   Scan 4: access pattern (sector gap analysis)
 
 Usage:
@@ -25,15 +25,49 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from stats_generation.shared import (compute_access_pattern,
                                      derive_throughput,
-                                     series_stats,
                                      tseries_stats)
 
 LAYER_PREFIX = "nvme"
+
+SCHEMA = {"event": pl.Utf8, "op": pl.Utf8, "latency_ns": pl.Int64}
 
 
 def _sec_to_time(s):
     h, m, ss = s // 3600, (s % 3600) // 60, s % 60
     return f"{h:02d}:{m:02d}:{ss:02d}"
+
+
+def _series_stats_exprs(col):
+    """Polars aggregation expressions for distribution stats."""
+    c = pl.col(col)
+    return [
+        c.count().alias("count"),
+        c.min().alias("min"),
+        c.max().alias("max"),
+        c.mean().alias("mean"),
+        c.quantile(0.01, interpolation="linear").alias("p1"),
+        c.quantile(0.05, interpolation="linear").alias("p5"),
+        c.quantile(0.50, interpolation="linear").alias("p50"),
+        c.quantile(0.95, interpolation="linear").alias("p95"),
+        c.quantile(0.99, interpolation="linear").alias("p99"),
+    ]
+
+
+def _row_to_stats(row):
+    """Convert a Polars agg row dict to series_stats-compatible dict."""
+    def _val(v):
+        return round(float(v), 2) if v is not None else 0.0
+    return {
+        "count": int(row["count"]) if row["count"] is not None else 0,
+        "min": _val(row["min"]),
+        "max": _val(row["max"]),
+        "mean": _val(row["mean"]),
+        "p1": _val(row["p1"]),
+        "p5": _val(row["p5"]),
+        "p50": _val(row["p50"]),
+        "p95": _val(row["p95"]),
+        "p99": _val(row["p99"]),
+    }
 
 
 def generate_stats(csv_path):
@@ -42,11 +76,10 @@ def generate_stats(csv_path):
     # Check header for optional columns
     with open(csv_path) as f:
         header = f.readline().strip().split(",")
-    has_inflight = "inflight" in header
     has_sector = "sector" in header
 
     # --- Scan 1: Counters, duration, event counts ---
-    lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "op": pl.Utf8})
+    lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
 
     agg = (lf.filter(pl.col("event").is_in(["setup", "complete"]))
              .group_by("event", "op")
@@ -56,14 +89,13 @@ def generate_stats(csv_path):
                  pl.col("timestamp_ns").min().alias("ts_min"),
                  pl.col("timestamp_ns").max().alias("ts_max"),
              )
-             .collect())
+             .collect(engine="streaming"))
 
     # Duration from all events
     ts_min = agg["ts_min"].min()
     ts_max = agg["ts_max"].max()
     if ts_min is not None and ts_max is not None and ts_max > ts_min:
-        duration_ns = int(ts_max - ts_min)
-        duration_s = duration_ns / 1e9
+        duration_s = (ts_max - ts_min) / 1e9
     else:
         duration_s = 0
 
@@ -89,10 +121,8 @@ def generate_stats(csv_path):
         ))
 
     # Event counts for data quality (avoids separate CSV pass)
-    event_counts = dict(zip(
-        agg.group_by("event").agg(pl.col("count").sum())["event"].to_list(),
-        agg.group_by("event").agg(pl.col("count").sum())["count"].to_list(),
-    ))
+    event_agg = agg.group_by("event").agg(pl.col("count").sum())
+    event_counts = dict(zip(event_agg["event"].to_list(), event_agg["count"].to_list()))
 
     result = {
         "counters": counters,
@@ -101,97 +131,73 @@ def generate_stats(csv_path):
         "tseries": {},
     }
 
-    # Derived throughput
     throughput = derive_throughput(counters, duration_s, "cmd_completed", "cmd_total_bytes")
     result["derived"].update(throughput)
 
     del agg
 
-    # --- Scan 2: Distributions ---
-    lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "op": pl.Utf8})
+    # --- Scan 2: Distributions (Polars-native quantiles, no data in Python) ---
+    lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+    lat_stats = (lf.filter(pl.col("event") == "complete")
+                   .filter(pl.col("latency_ns").is_not_null())
+                   .group_by("op")
+                   .agg(_series_stats_exprs("latency_ns"))
+                   .sort("op")
+                   .collect(engine="streaming"))
+    if len(lat_stats) > 0:
+        result["distributions"]["cmd_latencies"] = {
+            row["op"]: _row_to_stats(row)
+            for row in lat_stats.iter_rows(named=True)
+        }
+    del lat_stats
 
-    complete_lf = lf.filter(pl.col("event") == "complete")
+    lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+    size_stats = (lf.filter(pl.col("event") == "complete")
+                    .group_by("op")
+                    .agg(_series_stats_exprs("bytes"))
+                    .sort("op")
+                    .collect(engine="streaming"))
+    if len(size_stats) > 0:
+        result["distributions"]["cmd_sizes"] = {
+            row["op"]: _row_to_stats(row)
+            for row in size_stats.iter_rows(named=True)
+        }
+    del size_stats
 
-    # Latencies
-    lat_df = (complete_lf
-              .filter(pl.col("latency_ns").is_not_null())
-              .select("op", "latency_ns")
-              .collect())
-    if len(lat_df) > 0:
-        result["distributions"]["cmd_latencies"] = {}
-        for op in lat_df["op"].unique().sort().to_list():
-            vals = lat_df.filter(pl.col("op") == op)["latency_ns"].to_numpy()
-            result["distributions"]["cmd_latencies"][op] = series_stats(vals)
-
-    # Sizes
-    size_df = complete_lf.select("op", "bytes").collect()
-    if len(size_df) > 0:
-        result["distributions"]["cmd_sizes"] = {}
-        for op in size_df["op"].unique().sort().to_list():
-            vals = size_df.filter(pl.col("op") == op)["bytes"].to_numpy()
-            result["distributions"]["cmd_sizes"][op] = series_stats(vals)
-
-    del lat_df, size_df
-
-    # --- Scan 3: Inflight time-series ---
+    # --- Scan 3: Inflight time-series (aggregated per-second) ---
     if duration_s > 0:
         window_ns = 1_000_000_000
         result["tseries"]["cmd_inflight"] = {}
 
-        if has_inflight:
-            lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "op": pl.Utf8})
-            inf_df = (lf.filter(pl.col("event").is_in(["setup", "complete"]))
-                        .select("op", "timestamp_ns", "inflight")
-                        .sort("timestamp_ns")
-                        .with_columns(
-                            ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
-                        )
-                        .group_by("op", "sec")
-                        .agg(pl.col("inflight").last())
-                        .sort("op", "sec")
-                        .collect())
+        lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+        inf_df = (lf.filter(pl.col("event").is_in(["setup", "complete"]))
+                    .with_columns(
+                        ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
+                    )
+                    .group_by("op", "sec")
+                    .agg(pl.col("inflight").last())
+                    .sort("op", "sec")
+                    .collect(engine="streaming"))
 
-            for op in inf_df["op"].unique().sort().to_list():
-                op_df = inf_df.filter(pl.col("op") == op)
-                points = [
-                    {"time": _sec_to_time(int(s)), "value": max(0, int(v))}
-                    for s, v in zip(op_df["sec"].to_list(), op_df["inflight"].to_list())
-                ]
-                if points:
-                    result["tseries"]["cmd_inflight"][op] = tseries_stats(points)
-            del inf_df
-        else:
-            # Fallback: compute from enter/exit event counts
-            lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "op": pl.Utf8})
-            ev_df = (lf.filter(pl.col("event").is_in(["setup", "complete"]))
-                       .select("event", "op", "timestamp_ns")
-                       .collect())
-
-            for op in ev_df["op"].unique().sort().to_list():
-                enter_ts = ev_df.filter((pl.col("op") == op) & (pl.col("event") == "setup"))["timestamp_ns"].to_numpy()
-                exit_ts = ev_df.filter((pl.col("op") == op) & (pl.col("event") == "complete"))["timestamp_ns"].to_numpy()
-                if len(enter_ts) == 0:
-                    continue
-                points = []
-                t = ts_min
-                sec = 0
-                while t <= ts_max:
-                    inflight = int((enter_ts <= t).sum() - (exit_ts <= t).sum())
-                    points.append({"time": _sec_to_time(sec), "value": max(0, inflight)})
-                    t += window_ns
-                    sec += 1
-                if points:
-                    result["tseries"]["cmd_inflight"][op] = tseries_stats(points)
-            del ev_df
+        for op in inf_df["op"].unique().sort().to_list():
+            op_df = inf_df.filter(pl.col("op") == op)
+            points = [
+                {"time": _sec_to_time(int(s)), "value": max(0, int(v))}
+                for s, v in zip(op_df["sec"].to_list(), op_df["inflight"].to_list())
+                if v is not None
+            ]
+            if points:
+                result["tseries"]["cmd_inflight"][op] = tseries_stats(points)
+        del inf_df
 
     # --- Scan 4: Access pattern ---
     if has_sector:
-        lf = pl.scan_csv(csv_path, schema_overrides={"event": pl.Utf8, "op": pl.Utf8})
+        lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
         setup_df = (lf.filter(pl.col("event") == "setup")
                       .filter(pl.col("sector").is_not_null())
                       .select("op", "timestamp_ns", "sector", "bytes")
                       .sort("timestamp_ns")
-                      .collect())
+                      .collect(engine="streaming"))
 
         if len(setup_df) > 0:
             result["access_pattern"] = {"cmd_sectors": {}}
