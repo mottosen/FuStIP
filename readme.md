@@ -67,6 +67,10 @@ differentiating between syscalls and requests inside the kernel.
 These workloads are inspired by mimicking Vector DB workloads, as this tool has
 been build concurrently with such exploration, but should be expanded in the future.
 
+The test suite can be run for three different phases: `validation`, `vdb`, and
+`stress` - see examples below. These phases aim to test the tool under different
+loads to ensure stability, correctness, and ability to hangle large data files.
+
 
 ## Using the tool
 For detailed insights into using the tool, please refer to the help pages of
@@ -121,14 +125,14 @@ stopping FuStIP inside the DevBox.
 
 
 ### Run full test suite
-**Test summary mode**:
+**Test validation phase with summary mode**:
 
-    ./run.sh test -d nvme0n1
+    ./run.sh test validate -d nvme0n1
 
-**Test detailed mode with nvme dev nvme0n1**:
+**Test all phases with detailed mode and nvme dev nvme0n1**:
 
-    ./run.sh test -m detailed -d nvme0n1
+    ./run.sh test all  -m detailed -d nvme0n1
 
-**Test detailed mode against fio container**:
+**Test stress phase with detailed mode against fio container**:
 
-    ./run.sh test -m detailed -c fio-container
+    ./run.sh test stress -m detailed -c fio-container
