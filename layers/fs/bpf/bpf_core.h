@@ -35,6 +35,15 @@ struct {
 	__uint(max_entries, 1 << 28); // 256 MB
 } events SEC(".maps");
 
+// Per-event-type counters: [type*2] = generated, [type*2+1] = dropped
+// FS: enter=0,1  exit=2,3
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 4);
+	__type(key, __u32);
+	__type(value, __u64);
+} event_counters SEC(".maps");
+
 // Per-(syscall, comm) inflight counter (atomically incremented/decremented)
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -74,6 +83,10 @@ static __always_inline int handle_sc_enter(__u8 sc_idx, __s32 fd,
 		cur_inflight = (__s32)(__sync_fetch_and_add(cnt, 1) + 1);
 
 	// Emit enter event
+	__u32 gen_key = 0;
+	__u64 *gen_cnt = bpf_map_lookup_elem(&event_counters, &gen_key);
+	if (gen_cnt) (*gen_cnt)++;
+
 	struct fs_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (e) {
 		e->timestamp_ns = ts;
@@ -87,6 +100,10 @@ static __always_inline int handle_sc_enter(__u8 sc_idx, __s32 fd,
 		__builtin_memcpy(e->comm, data.comm, 16);
 		e->inflight = cur_inflight;
 		bpf_ringbuf_submit(e, 0);
+	} else {
+		__u32 drop_key = 1;
+		__u64 *drop_cnt = bpf_map_lookup_elem(&event_counters, &drop_key);
+		if (drop_cnt) (*drop_cnt)++;
 	}
 
 	return 0;
@@ -113,6 +130,10 @@ static __always_inline int handle_sc_exit(__s64 ret)
 		cur_inflight = (__s32)(__sync_fetch_and_add(cnt, -1) - 1);
 
 	// Emit exit event
+	__u32 gen_key2 = 2;  // EXIT_GEN
+	__u64 *gen_cnt2 = bpf_map_lookup_elem(&event_counters, &gen_key2);
+	if (gen_cnt2) (*gen_cnt2)++;
+
 	struct fs_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (e) {
 		e->timestamp_ns = now;
@@ -126,6 +147,10 @@ static __always_inline int handle_sc_exit(__s64 ret)
 		__builtin_memcpy(e->comm, data->comm, 16);
 		e->inflight = cur_inflight;
 		bpf_ringbuf_submit(e, 0);
+	} else {
+		__u32 drop_key2 = 3;  // EXIT_DROP
+		__u64 *drop_cnt2 = bpf_map_lookup_elem(&event_counters, &drop_key2);
+		if (drop_cnt2) (*drop_cnt2)++;
 	}
 
 	bpf_map_delete_elem(&sc_start, &tid);

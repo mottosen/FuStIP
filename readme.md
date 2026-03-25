@@ -45,8 +45,9 @@ for using the tool. Please, refer to [DevBox Docs](https://www.jetify.com/docs/d
 for details on how to install and use, but follow this for a brief guide:
 
 1. Install with `curl -fsSL https://get.jetify.com/devbox | bash`
-2. Run command `devbox run update_pip` the first time you are setting up the tool
-3. Use `devbox shell` anywhere within this repo to enter the DevBox shell,
+2. Create a `.env` file next to the provided `devbox.json` file, which can simply be empty, for overwriting/setting env vars.
+3. Run command `devbox run update_pip` the first time you are setting up the tool
+4. Use `devbox shell` anywhere within this repo to enter the DevBox shell,
     which will include all packages required to use the tool
 
 You can also try and use the tool without DevBox, in which case the packages

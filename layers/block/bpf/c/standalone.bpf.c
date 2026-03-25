@@ -9,6 +9,7 @@
 const volatile char comm_filters[MAX_COMM_FILTERS][16] = {};
 const volatile __u8 num_comm_filters = 0;
 const volatile bool filter_by_mntns = false;
+const volatile bool filter_or_mode = false;
 
 #include "../bpf_core.h"
 
@@ -62,10 +63,17 @@ static __always_inline bool comm_matches(void)
 	return false;
 }
 
+static __always_inline bool should_trace(void)
+{
+	if (filter_or_mode)
+		return comm_matches() || mntns_matches();
+	return comm_matches() && mntns_matches();
+}
+
 SEC("raw_tracepoint/block_rq_insert")
 int BPF_PROG(block_rq_insert, struct request *rq)
 {
-	if (!comm_matches() || !mntns_matches())
+	if (!should_trace())
 		return 0;
 	return handle_block_rq_insert(rq);
 }
@@ -73,7 +81,7 @@ int BPF_PROG(block_rq_insert, struct request *rq)
 SEC("raw_tracepoint/block_rq_issue")
 int BPF_PROG(block_rq_issue, struct request *rq)
 {
-	if (!comm_matches() || !mntns_matches())
+	if (!should_trace())
 		return 0;
 	return handle_block_rq_issue(rq);
 }

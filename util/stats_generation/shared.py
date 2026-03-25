@@ -15,6 +15,8 @@ for histograms and time-series data.
 import math
 import re
 
+import numpy as np
+
 
 # ── Suffix parsing ──
 
@@ -354,6 +356,15 @@ def derive_throughput(counters, duration_s, count_map, bytes_map):
     return {"iops": iops, "throughput_mb_s": throughput}
 
 
+def histogram_stats_only(buckets):
+    """Compute stats from histogram buckets without preserving bucket data.
+
+    Input: [{"lo": int, "hi": int, "count": int}, ...]
+    Output: {"count", "min", "max", "mean", "p1", "p5", "p50", "p95", "p99"}
+    """
+    return histogram_stats({"points": [], "ranges": buckets})
+
+
 def raw_values_to_hist(values):
     """Bin raw numeric values into exact 2^i points and inter-power ranges.
 
@@ -415,29 +426,27 @@ def raw_values_to_hist_buckets(values):
 
 
 def series_stats(values):
-    """Compute stats from a plain list of numeric values.
+    """Compute stats from a list or numpy array of numeric values.
 
-    Input: list of numbers
+    Input: list/array of numbers
     Output: {"count", "min", "max", "mean", "p1", "p5", "p50", "p95", "p99"}
     """
-    if not values:
+    arr = np.asarray(values, dtype=np.float64)
+    if len(arr) == 0:
         return {"count": 0, "min": 0, "max": 0, "mean": 0,
                 "p1": 0, "p5": 0, "p50": 0, "p95": 0, "p99": 0}
 
-    sorted_vals = sorted(values)
-    n = len(values)
-    total = sum(values)
-
+    pcts = np.percentile(arr, [1, 5, 50, 95, 99])
     return {
-        "count": n,
-        "min": round(min(values), 2),
-        "max": round(max(values), 2),
-        "mean": round(total / n, 2),
-        "p1": round(percentile(sorted_vals, 1), 2),
-        "p5": round(percentile(sorted_vals, 5), 2),
-        "p50": round(percentile(sorted_vals, 50), 2),
-        "p95": round(percentile(sorted_vals, 95), 2),
-        "p99": round(percentile(sorted_vals, 99), 2),
+        "count": len(arr),
+        "min": round(float(arr.min()), 2),
+        "max": round(float(arr.max()), 2),
+        "mean": round(float(arr.mean()), 2),
+        "p1": round(float(pcts[0]), 2),
+        "p5": round(float(pcts[1]), 2),
+        "p50": round(float(pcts[2]), 2),
+        "p95": round(float(pcts[3]), 2),
+        "p99": round(float(pcts[4]), 2),
     }
 
 
@@ -517,26 +526,23 @@ def compute_access_pattern(sectors, bytes_list):
       gap = abs(sector[i+1] - (sector[i] + bytes[i] // 512))
       gap == 0 → sequential, gap > 0 → random
 
+    Accepts lists or numpy arrays.
+
     Returns: {"total_ios", "sequential_count", "random_count",
-              "sequential_pct", "random_pct",
-              "gap_histogram": {"points": [...], "ranges": [...], "stats": {...}}}
+              "sequential_pct", "random_pct"}
     """
-    n = len(sectors)
+    s = np.asarray(sectors, dtype=np.int64)
+    b = np.asarray(bytes_list, dtype=np.int64)
+    n = len(s)
     if n < 2:
-        empty = {"points": [], "ranges": []}
         return {"total_ios": n, "sequential_count": 0, "random_count": 0,
-                "sequential_pct": 0, "random_pct": 0,
-                "gap_histogram": {**empty, "stats": histogram_stats(empty)}}
+                "sequential_pct": 0, "random_pct": 0}
 
-    gaps = []
-    for i in range(n - 1):
-        expected_next = sectors[i] + bytes_list[i] // 512
-        gap = abs(sectors[i + 1] - expected_next)
-        gaps.append(gap)
-
-    seq_count = sum(1 for g in gaps if g == 0)
-    rnd_count = len(gaps) - seq_count
+    expected_next = s[:-1] + b[:-1] // 512
+    gaps = np.abs(s[1:] - expected_next)
+    seq_count = int((gaps == 0).sum())
     total_gaps = len(gaps)
+    rnd_count = total_gaps - seq_count
 
     return {
         "total_ios": n,
@@ -544,7 +550,6 @@ def compute_access_pattern(sectors, bytes_list):
         "random_count": rnd_count,
         "sequential_pct": round(100 * seq_count / total_gaps, 2),
         "random_pct": round(100 * rnd_count / total_gaps, 2),
-        "gap_histogram": histogram_with_data(raw_values_to_hist(gaps)),
     }
 
 
@@ -556,24 +561,22 @@ def compute_fs_access_pattern(offsets, bytes_list):
 
     gap = abs(offset[i+1] - (offset[i] + bytes[i]))
 
+    Accepts lists or numpy arrays.
+
     Returns: same structure as compute_access_pattern.
     """
-    n = len(offsets)
+    o = np.asarray(offsets, dtype=np.int64)
+    b = np.asarray(bytes_list, dtype=np.int64)
+    n = len(o)
     if n < 2:
-        empty = {"points": [], "ranges": []}
         return {"total_ios": n, "sequential_count": 0, "random_count": 0,
-                "sequential_pct": 0, "random_pct": 0,
-                "gap_histogram": {**empty, "stats": histogram_stats(empty)}}
+                "sequential_pct": 0, "random_pct": 0}
 
-    gaps = []
-    for i in range(n - 1):
-        expected_next = offsets[i] + bytes_list[i]
-        gap = abs(offsets[i + 1] - expected_next)
-        gaps.append(gap)
-
-    seq_count = sum(1 for g in gaps if g == 0)
-    rnd_count = len(gaps) - seq_count
+    expected_next = o[:-1] + b[:-1]
+    gaps = np.abs(o[1:] - expected_next)
+    seq_count = int((gaps == 0).sum())
     total_gaps = len(gaps)
+    rnd_count = total_gaps - seq_count
 
     return {
         "total_ios": n,
@@ -581,5 +584,4 @@ def compute_fs_access_pattern(offsets, bytes_list):
         "random_count": rnd_count,
         "sequential_pct": round(100 * seq_count / total_gaps, 2),
         "random_pct": round(100 * rnd_count / total_gaps, 2),
-        "gap_histogram": histogram_with_data(raw_values_to_hist(gaps)),
     }

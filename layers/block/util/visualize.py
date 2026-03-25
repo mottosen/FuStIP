@@ -4,23 +4,24 @@
 import sys
 from pathlib import Path
 
-import pandas as pd
+import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from visualization.shared import (build_dashboard, plot_cumulated_mb_over_time,
-                                   plot_inflight_from_column,
+                                   plot_gap_cdf, plot_inflight_from_column,
                                    plot_inflight_over_time, plot_io_latency_cdf,
                                    plot_io_size_cdf, plot_type_distribution)
 
 LAYER = "block"
-USECOLS = ["timestamp_ns", "event", "op", "bytes", "latency_ns"]
+USECOLS = ["timestamp_ns", "event", "op", "bytes", "latency_ns", "sector"]
 
 
 def _build_row(label, df):
     """Build a dashboard row dict from a dataframe."""
-    complete = df[df["event"] == "complete"]
-    types = sorted(complete["op"].dropna().unique())
-    counts = complete.groupby("op").size().to_dict()
+    complete = df.filter(pl.col("event") == "complete")
+    issue = df.filter(pl.col("event") == "issue")
+    types = sorted(complete.drop_nulls("op")["op"].unique().sort().to_list())
+    counts = dict(zip(*complete.group_by("op").len().select("op", "len").get_columns()))
     has_inflight = "q_inflight" in df.columns and "d_inflight" in df.columns
 
     if has_inflight:
@@ -39,6 +40,7 @@ def _build_row(label, df):
             lambda ax, d=df, t=types: plot_cumulated_mb_over_time(ax, d, "complete", "op", "timestamp_ns", "bytes", t),
             lambda ax, c=complete, t=types: plot_io_size_cdf(ax, c, "op", "bytes", t),
             lambda ax, c=complete, t=types: plot_io_latency_cdf(ax, c, "op", "latency_ns", t),
+            lambda ax, s=issue, t=types: plot_gap_cdf(ax, s, "op", "sector", "bytes", t),
         ],
     }
 
@@ -52,16 +54,18 @@ def main():
 
     print(f"Reading {csv_path.name}...")
     # Check which optional columns exist
-    header = pd.read_csv(csv_path, nrows=0).columns.tolist()
+    with open(csv_path) as f:
+        header = f.readline().strip().split(",")
     has_comm = "comm" in header
     has_inflight = "q_inflight" in header and "d_inflight" in header
     usecols = USECOLS + (["comm"] if has_comm else []) + (["q_inflight", "d_inflight"] if has_inflight else [])
-    df = pd.read_csv(csv_path, usecols=usecols)
+
+    df = pl.read_csv(csv_path, columns=usecols)
 
     rows = []
     if has_comm:
-        for comm_val in sorted(df["comm"].dropna().unique()):
-            comm_df = df[df["comm"] == comm_val]
+        for comm_val in sorted(df.drop_nulls("comm")["comm"].unique().sort().to_list()):
+            comm_df = df.filter(pl.col("comm") == comm_val)
             rows.append(_build_row(comm_val, comm_df))
     else:
         rows.append(_build_row("block", df))
@@ -69,7 +73,7 @@ def main():
     output = results_dir / "visualizations" / "block-dashboard.png"
     build_dashboard(
         rows=rows,
-        col_titles=["Type Distribution", "Queue Inflight", "Driver Inflight", "Cumul. MB", "IO Size CDF", "Latency CDF"],
+        col_titles=["Type Distribution", "Queue Inflight", "Driver Inflight", "Cumul. MB", "IO Size CDF", "Latency CDF", "Gap CDF"],
         title="Block Layer Dashboard",
         output_path=output,
     )

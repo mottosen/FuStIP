@@ -43,6 +43,45 @@ static void sig_handler(int sig)
 	running = 0;
 }
 
+static void write_counters(struct standalone_bpf *skel, const char *csv_path)
+{
+	int fd = bpf_map__fd(skel->maps.event_counters);
+	int ncpus = libbpf_num_possible_cpus();
+	if (ncpus <= 0)
+		return;
+
+	/* Per-event-type counters: enter=0,1  exit=2,3 */
+	__u64 values[ncpus];
+	__u64 totals[4] = {};
+
+	for (__u32 key = 0; key < 4; key++) {
+		memset(values, 0, sizeof(values));
+		if (bpf_map_lookup_elem(fd, &key, values) == 0) {
+			for (int i = 0; i < ncpus; i++)
+				totals[key] += values[i];
+		}
+	}
+
+	char path[512];
+	strncpy(path, csv_path, sizeof(path) - 1);
+	path[sizeof(path) - 1] = '\0';
+	char *slash = strrchr(path, '/');
+	if (slash)
+		strcpy(slash + 1, "counters.json");
+	else
+		strcpy(path, "counters.json");
+
+	FILE *f = fopen(path, "w");
+	if (!f)
+		return;
+	fprintf(f, "{\"enter\": {\"generated\": %llu, \"dropped\": %llu}, "
+		   "\"exit\": {\"generated\": %llu, \"dropped\": %llu}}\n",
+		totals[0], totals[1], totals[2], totals[3]);
+	fclose(f);
+	fprintf(stderr, "Counters: enter(gen=%llu drop=%llu) exit(gen=%llu drop=%llu) -> %s\n",
+		totals[0], totals[1], totals[2], totals[3], path);
+}
+
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
 	const struct fs_event *e = data;
@@ -87,7 +126,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 static void usage(const char *prog)
 {
 	fprintf(stderr, "Usage: %s -o <output_csv> [-f <comm_filter[,comm2,...]>] [-c <container_name>]\n", prog);
-	fprintf(stderr, "  -f and -c are mutually exclusive; one is required\n");
+	fprintf(stderr, "  -f (comm) or -c (container) required; both enables OR mode\n");
 	exit(1);
 }
 
@@ -188,8 +227,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (!output_path || (!filter && !container_name) ||
-	    (filter && container_name))
+	if (!output_path || (!filter && !container_name))
 		usage(argv[0]);
 
 	signal(SIGINT, sig_handler);
@@ -206,6 +244,8 @@ int main(int argc, char **argv)
 		parse_comm_filters(skel, filter);
 	if (container_name)
 		skel->rodata->filter_by_mntns = true;
+	if (filter && container_name)
+		skel->rodata->filter_or_mode = true;
 
 	int err = standalone_bpf__load(skel);
 	if (err) {
@@ -238,7 +278,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (filter)
+	if (filter && container_name)
+		fprintf(stderr, "FS layer detailed tracing started (comm: %s, container: %s, OR mode)...\n",
+			filter, container_name);
+	else if (filter)
 		fprintf(stderr, "FS layer detailed tracing started (filter: %s)...\n",
 			filter);
 	else
@@ -270,6 +313,7 @@ int main(int argc, char **argv)
 	fprintf(stderr, "Stopping...\n");
 
 	ring_buffer__free(rb);
+	write_counters(skel, output_path);
 	fclose(output);
 	standalone_bpf__destroy(skel);
 

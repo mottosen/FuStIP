@@ -8,6 +8,7 @@ BEGIN
     print("bpftrace - NVMe Layer\n");
 
     @dev_filter = $1;
+    @comm_filter = $2;
 
     @nvme_op[(uint64)0] = "read";
     @nvme_op[(uint64)1] = "write";
@@ -17,7 +18,8 @@ BEGIN
 }
 
 fentry:nvme_core:nvme_setup_cmd
-/ strcontains(@dev_filter, args.req->q->disk->disk_name) /
+/ ((@dev_filter == "_" || strcontains(@dev_filter, args.req->q->disk->disk_name)) &&
+   (@comm_filter == "_" || strcontains(@comm_filter, comm))) /
 {
     $rq = (uint64)args.req;
     $op = (uint64)(args.req->cmd_flags & 0xFF);
@@ -43,11 +45,12 @@ rawtracepoint:nvme_setup_cmd
 rawtracepoint:nvme_complete_rq
 {
     $rq = (uint64)arg0;
+    $cmd_op = @cmd_ops[$rq];
+
     $t_ref = @cmd_time[$rq];
     if ($t_ref)
     {
         $now = nsecs;
-        $cmd_op = @cmd_ops[$rq];
         $cmd_size = @cmd_size[$rq];
 
         @cmd_completed[@nvme_op[$cmd_op]] = count();
@@ -63,7 +66,7 @@ rawtracepoint:nvme_complete_rq
     }
     else
     {
-        @cmd_untracked[((struct request *)arg0)->q->disk->disk_name] = count();
+        @cmd_untracked[((struct request *)arg0)->q->disk->disk_name, @nvme_op[$cmd_op]] = count();
     }
 }
 
@@ -110,4 +113,5 @@ END
 
 
     delete(@dev_filter);
+    delete(@comm_filter);
 }

@@ -46,6 +46,15 @@ struct {
 	__uint(max_entries, 1 << 28); // 256 MB
 } events SEC(".maps");
 
+// Per-event-type counters: [type*2] = generated, [type*2+1] = dropped
+// Block: insert=0,1  issue=2,3  complete=4,5
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 6);
+	__type(key, __u32);
+	__type(value, __u64);
+} event_counters SEC(".maps");
+
 // Per-(op, comm) queue inflight counter (insert -> issue)
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -101,6 +110,10 @@ static __always_inline int handle_block_rq_insert(struct request *rq)
 		di = (__s32)*dcnt;
 
 	// Emit insert event
+	__u32 gen_key = 0;
+	__u64 *gen_cnt = bpf_map_lookup_elem(&event_counters, &gen_key);
+	if (gen_cnt) (*gen_cnt)++;
+
 	struct block_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (e) {
 		e->timestamp_ns = ts;
@@ -114,6 +127,10 @@ static __always_inline int handle_block_rq_insert(struct request *rq)
 		e->q_inflight = qi;
 		e->d_inflight = di;
 		bpf_ringbuf_submit(e, 0);
+	} else {
+		__u32 drop_key = 1;
+		__u64 *drop_cnt = bpf_map_lookup_elem(&event_counters, &drop_key);
+		if (drop_cnt) (*drop_cnt)++;
 	}
 
 	return 0;
@@ -175,6 +192,10 @@ static __always_inline int handle_block_rq_issue(struct request *rq)
 		di = (__s32)(__sync_fetch_and_add(dcnt, 1) + 1);
 
 	// Emit issue event
+	__u32 gen_key2 = 2;  // ISSUE_GEN
+	__u64 *gen_cnt2 = bpf_map_lookup_elem(&event_counters, &gen_key2);
+	if (gen_cnt2) (*gen_cnt2)++;
+
 	struct block_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (e) {
 		e->timestamp_ns = now;
@@ -188,6 +209,10 @@ static __always_inline int handle_block_rq_issue(struct request *rq)
 		e->q_inflight = qi;
 		e->d_inflight = di;
 		bpf_ringbuf_submit(e, 0);
+	} else {
+		__u32 drop_key2 = 3;  // ISSUE_DROP
+		__u64 *drop_cnt2 = bpf_map_lookup_elem(&event_counters, &drop_key2);
+		if (drop_cnt2) (*drop_cnt2)++;
 	}
 
 	return 0;
@@ -226,6 +251,10 @@ static __always_inline int handle_block_rq_complete(struct request *rq)
 		di = (__s32)(__sync_fetch_and_add(dcnt, -1) - 1);
 
 	// Emit complete event
+	__u32 gen_key3 = 4;  // COMPLETE_GEN
+	__u64 *gen_cnt3 = bpf_map_lookup_elem(&event_counters, &gen_key3);
+	if (gen_cnt3) (*gen_cnt3)++;
+
 	struct block_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (e) {
 		e->timestamp_ns = now;
@@ -239,6 +268,10 @@ static __always_inline int handle_block_rq_complete(struct request *rq)
 		e->q_inflight = qi;
 		e->d_inflight = di;
 		bpf_ringbuf_submit(e, 0);
+	} else {
+		__u32 drop_key3 = 5;  // COMPLETE_DROP
+		__u64 *drop_cnt3 = bpf_map_lookup_elem(&event_counters, &drop_key3);
+		if (drop_cnt3) (*drop_cnt3)++;
 	}
 
 	// Cleanup maps

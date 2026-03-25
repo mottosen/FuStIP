@@ -1,14 +1,11 @@
 ifdef DEBUG
     Q =
     REDIRECT =
-    MAKE_FLAGS =
 else
     Q = @
     REDIRECT = 1>/dev/null 2>&1
-    MAKE_FLAGS = --no-print-directory
+    MAKE_FLAGS += --no-print-directory
 endif
-
-MAKE := $(MAKE) $(MAKE_FLAGS)
 
 # If CONTAINER_FILTER is set, force detailed mode
 ifdef CONTAINER_FILTER
@@ -32,6 +29,7 @@ FIO_COMPOSE ?= $(ROOT_DIR)/util/container/fio-test/fio-test.yml
 
 VAL_JOBS = val_seqread val_seqwrite val_randread val_randwrite val_randrw val_high_qd
 WORK_JOBS = work_index_search work_bulk_insert work_compaction work_query_insert work_scan work_high_qd
+STRESS_JOBS = stress_2m stress_5m stress_10m
 
 .NOTPARALLEL:
 
@@ -49,8 +47,11 @@ validate: $(VAL_JOBS)
 .PHONY: workload
 workload: $(WORK_JOBS)
 
+.PHONY: stress
+stress: $(STRESS_JOBS)
+
 .PHONY: all
-all: validate workload
+all: validate workload stress
 
 # ── Per-job pattern ──
 # Each target: start collection → run fio → stop collection → check results
@@ -110,4 +111,4 @@ endif
 		$(CONTAINER_FLAG)
 endef
 
-$(foreach job,$(VAL_JOBS) $(WORK_JOBS),$(eval $(call JOB_TEMPLATE,$(job))))
+$(foreach job,$(VAL_JOBS) $(WORK_JOBS) $(STRESS_JOBS),$(eval $(call JOB_TEMPLATE,$(job))))

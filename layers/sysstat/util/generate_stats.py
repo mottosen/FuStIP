@@ -17,7 +17,7 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
-from stats_generation.shared import tseries_with_points
+from stats_generation.shared import tseries_stats
 
 
 def parse_csv(path, processes=None):
@@ -66,9 +66,9 @@ def cpu_stats(rows, duration_s):
         for metric in metrics:
             points = [{"time": t, "value": round(times[t][metric], 2)}
                       for t in sorted(times)]
-            entry = tseries_with_points(points)
-            entry["stats"]["max_area_under_curve"] = max_auc
-            cmd_result[metric] = entry
+            stats = tseries_stats(points)
+            stats["max_area_under_curve"] = max_auc
+            cmd_result[metric] = stats
         result[cmd] = cmd_result
 
     return result
@@ -92,10 +92,10 @@ def mem_stats(rows, duration_s):
         for metric in metrics:
             points = [{"time": t, "value": round(times[t][metric], 2)}
                       for t in sorted(times)]
-            entry = tseries_with_points(points)
+            stats = tseries_stats(points)
             if metric == "mem_pct":
-                entry["stats"]["max_area_under_curve"] = max_auc
-            cmd_result[metric] = entry
+                stats["max_area_under_curve"] = max_auc
+            cmd_result[metric] = stats
         result[cmd] = cmd_result
 
     return result
@@ -118,7 +118,7 @@ def dev_stats(rows):
         for metric in metrics:
             points = [{"time": t, "value": round(times[t][metric], 2)}
                       for t in sorted(times)]
-            cmd_result[metric] = tseries_with_points(points)
+            cmd_result[metric] = tseries_stats(points)
         result[cmd] = cmd_result
 
     return result
@@ -144,7 +144,7 @@ def main():
         print(f"Error: {sysstat_dir} not found", file=sys.stderr)
         sys.exit(1)
 
-    result = {"source": []}
+    result = {}
 
     # Read all CSVs first to compute global duration
     csv_data = {}
@@ -152,11 +152,10 @@ def main():
                        ("mem", sysstat_dir / "mem.csv"),
                        ("dev", sysstat_dir / "dev.csv")]:
         if path.exists():
-            result["source"].append(f"{name}.csv")
             csv_data[name] = parse_csv(path, processes)
             print(f"  Processed {path.name}: {len(csv_data[name])} rows")
 
-    if not result["source"]:
+    if not csv_data:
         print(f"No sysstat CSV files found in {sysstat_dir}")
         return
 

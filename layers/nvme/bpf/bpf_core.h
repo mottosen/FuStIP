@@ -49,6 +49,15 @@ struct {
   __uint(max_entries, 1 << 28); // 256 MB
 } events SEC(".maps");
 
+// Per-event-type counters: [type*2] = generated, [type*2+1] = dropped
+// NVMe: setup=0,1  complete=2,3
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 4);
+  __type(key, __u32);
+  __type(value, __u64);
+} event_counters SEC(".maps");
+
 // Per-(op, comm) inflight counter (atomically incremented/decremented)
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
@@ -118,6 +127,10 @@ static __always_inline int handle_nvme_rawtp_setup(void) {
     cur_inflight = (__s32)(__sync_fetch_and_add(cnt, 1) + 1);
 
   // Emit setup event
+  __u32 gen_key = 0;
+  __u64 *gen_cnt = bpf_map_lookup_elem(&event_counters, &gen_key);
+  if (gen_cnt) (*gen_cnt)++;
+
   struct nvme_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
   if (e) {
     e->timestamp_ns = ts;
@@ -130,6 +143,10 @@ static __always_inline int handle_nvme_rawtp_setup(void) {
     __builtin_memcpy(e->comm, data->comm, 16);
     e->inflight = cur_inflight;
     bpf_ringbuf_submit(e, 0);
+  } else {
+    __u32 drop_key = 1;
+    __u64 *drop_cnt = bpf_map_lookup_elem(&event_counters, &drop_key);
+    if (drop_cnt) (*drop_cnt)++;
   }
 
   return 0;
@@ -164,6 +181,10 @@ static __always_inline int handle_nvme_complete(struct request *req) {
     cur_inflight = (__s32)(__sync_fetch_and_add(cnt, -1) - 1);
 
   // Emit complete event
+  __u32 gen_key = 2;  // COMPLETE_GEN
+  __u64 *gen_cnt = bpf_map_lookup_elem(&event_counters, &gen_key);
+  if (gen_cnt) (*gen_cnt)++;
+
   struct nvme_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
   if (e) {
     e->timestamp_ns = now;
@@ -176,6 +197,10 @@ static __always_inline int handle_nvme_complete(struct request *req) {
     __builtin_memcpy(e->comm, data->comm, 16);
     e->inflight = cur_inflight;
     bpf_ringbuf_submit(e, 0);
+  } else {
+    __u32 drop_key = 3;  // COMPLETE_DROP
+    __u64 *drop_cnt = bpf_map_lookup_elem(&event_counters, &drop_key);
+    if (drop_cnt) (*drop_cnt)++;
   }
 
   // Cleanup maps

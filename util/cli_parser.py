@@ -46,7 +46,12 @@ def parse_args(argv=None):
     profile_sub.add_parser("start", parents=[parent], help="Start profiling")
     profile_sub.add_parser("stop", parents=[parent], help="Stop profiling")
 
-    action_sub.add_parser("test", parents=[parent], help="Run test suite(s)")
+    test_parser = action_sub.add_parser("test", help="Run test suite(s)")
+    test_sub = test_parser.add_subparsers(dest="sub_action", required=True)
+    test_sub.add_parser("validate", parents=[parent], help="Run validation jobs")
+    test_sub.add_parser("vdb", parents=[parent], help="Run VDB-like workload jobs")
+    test_sub.add_parser("stress", parents=[parent], help="Run stress (long-duration) jobs")
+    test_sub.add_parser("all", parents=[parent], help="Run all test jobs")
 
     args = parser.parse_args(argv)
 
@@ -80,10 +85,6 @@ def parse_args(argv=None):
 
 
 def validate(args):
-    if args.comm_filter and args.container_filter:
-        print("Error: -p/--comm-filter and -c/--container-filter are mutually exclusive", file=sys.stderr)
-        sys.exit(1)
-
     if args.container_filter:
         args.mode = "detailed"
 
@@ -95,8 +96,8 @@ def validate(args):
 
     if not args.container_filter:
         if "nvme" in args.layers:
-            if not args.dev_filter:
-                print("Error: nvme layer requires -d/--dev-filter", file=sys.stderr)
+            if not args.dev_filter and not args.comm_filter:
+                print("Error: nvme layer requires -d/--dev-filter or -p/--comm-filter", file=sys.stderr)
                 sys.exit(1)
 
         if not is_test and ("block" in args.layers or "fs" in args.layers):
@@ -135,11 +136,16 @@ def build_layer_vars(layer, args):
 
     if args.container_filter:
         vs.append(f"CONTAINER_FILTER={args.container_filter}")
-    else:
+    if not args.container_filter:
         vs.append(f"MODE={args.mode}")
-        if layer == "nvme":
+
+    if layer == "nvme":
+        if args.dev_filter:
             vs.append(f"DEV_FILTER={args.dev_filter}")
-        elif layer in ("block", "fs"):
+        if args.comm_filter:
+            vs.append(f"COMM_FILTER={args.comm_filter}")
+    elif layer in ("block", "fs"):
+        if args.comm_filter:
             vs.append(f"COMM_FILTER={args.comm_filter}")
 
     vs.append(f"RESULTS_DIR={args.results_dir}")
@@ -164,8 +170,17 @@ def generate_profile_commands(args):
     return cmds
 
 
+TEST_TARGET_MAP = {
+    "validate": "validate",
+    "vdb": "workload",
+    "stress": "stress",
+    "all": "all",
+}
+
+
 def generate_test_commands(args):
     selected = set(args.layers)
+    target = TEST_TARGET_MAP[args.sub_action]
     cmds = []
 
     # Determine which layers within each suite are selected
@@ -187,7 +202,7 @@ def generate_test_commands(args):
             vs.append(f"LAYERS={' '.join(block_nvme_layers)}")
         vs.append(f"FIO_FILE={args.fio_file}")
         vs.append(f"RESULTS_DIR={args.results_dir}")
-        cmds.append(f"make -C tests/block_nvme all {' '.join(vs)} || echo '!! block_nvme suite failed'")
+        cmds.append(f"make -C tests/block_nvme {target} {' '.join(vs)} || echo '!! block_nvme suite failed'")
 
     if filesystem_layers:
         vs = []
@@ -202,7 +217,7 @@ def generate_test_commands(args):
             vs.append(f"LAYERS={' '.join(filesystem_layers)}")
         vs.append(f"FIO_FILE={args.fio_file}")
         vs.append(f"RESULTS_DIR={args.results_dir}")
-        cmds.append(f"make -C tests/filesystem all {' '.join(vs)} || echo '!! filesystem suite failed'")
+        cmds.append(f"make -C tests/filesystem {target} {' '.join(vs)} || echo '!! filesystem suite failed'")
 
     return cmds
 

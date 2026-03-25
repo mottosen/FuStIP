@@ -9,6 +9,7 @@
 const volatile char comm_filters[MAX_COMM_FILTERS][16] = {};
 const volatile __u8 num_comm_filters = 0;
 const volatile bool filter_by_mntns = false;
+const volatile bool filter_or_mode = false;
 
 #include "../bpf_core.h"
 
@@ -62,12 +63,19 @@ static __always_inline bool comm_matches(void)
 	return false;
 }
 
+static __always_inline bool should_trace(void)
+{
+	if (filter_or_mode)
+		return comm_matches() || mntns_matches();
+	return comm_matches() && mntns_matches();
+}
+
 // ── read() ──
 
 SEC("tp/syscalls/sys_enter_read")
 int handle_enter_read(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!comm_matches() || !mntns_matches())
+	if (!should_trace())
 		return 0;
 	__s32 fd = (__s32)ctx->args[0];
 	__s64 count = (__s64)ctx->args[2];
@@ -85,7 +93,7 @@ int handle_exit_read(struct trace_event_raw_sys_exit *ctx)
 SEC("tp/syscalls/sys_enter_write")
 int handle_enter_write(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!comm_matches() || !mntns_matches())
+	if (!should_trace())
 		return 0;
 	__s32 fd = (__s32)ctx->args[0];
 	__s64 count = (__s64)ctx->args[2];
@@ -103,7 +111,7 @@ int handle_exit_write(struct trace_event_raw_sys_exit *ctx)
 SEC("tp/syscalls/sys_enter_pread64")
 int handle_enter_pread64(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!comm_matches() || !mntns_matches())
+	if (!should_trace())
 		return 0;
 	__s32 fd = (__s32)ctx->args[0];
 	__s64 count = (__s64)ctx->args[2];
@@ -122,7 +130,7 @@ int handle_exit_pread64(struct trace_event_raw_sys_exit *ctx)
 SEC("tp/syscalls/sys_enter_pwrite64")
 int handle_enter_pwrite64(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!comm_matches() || !mntns_matches())
+	if (!should_trace())
 		return 0;
 	__s32 fd = (__s32)ctx->args[0];
 	__s64 count = (__s64)ctx->args[2];
@@ -141,7 +149,7 @@ int handle_exit_pwrite64(struct trace_event_raw_sys_exit *ctx)
 SEC("tp/syscalls/sys_enter_openat")
 int handle_enter_openat(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!comm_matches() || !mntns_matches())
+	if (!should_trace())
 		return 0;
 	__s32 dirfd = (__s32)ctx->args[0];
 	return handle_sc_enter(SC_OPENAT, dirfd, -1, 0);
@@ -158,7 +166,7 @@ int handle_exit_openat(struct trace_event_raw_sys_exit *ctx)
 SEC("tp/syscalls/sys_enter_close")
 int handle_enter_close(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!comm_matches() || !mntns_matches())
+	if (!should_trace())
 		return 0;
 	__s32 fd = (__s32)ctx->args[0];
 	return handle_sc_enter(SC_CLOSE, fd, -1, 0);
@@ -175,7 +183,7 @@ int handle_exit_close(struct trace_event_raw_sys_exit *ctx)
 SEC("tp/syscalls/sys_enter_lseek")
 int handle_enter_lseek(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!comm_matches() || !mntns_matches())
+	if (!should_trace())
 		return 0;
 	__s32 fd = (__s32)ctx->args[0];
 	__s64 offset = (__s64)ctx->args[1];
@@ -193,7 +201,7 @@ int handle_exit_lseek(struct trace_event_raw_sys_exit *ctx)
 SEC("tp/syscalls/sys_enter_newfstatat")
 int handle_enter_newfstatat(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!comm_matches() || !mntns_matches())
+	if (!should_trace())
 		return 0;
 	__s32 dirfd = (__s32)ctx->args[0];
 	return handle_sc_enter(SC_NEWFSTATAT, dirfd, -1, 0);
@@ -210,7 +218,7 @@ int handle_exit_newfstatat(struct trace_event_raw_sys_exit *ctx)
 SEC("tp/syscalls/sys_enter_newfstat")
 int handle_enter_newfstat(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!comm_matches() || !mntns_matches())
+	if (!should_trace())
 		return 0;
 	__s32 fd = (__s32)ctx->args[0];
 	return handle_sc_enter(SC_NEWFSTAT, fd, -1, 0);
@@ -227,7 +235,7 @@ int handle_exit_newfstat(struct trace_event_raw_sys_exit *ctx)
 SEC("tp/syscalls/sys_enter_unlinkat")
 int handle_enter_unlinkat(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!comm_matches() || !mntns_matches())
+	if (!should_trace())
 		return 0;
 	__s32 dirfd = (__s32)ctx->args[0];
 	return handle_sc_enter(SC_UNLINKAT, dirfd, -1, 0);
@@ -244,7 +252,7 @@ int handle_exit_unlinkat(struct trace_event_raw_sys_exit *ctx)
 SEC("tp/syscalls/sys_enter_mkdirat")
 int handle_enter_mkdirat(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!comm_matches() || !mntns_matches())
+	if (!should_trace())
 		return 0;
 	__s32 dirfd = (__s32)ctx->args[0];
 	return handle_sc_enter(SC_MKDIRAT, dirfd, -1, 0);
@@ -261,7 +269,7 @@ int handle_exit_mkdirat(struct trace_event_raw_sys_exit *ctx)
 SEC("tp/syscalls/sys_enter_mmap")
 int handle_enter_mmap(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!comm_matches() || !mntns_matches())
+	if (!should_trace())
 		return 0;
 	__s64 length = (__s64)ctx->args[1];
 	__s32 fd = (__s32)ctx->args[4];
@@ -280,7 +288,7 @@ int handle_exit_mmap(struct trace_event_raw_sys_exit *ctx)
 SEC("tp/syscalls/sys_enter_munmap")
 int handle_enter_munmap(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!comm_matches() || !mntns_matches())
+	if (!should_trace())
 		return 0;
 	__s64 length = (__s64)ctx->args[1];
 	return handle_sc_enter(SC_MUNMAP, -1, -1, length);

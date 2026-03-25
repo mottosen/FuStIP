@@ -16,9 +16,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from stats_generation.shared import (compute_duration_from_tseries,
                                      derive_throughput,
-                                     histogram_with_buckets,
+                                     histogram_stats_only,
                                      parse_counters, parse_histograms,
-                                     parse_tseries, tseries_with_points)
+                                     parse_tseries, tseries_stats)
 
 LAYER_PREFIX = "nvme"
 
@@ -38,10 +38,9 @@ def generate_stats(input_path):
     duration_s = compute_duration_from_tseries(tseries)
 
     result = {
-        "source": input_path.name,
         "counters": {},
         "derived": {"duration_s": duration_s},
-        "histograms": {},
+        "distributions": {},
         "tseries": {},
     }
 
@@ -56,19 +55,19 @@ def generate_stats(input_path):
     )
     result["derived"].update(throughput)
 
-    # Histogram stats
+    # Distribution stats (aggregate only, no histogram bucket data)
     for m in HISTOGRAM_MAPS:
         if m in histograms:
-            result["histograms"][m] = {}
+            result["distributions"][m] = {}
             for key, buckets in histograms[m].items():
-                result["histograms"][m][key] = histogram_with_buckets(buckets)
+                result["distributions"][m][key] = histogram_stats_only(buckets)
 
     # Time-series stats
     for m in TSERIES_MAPS:
         if m in tseries:
             result["tseries"][m] = {}
             for key, points in tseries[m].items():
-                result["tseries"][m][key] = tseries_with_points(points)
+                result["tseries"][m][key] = tseries_stats(points)
 
     return result
 

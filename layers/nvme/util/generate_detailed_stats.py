@@ -4,6 +4,13 @@
 Reads detailed.csv from the results directory, computes aggregate
 statistics matching the summary stats JSON structure, and writes JSON.
 
+Uses multiple independent Polars lazy scans with projection pushdown
+to limit peak memory on large files (100M+ rows):
+  Scan 1: counters, duration, event counts (streamable)
+  Scan 2: distributions (Polars-native quantiles, ~2-row result)
+  Scan 3: inflight time-series (aggregated per-second)
+  Scan 4: access pattern (sector gap analysis)
+
 Usage:
     python ./util/generate_detailed_stats.py <results_dir>
 """
@@ -13,126 +20,237 @@ import json
 import sys
 from pathlib import Path
 
-import pandas as pd
+import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from stats_generation.shared import (compute_access_pattern,
                                      derive_throughput,
-                                     histogram_with_buckets,
-                                     histogram_with_data,
-                                     raw_values_to_hist,
-                                     raw_values_to_hist_buckets,
-                                     tseries_with_points)
+                                     tseries_stats)
 
 LAYER_PREFIX = "nvme"
+
+SCHEMA = {"event": pl.Utf8, "op": pl.Utf8, "latency_ns": pl.Int64}
+
+
+def _sec_to_time(s):
+    h, m, ss = s // 3600, (s % 3600) // 60, s % 60
+    return f"{h:02d}:{m:02d}:{ss:02d}"
+
+
+def _series_stats_exprs(col):
+    """Polars aggregation expressions for distribution stats."""
+    c = pl.col(col)
+    return [
+        c.count().alias("count"),
+        c.min().alias("min"),
+        c.max().alias("max"),
+        c.mean().alias("mean"),
+        c.quantile(0.01, interpolation="linear").alias("p1"),
+        c.quantile(0.05, interpolation="linear").alias("p5"),
+        c.quantile(0.50, interpolation="linear").alias("p50"),
+        c.quantile(0.95, interpolation="linear").alias("p95"),
+        c.quantile(0.99, interpolation="linear").alias("p99"),
+    ]
+
+
+def _row_to_stats(row):
+    """Convert a Polars agg row dict to series_stats-compatible dict."""
+    def _val(v):
+        return round(float(v), 2) if v is not None else 0.0
+    return {
+        "count": int(row["count"]) if row["count"] is not None else 0,
+        "min": _val(row["min"]),
+        "max": _val(row["max"]),
+        "mean": _val(row["mean"]),
+        "p1": _val(row["p1"]),
+        "p5": _val(row["p5"]),
+        "p50": _val(row["p50"]),
+        "p95": _val(row["p95"]),
+        "p99": _val(row["p99"]),
+    }
 
 
 def generate_stats(csv_path):
     """Parse an NVMe layer detailed CSV and compute stats."""
-    df = pd.read_csv(csv_path)
 
-    complete = df[df["event"] == "complete"]
-    setup = df[df["event"] == "setup"]
-    all_events = df[df["event"].isin(["setup", "complete"])]
+    # Check header for optional columns
+    with open(csv_path) as f:
+        header = f.readline().strip().split(",")
+    has_sector = "sector" in header
 
-    # Duration
-    if len(all_events) > 1:
-        duration_ns = int(all_events["timestamp_ns"].max() - all_events["timestamp_ns"].min())
-        duration_s = duration_ns / 1e9
+    # --- Scan 1: Counters, duration, event counts ---
+    lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+
+    agg = (lf.filter(pl.col("event").is_in(["setup", "complete"]))
+             .group_by("event", "op")
+             .agg(
+                 pl.len().alias("count"),
+                 pl.col("bytes").sum().alias("total_bytes"),
+                 pl.col("timestamp_ns").min().alias("ts_min"),
+                 pl.col("timestamp_ns").max().alias("ts_max"),
+             )
+             .collect(engine="streaming"))
+
+    # Duration from all events
+    ts_min = agg["ts_min"].min()
+    ts_max = agg["ts_max"].max()
+    if ts_min is not None and ts_max is not None and ts_max > ts_min:
+        duration_s = (ts_max - ts_min) / 1e9
     else:
         duration_s = 0
 
     # Build counters
     counters = {}
 
-    counters["cmd_completed"] = complete.groupby("op").size().to_dict()
+    complete_rows = agg.filter(pl.col("event") == "complete")
+    if len(complete_rows) > 0:
+        counters["cmd_completed"] = dict(zip(
+            complete_rows["op"].to_list(),
+            [int(v) for v in complete_rows["count"].to_list()]
+        ))
+        counters["cmd_total_bytes"] = dict(zip(
+            complete_rows["op"].to_list(),
+            [int(v) for v in complete_rows["total_bytes"].to_list()]
+        ))
 
-    byte_sums = complete.groupby("op")["bytes"].sum().to_dict()
-    counters["cmd_total_bytes"] = {k: int(v) for k, v in byte_sums.items()}
+    setup_rows = agg.filter(pl.col("event") == "setup")
+    if len(setup_rows) > 0:
+        counters["cmd_setup"] = dict(zip(
+            setup_rows["op"].to_list(),
+            [int(v) for v in setup_rows["count"].to_list()]
+        ))
 
-    if len(setup) > 0:
-        counters["cmd_setup"] = setup.groupby("op").size().to_dict()
+    # Event counts for data quality (avoids separate CSV pass)
+    event_agg = agg.group_by("event").agg(pl.col("count").sum())
+    event_counts = dict(zip(event_agg["event"].to_list(), event_agg["count"].to_list()))
 
     result = {
-        "source": csv_path.name,
         "counters": counters,
         "derived": {"duration_s": round(duration_s, 2)},
-        "histograms": {},
+        "distributions": {},
         "tseries": {},
     }
 
-    # Derived throughput
     throughput = derive_throughput(counters, duration_s, "cmd_completed", "cmd_total_bytes")
     result["derived"].update(throughput)
 
-    # Histograms
-    cmd_lat = complete[complete["latency_ns"].notna()]
-    if len(cmd_lat) > 0:
-        result["histograms"]["cmd_latencies"] = {}
-        for op, group in cmd_lat.groupby("op"):
-            result["histograms"]["cmd_latencies"][op] = histogram_with_buckets(
-                raw_values_to_hist_buckets(group["latency_ns"].tolist())
-            )
+    del agg
 
-    if len(complete) > 0:
-        result["histograms"]["cmd_sizes"] = {}
-        for op, group in complete.groupby("op"):
-            result["histograms"]["cmd_sizes"][op] = histogram_with_data(
-                raw_values_to_hist(group["bytes"].tolist())
-            )
+    # --- Scan 2: Distributions (Polars-native quantiles, no data in Python) ---
+    lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+    lat_stats = (lf.filter(pl.col("event") == "complete")
+                   .filter(pl.col("latency_ns").is_not_null())
+                   .group_by("op")
+                   .agg(_series_stats_exprs("latency_ns"))
+                   .sort("op")
+                   .collect(engine="streaming"))
+    if len(lat_stats) > 0:
+        result["distributions"]["cmd_latencies"] = {
+            row["op"]: _row_to_stats(row)
+            for row in lat_stats.iter_rows(named=True)
+        }
+    del lat_stats
 
-    # Inflight time-series
-    if len(all_events) > 1:
-        t_min = all_events["timestamp_ns"].min()
+    lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+    size_stats = (lf.filter(pl.col("event") == "complete")
+                    .group_by("op")
+                    .agg(_series_stats_exprs("bytes"))
+                    .sort("op")
+                    .collect(engine="streaming"))
+    if len(size_stats) > 0:
+        result["distributions"]["cmd_sizes"] = {
+            row["op"]: _row_to_stats(row)
+            for row in size_stats.iter_rows(named=True)
+        }
+    del size_stats
+
+    # --- Scan 3: Inflight time-series (aggregated per-second) ---
+    if duration_s > 0:
         window_ns = 1_000_000_000
-
         result["tseries"]["cmd_inflight"] = {}
 
-        if "inflight" in df.columns:
-            # Use pre-computed in-kernel inflight column
-            for op in all_events["op"].unique():
-                op_df = all_events[all_events["op"] == op].sort_values("timestamp_ns")
-                secs = ((op_df["timestamp_ns"].values - t_min) / window_ns).astype(int)
-                op_df = op_df.assign(sec=secs)
-                sampled = op_df.groupby("sec")["inflight"].last()
-                points = []
-                for s, v in sampled.items():
-                    h, m, ss = s // 3600, (s % 3600) // 60, s % 60
-                    points.append({"time": f"{h:02d}:{m:02d}:{ss:02d}",
-                                   "value": max(0, int(v))})
-                if points:
-                    result["tseries"]["cmd_inflight"][op] = tseries_with_points(points)
-        else:
-            # Fallback: compute from enter/exit event counts
-            t_max = all_events["timestamp_ns"].max()
-            for op in setup["op"].unique():
-                enter_ts = setup[setup["op"] == op]["timestamp_ns"].values
-                exit_ts = complete[complete["op"] == op]["timestamp_ns"].values
-                points = []
-                t = t_min
-                sec = 0
-                while t <= t_max:
-                    inflight = int((enter_ts <= t).sum() - (exit_ts <= t).sum())
-                    h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
-                    points.append({"time": f"{h:02d}:{m:02d}:{s:02d}",
-                                   "value": max(0, inflight)})
-                    t += window_ns
-                    sec += 1
-                if points:
-                    result["tseries"]["cmd_inflight"][op] = tseries_with_points(points)
+        lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+        inf_df = (lf.filter(pl.col("event").is_in(["setup", "complete"]))
+                    .with_columns(
+                        ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
+                    )
+                    .group_by("op", "sec")
+                    .agg(pl.col("inflight").last())
+                    .sort("op", "sec")
+                    .collect(engine="streaming"))
 
-    # Access pattern (sequential/random from sector addresses)
-    if len(complete) > 0 and "sector" in complete.columns:
-        result["access_pattern"] = {"cmd_sectors": {}}
-        for op, group in complete.sort_values("timestamp_ns").groupby("op"):
-            sectors = group["sector"].dropna().astype(int).tolist()
-            bytes_list = group.loc[group["sector"].notna(), "bytes"].astype(int).tolist()
-            if len(sectors) >= 2:
-                result["access_pattern"]["cmd_sectors"][op] = compute_access_pattern(
-                    sectors, bytes_list
-                )
+        for op in inf_df["op"].unique().sort().to_list():
+            op_df = inf_df.filter(pl.col("op") == op)
+            points = [
+                {"time": _sec_to_time(int(s)), "value": max(0, int(v))}
+                for s, v in zip(op_df["sec"].to_list(), op_df["inflight"].to_list())
+                if v is not None
+            ]
+            if points:
+                result["tseries"]["cmd_inflight"][op] = tseries_stats(points)
+        del inf_df
 
-    return result
+    # --- Scan 4: Access pattern ---
+    if has_sector:
+        lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+        setup_df = (lf.filter(pl.col("event") == "setup")
+                      .filter(pl.col("sector").is_not_null())
+                      .select("op", "timestamp_ns", "sector", "bytes")
+                      .sort("timestamp_ns")
+                      .collect(engine="streaming"))
+
+        if len(setup_df) > 0:
+            result["access_pattern"] = {"cmd_sectors": {}}
+            for op in setup_df["op"].unique().sort().to_list():
+                op_df = setup_df.filter(pl.col("op") == op)
+                sectors = op_df["sector"].cast(pl.Int64).to_numpy()
+                bytes_list = op_df["bytes"].cast(pl.Int64).to_numpy()
+                if len(sectors) >= 2:
+                    result["access_pattern"]["cmd_sectors"][op] = compute_access_pattern(
+                        sectors, bytes_list
+                    )
+        del setup_df
+
+    return result, event_counts
+
+
+def load_data_quality(layer_dir, event_counts):
+    """Load per-type counters.json and compute data quality metrics."""
+    counters_file = layer_dir / "counters.json"
+    if not counters_file.exists():
+        return None
+    try:
+        with open(counters_file) as f:
+            counters = json.load(f)
+
+        per_event_type = {}
+        total_generated = 0
+        total_dropped = 0
+
+        for event_type in ("setup", "complete"):
+            entry = counters.get(event_type, {})
+            gen = entry.get("generated", 0)
+            drop = entry.get("dropped", 0)
+            received = int(event_counts.get(event_type, 0))
+            total_generated += gen
+            total_dropped += drop
+            per_event_type[event_type] = {
+                "generated": gen,
+                "dropped": drop,
+                "received": received,
+                "drop_pct": round(100 * drop / gen, 4) if gen > 0 else 0.0,
+            }
+
+        total_received = total_generated - total_dropped
+        return {
+            "total_generated": total_generated,
+            "total_dropped": total_dropped,
+            "total_received": total_received,
+            "drop_pct": round(100 * total_dropped / total_generated, 4) if total_generated > 0 else 0.0,
+            "per_event_type": per_event_type,
+        }
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def main():
@@ -153,7 +271,14 @@ def main():
         sys.exit(1)
 
     print(f"Processing {csv_file.name}...")
-    stats = generate_stats(csv_file)
+    stats, event_counts = generate_stats(csv_file)
+
+    dq = load_data_quality(layer_dir, event_counts)
+    if dq:
+        stats["data_quality"] = dq
+    # Always remove counters.json — transient file consumed by stats generation
+    counters_file = layer_dir / "counters.json"
+    counters_file.unlink(missing_ok=True)
 
     output_file = layer_dir / "detailed-stats.json"
     with open(output_file, "w") as f:
