@@ -97,7 +97,8 @@ stop-profiling:
 csv-to-parquet: ensure-results-exists
 ifeq ($(MODE),detailed)
 	$(Q)if [ -f "$(RESULTS_DIR)/block/detailed.csv" ]; then \
-		python "../../util/csv_to_parquet.py" "$(RESULTS_DIR)/block/detailed.csv" $(ERR_REDIRECT) $(OUT_REDIRECT); \
+		python "../../util/csv_to_parquet.py" "$(RESULTS_DIR)/block/detailed.csv" $(ERR_REDIRECT) $(OUT_REDIRECT) && \
+		rm -f "$(RESULTS_DIR)/block/detailed.csv"; \
 	fi
 endif
 
@@ -116,7 +117,8 @@ endif
 .PHONY: visualize
 visualize: ensure-results-exists
 	$(Q)if [ -f "$(RESULTS_DIR)/block/detailed.csv" ]; then \
-		python "../../util/csv_to_parquet.py" "$(RESULTS_DIR)/block/detailed.csv" $(ERR_REDIRECT) $(OUT_REDIRECT); \
+		python "../../util/csv_to_parquet.py" "$(RESULTS_DIR)/block/detailed.csv" $(ERR_REDIRECT) $(OUT_REDIRECT) && \
+		rm -f "$(RESULTS_DIR)/block/detailed.csv"; \
 	fi
 	$(Q)python "./util/visualize.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
 	$(Q)echo -e "block visualization generated"
