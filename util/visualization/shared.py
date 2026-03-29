@@ -19,9 +19,20 @@ TYPE_COLORS = {
 
 DEFAULT_COLOR_CYCLE = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
+MAX_CDF_POINTS = 10_000
+
 
 def _color_for(typ, idx=0):
     return TYPE_COLORS.get(typ, DEFAULT_COLOR_CYCLE[idx % len(DEFAULT_COLOR_CYCLE)])
+
+
+def _subsample_cdf(sorted_vals, max_points=MAX_CDF_POINTS):
+    """Subsample sorted array for CDF plotting, preserving distribution shape."""
+    n = len(sorted_vals)
+    if n <= max_points:
+        return sorted_vals, np.arange(1, n + 1) / n
+    idx = np.linspace(0, n - 1, max_points, dtype=int)
+    return sorted_vals[idx], (idx + 1) / n
 
 
 def plot_type_distribution(ax, counts_by_type):
@@ -38,51 +49,19 @@ def plot_type_distribution(ax, counts_by_type):
     ax.set_title("Type Distribution")
 
 
-def plot_inflight_over_time(ax, df, enter_event, exit_event, type_col, ts_col, types, title="Inflight Over Time"):
-    """Per-type inflight count in 1-second windows."""
-    ts_vals = df[ts_col].to_numpy()
-    t_min = int(ts_vals.min())
-    t_max = int(ts_vals.max())
-    window_ns = 1_000_000_000
-
-    for i, typ in enumerate(types):
-        enter_ts = df.filter((pl.col("event") == enter_event) & (pl.col(type_col) == typ))[ts_col].to_numpy()
-        exit_ts = df.filter((pl.col("event") == exit_event) & (pl.col(type_col) == typ))[ts_col].to_numpy()
-        if len(enter_ts) == 0:
-            continue
-        times = []
-        values = []
-        t = t_min
-        sec = 0
-        while t <= t_max:
-            inflight = int((enter_ts <= t).sum() - (exit_ts <= t).sum())
-            times.append(sec)
-            values.append(max(0, inflight))
-            t += window_ns
-            sec += 1
-        ax.plot(times, values, label=typ, color=_color_for(typ, i), linewidth=0.8)
-
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Inflight")
-    ax.set_title(title)
-    ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
-
-
-def plot_inflight_from_column(ax, df, type_col, ts_col, types,
+def plot_inflight_from_column(ax, df, type_col, types,
                               inflight_col="inflight", title="Inflight Over Time"):
-    """Plot inflight from pre-computed column in event CSV."""
-    t_min = df[ts_col].min()
-    window_ns = 1_000_000_000
+    """Plot inflight from pre-aggregated per-sec data.
+
+    Expects df with columns: type_col, "sec", inflight_col
+    (from group_by(type, sec).agg(inflight.last())).
+    """
     for i, typ in enumerate(types):
-        typ_df = df.filter(pl.col(type_col) == typ).sort(ts_col)
+        typ_df = df.filter(pl.col(type_col) == typ).sort("sec")
         if len(typ_df) == 0:
             continue
-        ts_arr = typ_df[ts_col].to_numpy()
-        secs = ((ts_arr - t_min) / window_ns).astype(int)
-        typ_df = typ_df.with_columns(pl.Series("sec", secs))
-        sampled = typ_df.group_by("sec").agg(pl.col(inflight_col).last()).sort("sec")
-        ax.plot(sampled["sec"].to_numpy(),
-                sampled[inflight_col].to_numpy().clip(min=0),
+        ax.plot(typ_df["sec"].to_numpy(),
+                typ_df[inflight_col].to_numpy().clip(min=0),
                 label=typ, color=_color_for(typ, i), linewidth=0.8)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Inflight")
@@ -90,33 +69,19 @@ def plot_inflight_from_column(ax, df, type_col, ts_col, types,
     ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
 
-def plot_cumulated_mb_over_time(ax, df, complete_event, type_col, ts_col, bytes_col, types):
-    """Cumulative MB transferred in 1-second windows."""
-    completed = df.filter(pl.col("event") == complete_event)
-    ts_vals = df[ts_col].to_numpy()
-    t_min = int(ts_vals.min())
-    t_max = int(ts_vals.max())
-    window_ns = 1_000_000_000
+def plot_cumulated_mb_over_time(ax, df, type_col, bytes_col, types):
+    """Cumulative MB from pre-aggregated per-sec byte sums.
 
+    Expects df with columns: type_col, "sec", bytes_col
+    (from group_by(type, sec).agg(bytes.sum()), already filtered to complete events).
+    """
     for i, typ in enumerate(types):
-        typ_df = completed.filter(pl.col(type_col) == typ)
+        typ_df = df.filter(pl.col(type_col) == typ).sort("sec")
         if len(typ_df) == 0:
             continue
-        ts = typ_df[ts_col].to_numpy()
-        bts = typ_df[bytes_col].to_numpy()
-        times = []
-        cumul = []
-        t = t_min
-        sec = 0
-        total = 0.0
-        while t <= t_max:
-            mask = ts <= t
-            total = bts[mask].sum() / (1024 * 1024)
-            times.append(sec)
-            cumul.append(total)
-            t += window_ns
-            sec += 1
-        ax.plot(times, cumul, label=typ, color=_color_for(typ, i), linewidth=0.8)
+        cum_bytes = typ_df[bytes_col].cum_sum().to_numpy() / (1024 * 1024)
+        ax.plot(typ_df["sec"].to_numpy(), cum_bytes,
+                label=typ, color=_color_for(typ, i), linewidth=0.8)
 
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Cumulative MB")
@@ -131,7 +96,7 @@ def plot_io_size_cdf(ax, df, type_col, bytes_col, types):
         if len(vals) == 0:
             continue
         sorted_vals = np.sort(vals)
-        cdf = np.arange(1, len(sorted_vals) + 1) / len(sorted_vals)
+        sorted_vals, cdf = _subsample_cdf(sorted_vals)
         ax.plot(sorted_vals, cdf, label=typ, color=_color_for(typ, i), linewidth=0.8)
 
     ax.set_xscale("log")
@@ -149,7 +114,7 @@ def plot_io_latency_cdf(ax, df, type_col, latency_col, types):
         if len(vals) == 0:
             continue
         sorted_vals = np.sort(vals)
-        cdf = np.arange(1, len(sorted_vals) + 1) / len(sorted_vals)
+        sorted_vals, cdf = _subsample_cdf(sorted_vals)
         ax.plot(sorted_vals / 1000, cdf, label=typ, color=_color_for(typ, i), linewidth=0.8)
 
     ax.set_xscale("log")
@@ -174,7 +139,8 @@ def plot_gap_cdf(ax, df, type_col, sector_or_offset_col, bytes_col, types,
         expected = locations[:-1] + sizes[:len(locations) - 1] // sector_divisor
         gaps = np.abs(locations[1:] - expected)
         sorted_gaps = np.sort(gaps)
-        cdf = np.arange(1, len(sorted_gaps) + 1) / len(sorted_gaps) * 100
+        sorted_gaps, cdf = _subsample_cdf(sorted_gaps)
+        cdf = cdf * 100  # percentage
         ax.plot(sorted_gaps, cdf, label=typ, color=_color_for(typ, i), linewidth=0.8)
 
     ax.set_xscale("symlog")

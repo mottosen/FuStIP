@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Generate stats JSON from filesystem layer detailed CSV output.
+"""Generate stats JSON from filesystem layer detailed Parquet output.
 
-Reads detailed.csv from the results directory, computes aggregate
+Reads detailed.parquet from the results directory, computes aggregate
 statistics matching the summary stats JSON structure, and writes JSON.
 
 Uses multiple independent Polars lazy scans with projection pushdown
@@ -32,8 +32,6 @@ LAYER_PREFIX = "fs"
 
 # IO syscalls that have meaningful bytes/latency for histograms
 IO_SYSCALLS = {"read", "write", "pread64", "pwrite64"}
-
-SCHEMA = {"event": pl.Utf8, "syscall": pl.Utf8, "latency_ns": pl.Int64, "offset": pl.Int64}
 
 
 def _sec_to_time(s):
@@ -163,19 +161,18 @@ def compute_rw_access_pattern(df):
     return result
 
 
-def generate_stats(csv_path):
-    """Parse an FS layer detailed CSV and compute stats."""
+def generate_stats(parquet_path):
+    """Parse an FS layer detailed Parquet and compute stats."""
 
-    # Check header for optional columns
-    with open(csv_path) as f:
-        header = f.readline().strip().split(",")
-    has_offset = "offset" in header
+    # Check schema for optional columns
+    schema = pl.scan_parquet(parquet_path).collect_schema()
+    has_offset = "offset" in schema
 
     io_syscalls_list = list(IO_SYSCALLS)
 
     # --- Scan 1: Counters, duration, event counts ---
     print("  Scan 1: counters...", flush=True)
-    lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+    lf = pl.scan_parquet(parquet_path)
 
     # Get per-(event, syscall) aggregates — streaming to avoid 15GB+ materialization
     agg = (lf.group_by("event", "syscall")
@@ -228,7 +225,7 @@ def generate_stats(csv_path):
             [int(v) for v in non_io_enters["count"].to_list()]
         ))
 
-    # Event counts for data quality (avoids separate CSV pass)
+    # Event counts for data quality (avoids separate scan)
     event_agg = agg.group_by("event").agg(pl.col("count").sum())
     event_counts = dict(zip(event_agg["event"].to_list(), event_agg["count"].to_list()))
 
@@ -246,7 +243,7 @@ def generate_stats(csv_path):
 
     # --- Scan 2: Distributions (Polars-native quantiles, no data in Python) ---
     print("  Scan 2: distributions...", flush=True)
-    lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+    lf = pl.scan_parquet(parquet_path)
     lat_stats = (lf.filter(pl.col("event") == "exit")
                    .filter(pl.col("syscall").is_in(io_syscalls_list))
                    .filter(pl.col("latency_ns").is_not_null() & (pl.col("latency_ns") > 0))
@@ -261,7 +258,7 @@ def generate_stats(csv_path):
         }
     del lat_stats
 
-    lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+    lf = pl.scan_parquet(parquet_path)
     size_stats = (lf.filter(pl.col("event") == "exit")
                     .filter(pl.col("syscall").is_in(io_syscalls_list))
                     .filter(pl.col("bytes") > 0)
@@ -282,7 +279,7 @@ def generate_stats(csv_path):
         window_ns = 1_000_000_000
         result["tseries"]["sc_inflight"] = {}
 
-        lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+        lf = pl.scan_parquet(parquet_path)
         inf_df = (lf.filter(pl.col("syscall").is_in(io_syscalls_list))
                     .with_columns(
                         ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
@@ -310,7 +307,7 @@ def generate_stats(csv_path):
     # pread64/pwrite64: per-syscall scan with explicit offsets, per-fd analysis
     if has_offset:
         for sc in ["pread64", "pwrite64"]:
-            lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+            lf = pl.scan_parquet(parquet_path)
             sc_df = (lf.filter((pl.col("event") == "enter") & (pl.col("syscall") == sc)
                                & pl.col("offset").is_not_null())
                        .select("timestamp_ns", "offset", "bytes", "fd")
@@ -347,7 +344,7 @@ def generate_stats(csv_path):
 
     # read/write: pre-filter to relevant syscalls, reconstruct positions
     rw_relevant = ["read", "write", "openat", "lseek", "close"]
-    lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+    lf = pl.scan_parquet(parquet_path)
     rw_df = (lf.filter(pl.col("syscall").is_in(rw_relevant))
                .select("event", "syscall", "timestamp_ns", "tid", "fd", "bytes")
                .collect(engine="streaming"))
@@ -402,7 +399,7 @@ def load_data_quality(layer_dir, event_counts):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate stats from fs layer detailed CSV output"
+        description="Generate stats from fs layer detailed Parquet output"
     )
     parser.add_argument("results_dir", type=Path, help="Results directory")
     args = parser.parse_args()
@@ -412,13 +409,13 @@ def main():
         print(f"Error: {layer_dir} not found", file=sys.stderr)
         sys.exit(1)
 
-    csv_file = layer_dir / "detailed.csv"
-    if not csv_file.exists():
-        print(f"No detailed output found: {csv_file}", file=sys.stderr)
+    parquet_file = layer_dir / "detailed.parquet"
+    if not parquet_file.exists():
+        print(f"No detailed output found: {parquet_file}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Processing {csv_file.name}...")
-    stats, event_counts = generate_stats(csv_file)
+    print(f"Processing {parquet_file.name}...")
+    stats, event_counts = generate_stats(parquet_file)
 
     dq = load_data_quality(layer_dir, event_counts)
     if dq:
