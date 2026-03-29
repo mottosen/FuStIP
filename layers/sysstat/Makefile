@@ -44,8 +44,8 @@ start-collection: ensure-results-exists ensure-sudo
 
 	$(Q)echo -e "sysstat collection is running!\n"
 
-.PHONY: stop-collection
-stop-collection:
+.PHONY: stop-profiling
+stop-profiling:
 	$(Q)for pidfile in $(PIDS_DIR)/*.pid; do \
 		if [ -f "$$pidfile" ]; then \
 			pid=$$(cat "$$pidfile"); \
@@ -57,9 +57,15 @@ stop-collection:
 	done
 	$(Q)rm -rf "$(PIDS_DIR)"
 	@echo "sysstat collection stopped"
+
+.PHONY: csv-to-parquet
+csv-to-parquet: ensure-results-exists
 	$(Q)if [ -f "$(RESULTS_DIR)/sysstat/pidstat.out" ]; then \
-		$(MAKE) parse && $(MAKE) generate-stats; \
+		$(MAKE) parse; \
 	fi
+
+.PHONY: stop-collection
+stop-collection: stop-profiling csv-to-parquet generate-stats
 
 .PHONY: parse
 parse: ensure-results-exists

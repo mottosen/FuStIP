@@ -160,14 +160,28 @@ def _concurrent(cmds):
 
 
 def generate_profile_commands(args):
-    order = PROFILE_START_ORDER if args.sub_action == "start" else PROFILE_STOP_ORDER
-    target = "start-collection" if args.sub_action == "start" else "stop-collection"
-    cmds = []
-    for layer in order:
+    if args.sub_action == "start":
+        cmds = []
+        for layer in PROFILE_START_ORDER:
+            if layer in args.layers:
+                vs = build_layer_vars(layer, args)
+                cmds.append(f"make -C layers/{layer} start-collection {' '.join(vs)}")
+        return _concurrent(cmds)
+
+    # stop: parallel stop-profiling, then sequential csv-to-parquet + generate-stats
+    stop_cmds = []
+    for layer in PROFILE_STOP_ORDER:
         if layer in args.layers:
             vs = build_layer_vars(layer, args)
-            cmds.append(f"make -C layers/{layer} {target} {' '.join(vs)}")
-    return cmds
+            stop_cmds.append(f"make -C layers/{layer} stop-profiling {' '.join(vs)}")
+
+    seq_cmds = []
+    for target in ("csv-to-parquet", "generate-stats"):
+        for layer in args.layers:
+            vs = build_layer_vars(layer, args)
+            seq_cmds.append(f"make -C layers/{layer} {target} {' '.join(vs)}")
+
+    return _concurrent(stop_cmds) + seq_cmds
 
 
 TEST_TARGET_MAP = {
@@ -241,12 +255,12 @@ def main(argv=None):
         cmds.append(f"rm -rf {args.results_dir}/*")
 
     if args.action == "profile":
-        cmds.extend(_concurrent(generate_profile_commands(args)))
+        cmds.extend(generate_profile_commands(args))
     elif args.action == "test":
         cmds.extend(generate_test_commands(args))
 
     if args.visualize:
-        cmds.extend(_concurrent(generate_visualize_commands(args)))
+        cmds.extend(generate_visualize_commands(args))
 
     for cmd in cmds:
         print(cmd)

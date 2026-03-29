@@ -9,66 +9,106 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from visualization.shared import (build_dashboard, plot_cumulated_mb_over_time,
                                    plot_gap_cdf, plot_inflight_from_column,
-                                   plot_inflight_over_time, plot_io_latency_cdf,
-                                   plot_io_size_cdf, plot_type_distribution)
+                                   plot_io_latency_cdf, plot_io_size_cdf,
+                                   plot_type_distribution, sort_types)
 
 LAYER = "block"
-USECOLS = ["timestamp_ns", "event", "op", "bytes", "latency_ns", "sector"]
+WINDOW_NS = 1_000_000_000
 
 
-def _build_row(label, df):
-    """Build a dashboard row dict from a dataframe."""
-    complete = df.filter(pl.col("event") == "complete")
-    issue = df.filter(pl.col("event") == "issue")
-    types = sorted(complete.drop_nulls("op")["op"].unique().sort().to_list())
-    counts = dict(zip(*complete.group_by("op").len().select("op", "len").get_columns()))
-    has_inflight = "q_inflight" in df.columns and "d_inflight" in df.columns
+def _build_row(label, parquet_path, comm_filter=None):
+    """Build a dashboard row dict using per-plot Parquet scans."""
 
-    if has_inflight:
-        q_fn = lambda ax, d=df, t=types: plot_inflight_from_column(ax, d, "op", "timestamp_ns", t, inflight_col="q_inflight", title="Queue Inflight")
-        d_fn = lambda ax, d=df, t=types: plot_inflight_from_column(ax, d, "op", "timestamp_ns", t, inflight_col="d_inflight", title="Driver Inflight")
-    else:
-        q_fn = lambda ax, d=df, t=types: plot_inflight_over_time(ax, d, "insert", "issue", "op", "timestamp_ns", t, title="Queue Inflight")
-        d_fn = lambda ax, d=df, t=types: plot_inflight_over_time(ax, d, "issue", "complete", "op", "timestamp_ns", t, title="Driver Inflight")
+    def _scan(cols, event_filter=None):
+        """Lazy scan of Parquet with column selection and optional filters."""
+        lf = pl.scan_parquet(parquet_path)
+        if comm_filter is not None:
+            lf = lf.filter(pl.col("comm") == comm_filter)
+        if event_filter is not None:
+            lf = lf.filter(pl.col("event") == event_filter)
+        return lf.select(cols)
+
+    # Pre-compute type counts (tiny scan)
+    counts_df = (_scan(["op"], event_filter="complete")
+                 .group_by("op").len()
+                 .collect(engine="streaming"))
+    counts = dict(zip(*counts_df.select("op", "len").get_columns()))
+    types = sort_types(counts.keys())
+
+    # Pre-compute ts_min once (tiny scan)
+    ts_min = (_scan(["timestamp_ns"])
+              .select(pl.col("timestamp_ns").min())
+              .collect(engine="streaming").item())
+
+    def q_fn(ax, t=types, ts_min=ts_min):
+        df = (_scan(["timestamp_ns", "op", "q_inflight"])
+              .with_columns(((pl.col("timestamp_ns") - ts_min) // WINDOW_NS).cast(pl.Int64).alias("sec"))
+              .group_by("op", "sec").agg(pl.col("q_inflight").last())
+              .sort("op", "sec")
+              .collect(engine="streaming"))
+        plot_inflight_from_column(ax, df, "op", t, inflight_col="q_inflight", title="Queue Inflight")
+
+    def d_fn(ax, t=types, ts_min=ts_min):
+        df = (_scan(["timestamp_ns", "op", "d_inflight"])
+              .with_columns(((pl.col("timestamp_ns") - ts_min) // WINDOW_NS).cast(pl.Int64).alias("sec"))
+              .group_by("op", "sec").agg(pl.col("d_inflight").last())
+              .sort("op", "sec")
+              .collect(engine="streaming"))
+        plot_inflight_from_column(ax, df, "op", t, inflight_col="d_inflight", title="Driver Inflight")
+
+    def cumul_fn(ax, t=types, ts_min=ts_min):
+        df = (_scan(["op", "timestamp_ns", "bytes"], event_filter="complete")
+              .with_columns(((pl.col("timestamp_ns") - ts_min) // WINDOW_NS).cast(pl.Int64).alias("sec"))
+              .group_by("op", "sec").agg(pl.col("bytes").sum())
+              .sort("op", "sec")
+              .collect(engine="streaming"))
+        plot_cumulated_mb_over_time(ax, df, "op", "bytes", t)
+
+    def size_fn(ax, t=types):
+        df = _scan(["op", "bytes"], event_filter="complete").collect(engine="streaming")
+        plot_io_size_cdf(ax, df, "op", "bytes", t)
+
+    def latency_fn(ax, t=types):
+        df = _scan(["op", "latency_ns"], event_filter="complete").collect(engine="streaming")
+        plot_io_latency_cdf(ax, df, "op", "latency_ns", t)
+
+    def gap_fn(ax, t=types):
+        df = _scan(["op", "sector", "bytes", "timestamp_ns"], event_filter="issue").collect(engine="streaming")
+        plot_gap_cdf(ax, df, "op", "sector", "bytes", t)
 
     return {
         "label": label,
         "plots": [
             lambda ax, c=counts: plot_type_distribution(ax, c),
-            q_fn,
-            d_fn,
-            lambda ax, d=df, t=types: plot_cumulated_mb_over_time(ax, d, "complete", "op", "timestamp_ns", "bytes", t),
-            lambda ax, c=complete, t=types: plot_io_size_cdf(ax, c, "op", "bytes", t),
-            lambda ax, c=complete, t=types: plot_io_latency_cdf(ax, c, "op", "latency_ns", t),
-            lambda ax, s=issue, t=types: plot_gap_cdf(ax, s, "op", "sector", "bytes", t),
+            q_fn, d_fn, cumul_fn, size_fn, latency_fn, gap_fn,
         ],
     }
 
 
 def main():
     results_dir = Path(sys.argv[1])
-    csv_path = results_dir / LAYER / "detailed.csv"
-    if not csv_path.exists():
-        print(f"No detailed output found: {csv_path}", file=sys.stderr)
+    parquet_path = results_dir / LAYER / "detailed.parquet"
+    if not parquet_path.exists():
+        csv_path = results_dir / LAYER / "detailed.csv"
+        if not csv_path.exists():
+            print(f"No detailed output found", file=sys.stderr)
+            sys.exit(1)
+        print(f"Parquet not found: {parquet_path}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Reading {csv_path.name}...")
-    # Check which optional columns exist
-    with open(csv_path) as f:
-        header = f.readline().strip().split(",")
-    has_comm = "comm" in header
-    has_inflight = "q_inflight" in header and "d_inflight" in header
-    usecols = USECOLS + (["comm"] if has_comm else []) + (["q_inflight", "d_inflight"] if has_inflight else [])
+    schema = pl.scan_parquet(parquet_path).collect_schema()
+    has_comm = "comm" in schema
 
-    df = pl.read_csv(csv_path, columns=usecols)
-
+    print("Building dashboard...")
     rows = []
     if has_comm:
-        for comm_val in sorted(df.drop_nulls("comm")["comm"].unique().sort().to_list()):
-            comm_df = df.filter(pl.col("comm") == comm_val)
-            rows.append(_build_row(comm_val, comm_df))
+        comms = (pl.scan_parquet(parquet_path)
+                 .select("comm").drop_nulls().unique()
+                 .collect(engine="streaming"))["comm"].sort().to_list()
+        for comm_val in comms:
+            rows.append(_build_row(comm_val, parquet_path, comm_filter=comm_val))
     else:
-        rows.append(_build_row("block", df))
+        rows.append(_build_row("block", parquet_path))
 
     output = results_dir / "visualizations" / "block-dashboard.png"
     build_dashboard(

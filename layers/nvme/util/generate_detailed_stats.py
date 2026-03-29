@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Generate stats JSON from NVMe layer detailed CSV output.
+"""Generate stats JSON from NVMe layer detailed Parquet output.
 
-Reads detailed.csv from the results directory, computes aggregate
+Reads detailed.parquet from the results directory, computes aggregate
 statistics matching the summary stats JSON structure, and writes JSON.
 
 Uses multiple independent Polars lazy scans with projection pushdown
@@ -28,8 +28,6 @@ from stats_generation.shared import (compute_access_pattern,
                                      tseries_stats)
 
 LAYER_PREFIX = "nvme"
-
-SCHEMA = {"event": pl.Utf8, "op": pl.Utf8, "latency_ns": pl.Int64}
 
 
 def _sec_to_time(s):
@@ -70,16 +68,15 @@ def _row_to_stats(row):
     }
 
 
-def generate_stats(csv_path):
-    """Parse an NVMe layer detailed CSV and compute stats."""
+def generate_stats(parquet_path):
+    """Parse an NVMe layer detailed Parquet and compute stats."""
 
-    # Check header for optional columns
-    with open(csv_path) as f:
-        header = f.readline().strip().split(",")
-    has_sector = "sector" in header
+    # Check schema for optional columns
+    schema = pl.scan_parquet(parquet_path).collect_schema()
+    has_sector = "sector" in schema
 
     # --- Scan 1: Counters, duration, event counts ---
-    lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+    lf = pl.scan_parquet(parquet_path)
 
     agg = (lf.filter(pl.col("event").is_in(["setup", "complete"]))
              .group_by("event", "op")
@@ -120,7 +117,7 @@ def generate_stats(csv_path):
             [int(v) for v in setup_rows["count"].to_list()]
         ))
 
-    # Event counts for data quality (avoids separate CSV pass)
+    # Event counts for data quality (avoids separate scan)
     event_agg = agg.group_by("event").agg(pl.col("count").sum())
     event_counts = dict(zip(event_agg["event"].to_list(), event_agg["count"].to_list()))
 
@@ -137,7 +134,7 @@ def generate_stats(csv_path):
     del agg
 
     # --- Scan 2: Distributions (Polars-native quantiles, no data in Python) ---
-    lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+    lf = pl.scan_parquet(parquet_path)
     lat_stats = (lf.filter(pl.col("event") == "complete")
                    .filter(pl.col("latency_ns").is_not_null())
                    .group_by("op")
@@ -151,7 +148,7 @@ def generate_stats(csv_path):
         }
     del lat_stats
 
-    lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+    lf = pl.scan_parquet(parquet_path)
     size_stats = (lf.filter(pl.col("event") == "complete")
                     .group_by("op")
                     .agg(_series_stats_exprs("bytes"))
@@ -169,7 +166,7 @@ def generate_stats(csv_path):
         window_ns = 1_000_000_000
         result["tseries"]["cmd_inflight"] = {}
 
-        lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+        lf = pl.scan_parquet(parquet_path)
         inf_df = (lf.filter(pl.col("event").is_in(["setup", "complete"]))
                     .with_columns(
                         ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
@@ -192,7 +189,7 @@ def generate_stats(csv_path):
 
     # --- Scan 4: Access pattern ---
     if has_sector:
-        lf = pl.scan_csv(csv_path, schema_overrides=SCHEMA)
+        lf = pl.scan_parquet(parquet_path)
         setup_df = (lf.filter(pl.col("event") == "setup")
                       .filter(pl.col("sector").is_not_null())
                       .select("op", "timestamp_ns", "sector", "bytes")
@@ -255,7 +252,7 @@ def load_data_quality(layer_dir, event_counts):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate stats from NVMe layer detailed CSV output"
+        description="Generate stats from NVMe layer detailed Parquet output"
     )
     parser.add_argument("results_dir", type=Path, help="Results directory")
     args = parser.parse_args()
@@ -265,13 +262,13 @@ def main():
         print(f"Error: {layer_dir} not found", file=sys.stderr)
         sys.exit(1)
 
-    csv_file = layer_dir / "detailed.csv"
-    if not csv_file.exists():
-        print(f"No detailed output found: {csv_file}", file=sys.stderr)
+    parquet_file = layer_dir / "detailed.parquet"
+    if not parquet_file.exists():
+        print(f"No detailed output found: {parquet_file}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Processing {csv_file.name}...")
-    stats, event_counts = generate_stats(csv_file)
+    print(f"Processing {parquet_file.name}...")
+    stats, event_counts = generate_stats(parquet_file)
 
     dq = load_data_quality(layer_dir, event_counts)
     if dq:

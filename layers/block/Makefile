@@ -79,8 +79,8 @@ else
 	$(Q)echo -e "bpftrace collection is running!\n"
 endif
 
-.PHONY: stop-collection
-stop-collection:
+.PHONY: stop-profiling
+stop-profiling:
 	$(Q)for pidfile in $(PIDS_DIR)/*.pid; do \
 		if [ -f "$$pidfile" ]; then \
 			pid=$$(cat "$$pidfile"); \
@@ -93,27 +93,32 @@ stop-collection:
 	$(Q)rm -rf "$(PIDS_DIR)"
 	@echo "block collection stopped"
 
+.PHONY: csv-to-parquet
+csv-to-parquet: ensure-results-exists
 ifeq ($(MODE),detailed)
 	$(Q)if [ -f "$(RESULTS_DIR)/block/detailed.csv" ]; then \
-		$(MAKE) generate-detailed-stats; \
-	fi
-else
-	$(Q)if [ -f "$(RESULTS_DIR)/block/trace.out" ]; then \
-		$(MAKE) generate-stats; \
+		python "../../util/csv_to_parquet.py" "$(RESULTS_DIR)/block/detailed.csv" $(ERR_REDIRECT) $(OUT_REDIRECT) && \
+		rm -f "$(RESULTS_DIR)/block/detailed.csv"; \
 	fi
 endif
 
+.PHONY: stop-collection
+stop-collection: stop-profiling csv-to-parquet generate-stats
+
 .PHONY: generate-stats
 generate-stats: ensure-results-exists
-	$(Q)python "./util/generate_summary_stats.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
-	@echo "block stats generated"
-
-.PHONY: generate-detailed-stats
-generate-detailed-stats: ensure-results-exists
+ifeq ($(MODE),detailed)
 	$(Q)python "./util/generate_detailed_stats.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
+else
+	$(Q)python "./util/generate_summary_stats.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
+endif
 	@echo "block stats generated"
 
 .PHONY: visualize
 visualize: ensure-results-exists
+	$(Q)if [ -f "$(RESULTS_DIR)/block/detailed.csv" ]; then \
+		python "../../util/csv_to_parquet.py" "$(RESULTS_DIR)/block/detailed.csv" $(ERR_REDIRECT) $(OUT_REDIRECT) && \
+		rm -f "$(RESULTS_DIR)/block/detailed.csv"; \
+	fi
 	$(Q)python "./util/visualize.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
 	$(Q)echo -e "block visualization generated"

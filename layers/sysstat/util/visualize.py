@@ -200,12 +200,14 @@ def main():
                 if wr:
                     ax.plot(range(len(wr)), wr,
                             label="write", color="#ff7f0e", linewidth=0.8)
+                ax.set_yscale("symlog", linthresh=1)
                 ax.set_xlabel("Time (s)")
                 ax.set_ylabel("KB/s")
                 ax.set_title("Disk IO")
                 ax.legend(fontsize="small", loc="upper left",
                           bbox_to_anchor=(1.02, 1.0))
             else:
+                ax.set_yscale("symlog", linthresh=1)
                 ax.set_title("Disk IO")
                 ax.text(0.5, 0.5, "No data", ha="center", va="center",
                         transform=ax.transAxes)
