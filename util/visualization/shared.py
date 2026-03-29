@@ -10,11 +10,24 @@ import polars as pl
 TYPE_COLORS = {
     "read": "#cecece",
     "write": "#a559aa",
-    "pread64": "#59a89c",
-    "pwrite64": "#f0c571",
+    "pread64": "#cecece",
+    "pwrite64": "#a559aa",
     "flush": "#e02b35",
     "discard": "#082a54",
     "write_zeros": "#d47264",
+}
+
+TYPE_LINESTYLES = {
+    "read": "solid",
+    "write": "solid",
+    "pread64": "dashed",
+    "pwrite64": "dashed",
+}
+
+TYPE_ORDER = {
+    "read": 0, "write": 1,
+    "pread64": 2, "pwrite64": 3,
+    "flush": 4, "discard": 5, "write_zeros": 6,
 }
 
 DEFAULT_COLOR_CYCLE = plt.rcParams["axes.prop_cycle"].by_key()["color"]
@@ -24,6 +37,15 @@ MAX_CDF_POINTS = 10_000
 
 def _color_for(typ, idx=0):
     return TYPE_COLORS.get(typ, DEFAULT_COLOR_CYCLE[idx % len(DEFAULT_COLOR_CYCLE)])
+
+
+def _linestyle_for(typ):
+    return TYPE_LINESTYLES.get(typ, "solid")
+
+
+def sort_types(types):
+    """Sort IO types in canonical order: read, write, pread64, pwrite64, ..."""
+    return sorted(types, key=lambda t: TYPE_ORDER.get(t, 99))
 
 
 def _subsample_cdf(sorted_vals, max_points=MAX_CDF_POINTS):
@@ -37,7 +59,7 @@ def _subsample_cdf(sorted_vals, max_points=MAX_CDF_POINTS):
 
 def plot_type_distribution(ax, counts_by_type):
     """Pie chart of IO type distribution with side legend."""
-    types = list(counts_by_type.keys())
+    types = sort_types(counts_by_type.keys())
     counts = [counts_by_type[t] for t in types]
     total = sum(counts)
     colors = [_color_for(t, i) for i, t in enumerate(types)]
@@ -45,7 +67,7 @@ def plot_type_distribution(ax, counts_by_type):
 
     wedges, _ = ax.pie(counts, colors=colors, startangle=90)
     ax.legend(wedges, labels, fontsize="small", loc="center left",
-              bbox_to_anchor=(1.02, 0.5))
+              bbox_to_anchor=(1.05, 0.5))
     ax.set_title("Type Distribution")
 
 
@@ -62,7 +84,8 @@ def plot_inflight_from_column(ax, df, type_col, types,
             continue
         ax.plot(typ_df["sec"].to_numpy(),
                 typ_df[inflight_col].to_numpy().clip(min=0),
-                label=typ, color=_color_for(typ, i), linewidth=0.8)
+                label=typ, color=_color_for(typ, i),
+                linestyle=_linestyle_for(typ), linewidth=0.8)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Inflight")
     ax.set_title(title)
@@ -81,7 +104,8 @@ def plot_cumulated_mb_over_time(ax, df, type_col, bytes_col, types):
             continue
         cum_bytes = typ_df[bytes_col].cum_sum().to_numpy() / (1024 * 1024)
         ax.plot(typ_df["sec"].to_numpy(), cum_bytes,
-                label=typ, color=_color_for(typ, i), linewidth=0.8)
+                label=typ, color=_color_for(typ, i),
+                linestyle=_linestyle_for(typ), linewidth=0.8)
 
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Cumulative MB")
@@ -97,7 +121,8 @@ def plot_io_size_cdf(ax, df, type_col, bytes_col, types):
             continue
         sorted_vals = np.sort(vals)
         sorted_vals, cdf = _subsample_cdf(sorted_vals)
-        ax.plot(sorted_vals, cdf, label=typ, color=_color_for(typ, i), linewidth=0.8)
+        ax.plot(sorted_vals, cdf, label=typ, color=_color_for(typ, i),
+                linestyle=_linestyle_for(typ), linewidth=0.8)
 
     ax.set_xscale("log")
     ax.set_xlabel("IO Size (bytes)")
@@ -115,7 +140,8 @@ def plot_io_latency_cdf(ax, df, type_col, latency_col, types):
             continue
         sorted_vals = np.sort(vals)
         sorted_vals, cdf = _subsample_cdf(sorted_vals)
-        ax.plot(sorted_vals / 1000, cdf, label=typ, color=_color_for(typ, i), linewidth=0.8)
+        ax.plot(sorted_vals / 1000, cdf, label=typ, color=_color_for(typ, i),
+                linestyle=_linestyle_for(typ), linewidth=0.8)
 
     ax.set_xscale("log")
     ax.set_xlabel("Latency (us)")
@@ -140,12 +166,12 @@ def plot_gap_cdf(ax, df, type_col, sector_or_offset_col, bytes_col, types,
         gaps = np.abs(locations[1:] - expected)
         sorted_gaps = np.sort(gaps)
         sorted_gaps, cdf = _subsample_cdf(sorted_gaps)
-        cdf = cdf * 100  # percentage
-        ax.plot(sorted_gaps, cdf, label=typ, color=_color_for(typ, i), linewidth=0.8)
+        ax.plot(sorted_gaps, cdf, label=typ, color=_color_for(typ, i),
+                linestyle=_linestyle_for(typ), linewidth=0.8)
 
     ax.set_xscale("symlog")
     ax.set_xlabel(xlabel)
-    ax.set_ylabel("Cumulative %")
+    ax.set_ylabel("CDF")
     ax.set_title("Gap CDF")
     ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
@@ -182,7 +208,7 @@ def build_dashboard(rows, col_titles, title, output_path):
             axes[r, c].set_ylim(y_min, y_max)
 
     # Leave room at top for suptitle and left for row labels
-    fig.tight_layout(pad=1.5, h_pad=3.0, w_pad=2.0,
+    fig.tight_layout(pad=1.5, h_pad=3.0, w_pad=3.5,
                      rect=[0.03, 0, 1, 0.96])
 
     # Add row labels on the far left after layout

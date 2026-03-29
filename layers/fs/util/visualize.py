@@ -9,10 +9,11 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 import numpy as np
 
-from visualization.shared import (_color_for, _subsample_cdf, build_dashboard,
-                                   plot_cumulated_mb_over_time,
+from visualization.shared import (_color_for, _linestyle_for, _subsample_cdf,
+                                   build_dashboard, plot_cumulated_mb_over_time,
                                    plot_inflight_from_column, plot_io_latency_cdf,
-                                   plot_io_size_cdf, plot_type_distribution)
+                                   plot_io_size_cdf, plot_type_distribution,
+                                   sort_types)
 
 LAYER = "fs"
 IO_SYSCALLS = {"read", "write", "pread64", "pwrite64"}
@@ -150,12 +151,12 @@ def _plot_fs_gap_cdf(ax, parquet_path, types, comm_filter=None):
 
         sorted_gaps = np.sort(gaps)
         sorted_gaps, cdf = _subsample_cdf(sorted_gaps)
-        cdf = cdf * 100  # percentage
-        ax.plot(sorted_gaps, cdf, label=typ, color=_color_for(typ, i), linewidth=0.8)
+        ax.plot(sorted_gaps, cdf, label=typ, color=_color_for(typ, i),
+                linestyle=_linestyle_for(typ), linewidth=0.8)
 
     ax.set_xscale("symlog")
     ax.set_xlabel("Gap (bytes)")
-    ax.set_ylabel("Cumulative %")
+    ax.set_ylabel("CDF")
     ax.set_title("Gap CDF")
     ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
@@ -181,7 +182,7 @@ def _build_row(label, parquet_path, comm_filter=None):
                  .group_by("syscall").len()
                  .collect(engine="streaming"))
     counts = dict(zip(*counts_df.select("syscall", "len").get_columns()))
-    types = sorted(counts.keys())
+    types = sort_types(counts.keys())
 
     # Pre-compute ts_min once (tiny scan)
     ts_min = (_scan(["timestamp_ns"], syscall_filter=io_list)

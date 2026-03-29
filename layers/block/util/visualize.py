@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "u
 from visualization.shared import (build_dashboard, plot_cumulated_mb_over_time,
                                    plot_gap_cdf, plot_inflight_from_column,
                                    plot_io_latency_cdf, plot_io_size_cdf,
-                                   plot_type_distribution)
+                                   plot_type_distribution, sort_types)
 
 LAYER = "block"
 WINDOW_NS = 1_000_000_000
@@ -33,7 +33,7 @@ def _build_row(label, parquet_path, comm_filter=None):
                  .group_by("op").len()
                  .collect(engine="streaming"))
     counts = dict(zip(*counts_df.select("op", "len").get_columns()))
-    types = sorted(counts.keys())
+    types = sort_types(counts.keys())
 
     # Pre-compute ts_min once (tiny scan)
     ts_min = (_scan(["timestamp_ns"])
