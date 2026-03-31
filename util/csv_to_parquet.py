@@ -17,6 +17,11 @@ import polars as pl
 
 STRING_COLS = {"event", "op", "syscall", "comm", "rq"}
 
+# Columns that can be empty (nullable) but must be numeric, not Utf8.
+# Polars infers Utf8 when a numeric column has empty cells in CSV.
+INT_COLS = {"latency_ns", "timestamp_ns", "bytes", "sector",
+            "q_inflight", "d_inflight", "offset", "count"}
+
 
 def convert(csv_path):
     csv_path = Path(csv_path)
@@ -31,10 +36,16 @@ def convert(csv_path):
             return
         parquet_path.unlink()
 
-    # Read header to build schema overrides for string columns
+    # Read header to build schema overrides: strings stay Utf8, numeric cols
+    # that can be empty are forced to Int64 so Polars doesn't infer Utf8.
     with open(csv_path) as f:
         header = f.readline().strip().split(",")
-    overrides = {col: pl.Utf8 for col in header if col in STRING_COLS}
+    overrides = {}
+    for col in header:
+        if col in STRING_COLS:
+            overrides[col] = pl.Utf8
+        elif col in INT_COLS:
+            overrides[col] = pl.Int64
 
     print(f"Converting {csv_path.name} -> {parquet_path.name}...")
     pl.scan_csv(csv_path, schema_overrides=overrides).sink_parquet(parquet_path)
