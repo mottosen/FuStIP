@@ -221,6 +221,7 @@ def main():
     build_dashboard(
         rows=rows,
         col_titles=["CPU %", "Memory %", "Disk IO (KB/s)"],
+        col_ylims=[(0, 100), (0, 100), None],
         title="Sysstat Dashboard",
         output_path=output,
     )

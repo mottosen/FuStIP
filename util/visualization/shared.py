@@ -176,7 +176,7 @@ def plot_gap_cdf(ax, df, type_col, sector_or_offset_col, bytes_col, types,
     ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
 
-def build_dashboard(rows, col_titles, title, output_path):
+def build_dashboard(rows, col_titles, title, output_path, col_ylims=None):
     """Build a multi-row dashboard.
 
     Args:
@@ -186,6 +186,8 @@ def build_dashboard(rows, col_titles, title, output_path):
         col_titles: list of column title strings
         title: overall figure title
         output_path: Path to save PNG
+        col_ylims: optional list of (ymin, ymax) tuples per column, or None
+            for auto-scaled columns. Length must match col_titles.
     """
     nrows = len(rows)
     ncols = len(col_titles)
@@ -200,10 +202,13 @@ def build_dashboard(rows, col_titles, title, output_path):
 
     # Unify y-axes per column, starting at 0 for non-negative data
     for c in range(ncols):
-        y_min = min(axes[r, c].get_ylim()[0] for r in range(nrows))
-        y_max = max(axes[r, c].get_ylim()[1] for r in range(nrows))
-        if y_min >= 0:
-            y_min = 0
+        if col_ylims and col_ylims[c] is not None:
+            y_min, y_max = col_ylims[c]
+        else:
+            y_min = min(axes[r, c].get_ylim()[0] for r in range(nrows))
+            y_max = max(axes[r, c].get_ylim()[1] for r in range(nrows))
+            if y_min >= 0:
+                y_min = 0
         for r in range(nrows):
             axes[r, c].set_ylim(y_min, y_max)
 
