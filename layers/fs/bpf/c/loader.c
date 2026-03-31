@@ -8,12 +8,15 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <ctype.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include "standalone.skel.h"
 
 static volatile sig_atomic_t running = 1;
 static FILE *output;
+#define MAX_CONTAINER_FILTERS 32
+#define MAX_COMM_FILTERS 8
 
 static const char *syscall_names[] = {
 	[0]  = "read",
@@ -125,7 +128,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 
 static void usage(const char *prog)
 {
-	fprintf(stderr, "Usage: %s -o <output_csv> [-f <comm_filter[,comm2,...]>] [-c <container_name>]\n", prog);
+	fprintf(stderr, "Usage: %s -o <output_csv> [-f <comm_filter[,comm2,...]>] [-c <container_name[,container2,...]>]\n", prog);
 	fprintf(stderr, "  -f (comm) or -c (container) required; both enables OR mode\n");
 	exit(1);
 }
@@ -139,12 +142,41 @@ static int parse_comm_filters(struct standalone_bpf *skel, const char *filter)
 	int count = 0;
 	char *saveptr = NULL;
 	char *token = strtok_r(buf, ",", &saveptr);
-	while (token && count < 8) {
+	while (token && count < MAX_COMM_FILTERS) {
 		strncpy((char *)skel->rodata->comm_filters[count], token, 15);
 		count++;
 		token = strtok_r(NULL, ",", &saveptr);
 	}
+	if (token)
+		fprintf(stderr, "Warning: only first %d comm filters are used\n", MAX_COMM_FILTERS);
 	skel->rodata->num_comm_filters = count;
+	return count;
+}
+
+static int parse_container_filters(const char *csv, char out[][128], int max_entries)
+{
+	char buf[1024];
+	strncpy(buf, csv, sizeof(buf) - 1);
+	buf[sizeof(buf) - 1] = '\0';
+
+	int count = 0;
+	char *saveptr = NULL;
+	char *token = strtok_r(buf, ",", &saveptr);
+	while (token && count < max_entries) {
+		while (*token && isspace((unsigned char)*token))
+			token++;
+		char *end = token + strlen(token);
+		while (end > token && isspace((unsigned char)*(end - 1)))
+			*--end = '\0';
+		if (*token != '\0') {
+			strncpy(out[count], token, 127);
+			out[count][127] = '\0';
+			count++;
+		}
+		token = strtok_r(NULL, ",", &saveptr);
+	}
+	if (token)
+		fprintf(stderr, "Warning: only first %d containers are used\n", max_entries);
 	return count;
 }
 
@@ -208,7 +240,10 @@ int main(int argc, char **argv)
 {
 	char *output_path = NULL;
 	char *filter = NULL;
-	char *container_name = NULL;
+	char *container_filter = NULL;
+	char container_names[MAX_CONTAINER_FILTERS][128] = {};
+	int container_count = 0;
+	int container_resolved[MAX_CONTAINER_FILTERS] = {};
 	int opt;
 
 	while ((opt = getopt(argc, argv, "o:f:c:")) != -1) {
@@ -220,15 +255,23 @@ int main(int argc, char **argv)
 			filter = optarg;
 			break;
 		case 'c':
-			container_name = optarg;
+			container_filter = optarg;
 			break;
 		default:
 			usage(argv[0]);
 		}
 	}
 
-	if (!output_path || (!filter && !container_name))
+	if (!output_path || (!filter && !container_filter))
 		usage(argv[0]);
+
+	if (container_filter) {
+		container_count = parse_container_filters(container_filter, container_names, MAX_CONTAINER_FILTERS);
+		if (container_count == 0) {
+			fprintf(stderr, "Error: no valid container names parsed from -c\n");
+			return 1;
+		}
+	}
 
 	signal(SIGINT, sig_handler);
 	signal(SIGTERM, sig_handler);
@@ -242,9 +285,9 @@ int main(int argc, char **argv)
 	// Set filters in rodata
 	if (filter)
 		parse_comm_filters(skel, filter);
-	if (container_name)
+	if (container_count > 0)
 		skel->rodata->filter_by_mntns = true;
-	if (filter && container_name)
+	if (filter && container_count > 0)
 		skel->rodata->filter_or_mode = true;
 
 	int err = standalone_bpf__load(skel);
@@ -278,26 +321,31 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (filter && container_name)
-		fprintf(stderr, "FS layer detailed tracing started (comm: %s, container: %s, OR mode)...\n",
-			filter, container_name);
+	if (filter && container_count > 0)
+		fprintf(stderr, "FS layer detailed tracing started (comm: %s, containers: %s, OR mode)...\n",
+			filter, container_filter);
 	else if (filter)
 		fprintf(stderr, "FS layer detailed tracing started (filter: %s)...\n",
 			filter);
 	else
-		fprintf(stderr, "FS layer detailed tracing started (container: %s)...\n",
-			container_name);
+		fprintf(stderr, "FS layer detailed tracing started (containers: %s)...\n",
+			container_filter);
 
 	// Event loop
-	int container_resolved = 0;
+	int num_resolved = 0;
 	time_t last_attempt = 0;
 
 	while (running) {
-		if (container_name && !container_resolved) {
+		if (container_count > 0 && num_resolved < container_count) {
 			time_t now = time(NULL);
 			if (now - last_attempt >= 1) {
-				container_resolved = try_resolve_container(
-					skel, container_name);
+				for (int i = 0; i < container_count; i++) {
+					if (!container_resolved[i] &&
+					    try_resolve_container(skel, container_names[i])) {
+						container_resolved[i] = 1;
+						num_resolved++;
+					}
+				}
 				last_attempt = now;
 			}
 		}

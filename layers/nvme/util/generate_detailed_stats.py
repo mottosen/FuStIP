@@ -133,6 +133,55 @@ def generate_stats(parquet_path):
 
     del agg
 
+    if "comm" in schema:
+        per_comm = {}
+        comm_agg = (pl.scan_parquet(parquet_path)
+                      .filter(pl.col("comm").is_not_null())
+                      .filter(pl.col("event").is_in(["setup", "complete"]))
+                      .group_by("comm", "event", "op")
+                      .agg(
+                          pl.len().alias("count"),
+                          pl.col("bytes").sum().alias("total_bytes"),
+                          pl.col("timestamp_ns").min().alias("ts_min"),
+                          pl.col("timestamp_ns").max().alias("ts_max"),
+                      )
+                      .collect(engine="streaming"))
+        for comm in comm_agg["comm"].unique().sort().to_list():
+            comm_rows = comm_agg.filter(pl.col("comm") == comm)
+            comm_counters = {}
+
+            comm_complete = comm_rows.filter(pl.col("event") == "complete")
+            if len(comm_complete) > 0:
+                comm_counters["cmd_completed"] = dict(zip(
+                    comm_complete["op"].to_list(),
+                    [int(v) for v in comm_complete["count"].to_list()]
+                ))
+                comm_counters["cmd_total_bytes"] = dict(zip(
+                    comm_complete["op"].to_list(),
+                    [int(v) for v in comm_complete["total_bytes"].to_list()]
+                ))
+
+            comm_setup = comm_rows.filter(pl.col("event") == "setup")
+            if len(comm_setup) > 0:
+                comm_counters["cmd_setup"] = dict(zip(
+                    comm_setup["op"].to_list(),
+                    [int(v) for v in comm_setup["count"].to_list()]
+                ))
+
+            comm_ts_min = comm_rows["ts_min"].min()
+            comm_ts_max = comm_rows["ts_max"].max()
+            if comm_ts_min is not None and comm_ts_max is not None and comm_ts_max > comm_ts_min:
+                comm_duration_s = (comm_ts_max - comm_ts_min) / 1e9
+            else:
+                comm_duration_s = 0
+
+            comm_derived = {"duration_s": round(comm_duration_s, 2)}
+            comm_derived.update(derive_throughput(
+                comm_counters, comm_duration_s, "cmd_completed", "cmd_total_bytes"
+            ))
+            per_comm[comm] = {"counters": comm_counters, "derived": comm_derived}
+        result["per_comm"] = per_comm
+
     # --- Scan 2: Distributions (Polars-native quantiles, no data in Python) ---
     lf = pl.scan_parquet(parquet_path)
     lat_stats = (lf.filter(pl.col("event") == "complete")

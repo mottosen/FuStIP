@@ -241,6 +241,66 @@ def generate_stats(parquet_path):
 
     del agg
 
+    if "comm" in schema:
+        per_comm = {}
+        comm_agg = (pl.scan_parquet(parquet_path)
+                      .filter(pl.col("comm").is_not_null())
+                      .group_by("comm", "event", "syscall")
+                      .agg(
+                          pl.len().alias("count"),
+                          pl.col("bytes").sum().alias("total_bytes"),
+                          pl.col("timestamp_ns").min().alias("ts_min"),
+                          pl.col("timestamp_ns").max().alias("ts_max"),
+                          pl.when(pl.col("bytes") > 0).then(pl.col("bytes")).otherwise(0).sum().alias("pos_bytes"),
+                      )
+                      .collect(engine="streaming"))
+        for comm in comm_agg["comm"].unique().sort().to_list():
+            comm_rows = comm_agg.filter(pl.col("comm") == comm)
+            comm_counters = {}
+
+            comm_exit_io = comm_rows.filter((pl.col("event") == "exit") & pl.col("syscall").is_in(io_syscalls_list))
+            if len(comm_exit_io) > 0:
+                comm_counters["sc_completed"] = dict(zip(
+                    comm_exit_io["syscall"].to_list(),
+                    [int(v) for v in comm_exit_io["count"].to_list()]
+                ))
+
+            comm_enter_io = comm_rows.filter((pl.col("event") == "enter") & pl.col("syscall").is_in(io_syscalls_list))
+            if len(comm_enter_io) > 0:
+                comm_counters["sc_entered"] = dict(zip(
+                    comm_enter_io["syscall"].to_list(),
+                    [int(v) for v in comm_enter_io["count"].to_list()]
+                ))
+
+            if len(comm_exit_io) > 0:
+                comm_pos_bytes = comm_exit_io.filter(pl.col("pos_bytes") > 0)
+                if len(comm_pos_bytes) > 0:
+                    comm_counters["sc_total_bytes"] = dict(zip(
+                        comm_pos_bytes["syscall"].to_list(),
+                        [int(v) for v in comm_pos_bytes["pos_bytes"].to_list()]
+                    ))
+
+            comm_non_io_enters = comm_rows.filter((pl.col("event") == "enter") & ~pl.col("syscall").is_in(io_syscalls_list))
+            if len(comm_non_io_enters) > 0:
+                comm_counters["sc_count"] = dict(zip(
+                    comm_non_io_enters["syscall"].to_list(),
+                    [int(v) for v in comm_non_io_enters["count"].to_list()]
+                ))
+
+            comm_ts_min = comm_rows["ts_min"].min()
+            comm_ts_max = comm_rows["ts_max"].max()
+            if comm_ts_min is not None and comm_ts_max is not None and comm_ts_max > comm_ts_min:
+                comm_duration_s = (comm_ts_max - comm_ts_min) / 1e9
+            else:
+                comm_duration_s = 0
+
+            comm_derived = {"duration_s": round(comm_duration_s, 2)}
+            comm_derived.update(derive_throughput(
+                comm_counters, comm_duration_s, "sc_completed", "sc_total_bytes"
+            ))
+            per_comm[comm] = {"counters": comm_counters, "derived": comm_derived}
+        result["per_comm"] = per_comm
+
     # --- Scan 2: Distributions (Polars-native quantiles, no data in Python) ---
     print("  Scan 2: distributions...", flush=True)
     lf = pl.scan_parquet(parquet_path)

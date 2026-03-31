@@ -19,17 +19,23 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from stats_generation.shared import tseries_stats
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from container_map import build_label_map, get_label_order
 
-def parse_csv(path, processes=None):
+
+def parse_csv(path, label_map=None, processes=None):
     """Read a CSV file and return list of row dicts.
 
-    If processes is provided, remap command names not in the list to "other".
+    If label_map is provided, remap command names via the map (unmapped → "other").
+    If processes is provided (legacy), remap command names not in the list to "other".
     """
     rows = []
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if processes is not None:
+            if label_map is not None:
+                row["command"] = label_map.get(row["command"], "other")
+            elif processes is not None:
                 if row["command"] not in processes:
                     row["command"] = "other"
             rows.append(row)
@@ -136,13 +142,22 @@ def main():
         help="Space-separated list of process names to track individually. "
              "All others are grouped as 'other'.",
     )
+    parser.add_argument(
+        "--container", "-c",
+        type=str.split,
+        default=None,
+        help="Space-separated container names for container-based grouping.",
+    )
     args = parser.parse_args()
 
     processes = args.process
+    containers = args.container
     sysstat_dir = args.results_dir / "sysstat"
     if not sysstat_dir.is_dir():
         print(f"Error: {sysstat_dir} not found", file=sys.stderr)
         sys.exit(1)
+
+    label_map = build_label_map(sysstat_dir, processes, containers)
 
     result = {}
 
@@ -152,7 +167,7 @@ def main():
                        ("mem", sysstat_dir / "mem.csv"),
                        ("dev", sysstat_dir / "dev.csv")]:
         if path.exists():
-            csv_data[name] = parse_csv(path, processes)
+            csv_data[name] = parse_csv(path, label_map=label_map, processes=processes if label_map is None else None)
             print(f"  Processed {path.name}: {len(csv_data[name])} rows")
 
     if not csv_data:
@@ -169,6 +184,8 @@ def main():
         result["mem"] = {"per_command": mem_stats(csv_data["mem"], duration_s)}
     if "dev" in csv_data:
         result["dev"] = {"per_command": dev_stats(csv_data["dev"])}
+
+    result["label_order"] = get_label_order(containers, processes)
 
     output_file = sysstat_dir / "sysstat-stats.json"
     with open(output_file, "w") as f:

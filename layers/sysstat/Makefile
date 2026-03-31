@@ -42,6 +42,11 @@ start-collection: ensure-results-exists ensure-sudo
 		> "$(RESULTS_DIR)/sysstat/pidstat.out" \
 		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/pidstat.pid"
 
+ifdef CONTAINER_FILTER
+	$(Q)python "./util/poll_container_comms.py" "$(RESULTS_DIR)/sysstat" "$(CONTAINER_FILTER)" \
+		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/poller.pid"
+endif
+
 	$(Q)echo -e "sysstat collection is running!\n"
 
 .PHONY: stop-profiling
@@ -75,18 +80,16 @@ parse: ensure-results-exists
 
 .PHONY: generate-stats
 generate-stats: ensure-results-exists
-ifdef COMM_FILTER
-	$(Q)python "./util/generate_stats.py" --process "$$(echo '$(COMM_FILTER)' | tr ',' ' ')" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
-else
-	$(Q)python "./util/generate_stats.py" $(OPTIONS) "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
-endif
+	$(Q)python "./util/generate_stats.py" \
+		$(if $(COMM_FILTER),--process "$$(echo '$(COMM_FILTER)' | tr ',' ' ')") \
+		$(if $(CONTAINER_FILTER),--container "$$(echo '$(CONTAINER_FILTER)' | tr ',' ' ')") \
+		"$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
 	@echo "sysstat stats generated"
 
 .PHONY: visualize
 visualize: ensure-results-exists
-ifdef COMM_FILTER
-	$(Q)python "./util/visualize.py" --process "$$(echo '$(COMM_FILTER)' | tr ',' ' ')" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
-else
-	$(Q)python "./util/visualize.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
-endif
+	$(Q)python "./util/visualize.py" \
+		$(if $(COMM_FILTER),--process "$$(echo '$(COMM_FILTER)' | tr ',' ' ')") \
+		$(if $(CONTAINER_FILTER),--container "$$(echo '$(CONTAINER_FILTER)' | tr ',' ' ')") \
+		"$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
 	$(Q)echo -e "sysstat visualization generated"
