@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared utility: build comm→label map from container_map.json + COMM_FILTER.
+"""Shared utility: build label maps from container_map.json + COMM/CONTAINER filters.
 
 Imported by both generate_stats.py and visualize.py.
 """
@@ -9,39 +9,73 @@ import sys
 from pathlib import Path
 
 
-def build_label_map(sysstat_dir: Path, comm_filter: list | None,
-                    container_filter: list | None) -> dict | None:
-    """Return {raw_comm: display_label} or None if no filtering configured.
-
-    Priority: container_map.json entries first (first container wins on conflict),
-    then COMM_FILTER host processes (identity mapping), rest → "other" at call site.
-    """
+def _load_container_data(sysstat_dir: Path) -> dict[str, dict[str, set]]:
+    """Return normalized container data: {container: {"comms": set, "tgids": set}}."""
     container_map_path = sysstat_dir / "container_map.json"
-    has_map = container_map_path.exists()
-    has_comms = bool(comm_filter)
+    if not container_map_path.exists():
+        return {}
 
-    if not has_map and not has_comms:
+    data = json.loads(container_map_path.read_text())
+    containers = {}
+    for cname, raw in data.get("containers", {}).items():
+        if isinstance(raw, dict):
+            comms = set(raw.get("comms", []))
+            tgids = set(str(v) for v in raw.get("tgids", raw.get("pids", [])))
+        else:
+            # Backward compatibility with v1 format: {"containers": {"name": ["comm", ...]}}
+            comms = set(raw or [])
+            tgids = set()
+        containers[cname] = {"comms": comms, "tgids": tgids}
+    return containers
+
+
+def build_label_maps(sysstat_dir: Path, comm_filter: list | None) -> tuple[dict, dict] | None:
+    """Return (tgid_map, comm_map) or None if no filtering configured."""
+    containers = _load_container_data(sysstat_dir)
+    has_comms = bool(comm_filter)
+    if not containers and not has_comms:
         return None
 
-    label_map: dict[str, str] = {}
+    tgid_map: dict[str, str] = {}
+    comm_map: dict[str, str] = {}
 
-    if has_map:
-        data = json.loads(container_map_path.read_text())
-        for cname, comms in data["containers"].items():
-            for comm in comms:
-                if comm not in label_map:
-                    label_map[comm] = cname
-                else:
-                    print(f"Warning: comm '{comm}' already mapped to "
-                          f"'{label_map[comm]}', skipping for '{cname}'",
-                          file=sys.stderr)
+    for cname, payload in containers.items():
+        for tgid in payload["tgids"]:
+            if tgid not in tgid_map:
+                tgid_map[tgid] = cname
+            else:
+                print(f"Warning: tgid '{tgid}' already mapped to "
+                      f"'{tgid_map[tgid]}', skipping for '{cname}'",
+                      file=sys.stderr)
+        for comm in payload["comms"]:
+            if comm not in comm_map:
+                comm_map[comm] = cname
+            else:
+                print(f"Warning: comm '{comm}' already mapped to "
+                      f"'{comm_map[comm]}', skipping for '{cname}'",
+                      file=sys.stderr)
 
     if has_comms:
         for comm in comm_filter:
-            if comm not in label_map:
-                label_map[comm] = comm  # host process: identity label
+            if comm not in comm_map:
+                comm_map[comm] = comm  # host process: identity label
 
-    return label_map
+    return tgid_map, comm_map
+
+
+def remap_rows(rows: list[dict], label_maps: tuple[dict, dict] | None) -> bool:
+    """Apply tgid-first then comm-based remapping. Returns True if mapping applied."""
+    if label_maps is None:
+        return False
+
+    tgid_map, comm_map = label_maps
+    for row in rows:
+        tgid = row.get("tgid")
+        if tgid in tgid_map:
+            row["command"] = tgid_map[tgid]
+        else:
+            row["command"] = comm_map.get(row["command"], "other")
+    return True
 
 
 def get_label_order(container_filter: list | None,

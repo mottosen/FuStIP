@@ -19,7 +19,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 from visualization.shared import build_dashboard, _color_for, DEFAULT_COLOR_CYCLE
-from container_map import build_label_map, get_label_order
+from container_map import build_label_maps, get_label_order, remap_rows
 
 MAX_ROWS = 5
 
@@ -127,11 +127,10 @@ def main():
     print("Reading sysstat CSVs...")
 
     # Select top commands or use filter, remap rest to "other"
-    label_map = build_label_map(sysstat_dir, args.process, args.container)
-    if label_map is not None:
+    label_maps = build_label_maps(sysstat_dir, args.process)
+    if label_maps is not None:
         for rows in (cpu_rows, mem_rows, dev_rows):
-            for row in rows:
-                row["command"] = label_map.get(row["command"], "other")
+            remap_rows(rows, label_maps)
     else:
         _select_and_remap(cpu_rows, mem_rows, dev_rows, process_filter)
 

@@ -20,25 +20,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "u
 from stats_generation.shared import tseries_stats
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from container_map import build_label_map, get_label_order
+from container_map import build_label_maps, get_label_order, remap_rows
 
 
-def parse_csv(path, label_map=None, processes=None):
+def parse_csv(path, label_maps=None, processes=None):
     """Read a CSV file and return list of row dicts.
 
-    If label_map is provided, remap command names via the map (unmapped → "other").
+    If label_maps is provided, remap using tgid-first then comm map (unmapped → "other").
     If processes is provided (legacy), remap command names not in the list to "other".
     """
     rows = []
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if label_map is not None:
-                row["command"] = label_map.get(row["command"], "other")
-            elif processes is not None:
+            if processes is not None:
                 if row["command"] not in processes:
                     row["command"] = "other"
             rows.append(row)
+    remap_rows(rows, label_maps)
     return rows
 
 
@@ -157,7 +156,7 @@ def main():
         print(f"Error: {sysstat_dir} not found", file=sys.stderr)
         sys.exit(1)
 
-    label_map = build_label_map(sysstat_dir, processes, containers)
+    label_maps = build_label_maps(sysstat_dir, processes)
 
     result = {}
 
@@ -167,7 +166,7 @@ def main():
                        ("mem", sysstat_dir / "mem.csv"),
                        ("dev", sysstat_dir / "dev.csv")]:
         if path.exists():
-            csv_data[name] = parse_csv(path, label_map=label_map, processes=processes if label_map is None else None)
+            csv_data[name] = parse_csv(path, label_maps=label_maps, processes=processes if label_maps is None else None)
             print(f"  Processed {path.name}: {len(csv_data[name])} rows")
 
     if not csv_data:
