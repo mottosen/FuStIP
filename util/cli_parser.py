@@ -132,6 +132,8 @@ def build_layer_vars(layer, args):
     if layer == "sysstat":
         if args.comm_filter:
             vs.append(f"COMM_FILTER={args.comm_filter}")
+        if args.container_filter:
+            vs.append(f"CONTAINER_FILTER={args.container_filter}")
         vs.append(f"RESULTS_DIR={args.results_dir}")
         return vs
 
