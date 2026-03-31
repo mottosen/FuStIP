@@ -162,6 +162,14 @@ def _concurrent(cmds):
     return [f"{cmd} &" for cmd in cmds] + ["wait"]
 
 
+def _concurrent_isolated(cmds):
+    """Run commands concurrently inside a subshell, isolating wait from prior jobs."""
+    if len(cmds) <= 1:
+        return cmds
+    body = " ".join(f"{cmd} &" for cmd in cmds) + " wait"
+    return [f"( {body} )"]
+
+
 def _container_map_start_cmd(args):
     if not args.container_filter:
         return None
@@ -189,11 +197,13 @@ def generate_profile_commands(args):
         map_cmd = _container_map_start_cmd(args)
         if map_cmd:
             cmds.append(map_cmd)
+        layer_cmds = []
         for layer in PROFILE_START_ORDER:
             if layer in args.layers:
                 vs = build_layer_vars(layer, args)
-                cmds.append(f"make -C layers/{layer} start-collection {' '.join(vs)}")
-        return cmds[:1] + _concurrent(cmds[1:]) if map_cmd else _concurrent(cmds)
+                layer_cmds.append(f"make -C layers/{layer} start-collection {' '.join(vs)}")
+        # Keep container-map detached from shell wait; otherwise profile start hangs.
+        return cmds + _concurrent_isolated(layer_cmds)
 
     # stop: parallel stop-profiling, then sequential csv-to-parquet + generate-stats
     stop_cmds = [_container_map_stop_cmd()] if args.container_filter else []
