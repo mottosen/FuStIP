@@ -196,227 +196,200 @@ def generate_stats(parquet_path):
     else:
         duration_s = 0
 
-    # Build counters
-    counters = {}
-
-    exit_io = agg.filter((pl.col("event") == "exit") & pl.col("syscall").is_in(io_syscalls_list))
-    if len(exit_io) > 0:
-        counters["sc_completed"] = dict(zip(
-            exit_io["syscall"].to_list(),
-            [int(v) for v in exit_io["count"].to_list()]
-        ))
-
-    enter_io = agg.filter((pl.col("event") == "enter") & pl.col("syscall").is_in(io_syscalls_list))
-    if len(enter_io) > 0:
-        counters["sc_entered"] = dict(zip(
-            enter_io["syscall"].to_list(),
-            [int(v) for v in enter_io["count"].to_list()]
-        ))
-
-    if len(exit_io) > 0:
-        pos_bytes_rows = exit_io.filter(pl.col("pos_bytes") > 0)
-        if len(pos_bytes_rows) > 0:
-            counters["sc_total_bytes"] = dict(zip(
-                pos_bytes_rows["syscall"].to_list(),
-                [int(v) for v in pos_bytes_rows["pos_bytes"].to_list()]
-            ))
-
-    non_io_enters = agg.filter((pl.col("event") == "enter") & ~pl.col("syscall").is_in(io_syscalls_list))
-    if len(non_io_enters) > 0:
-        counters["sc_count"] = dict(zip(
-            non_io_enters["syscall"].to_list(),
-            [int(v) for v in non_io_enters["count"].to_list()]
-        ))
-
     # Event counts for data quality (avoids separate scan)
     event_agg = agg.group_by("event").agg(pl.col("count").sum())
     event_counts = dict(zip(event_agg["event"].to_list(), event_agg["count"].to_list()))
+    container_labels = set(mntns_map.values())
+    result = {"per_comm": {}, "per_container": {}}
 
-    result = {
-        "counters": counters,
-        "derived": {"duration_s": round(duration_s, 2)},
-        "distributions": {},
-        "tseries": {},
-    }
-
-    throughput = derive_throughput(counters, duration_s, "sc_completed", "sc_total_bytes")
-    result["derived"].update(throughput)
+    def ensure_label_entry(label):
+        bucket = "per_container" if label in container_labels else "per_comm"
+        if label not in result[bucket]:
+            result[bucket][label] = {
+                "counters": {},
+                "derived": {},
+                "distributions": {},
+                "tseries": {},
+                "access_pattern": {},
+            }
+        return result[bucket][label]
 
     del agg
 
-    if "label" in schema:
-        per_comm = {}
-        comm_agg = (add_label_column(pl.scan_parquet(parquet_path), mntns_map)
-                      .filter(pl.col("label").is_not_null())
-                      .group_by("label", "event", "syscall")
-                      .agg(
-                          pl.len().alias("count"),
-                          pl.col("bytes").sum().alias("total_bytes"),
-                          pl.col("timestamp_ns").min().alias("ts_min"),
-                          pl.col("timestamp_ns").max().alias("ts_max"),
-                          pl.when(pl.col("bytes") > 0).then(pl.col("bytes")).otherwise(0).sum().alias("pos_bytes"),
-                      )
-                      .collect(engine="streaming"))
-        for comm in comm_agg["label"].unique().sort().to_list():
-            comm_rows = comm_agg.filter(pl.col("label") == comm)
-            comm_counters = {}
+    comm_agg = (add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+                  .filter(pl.col("label").is_not_null())
+                  .group_by("label", "event", "syscall")
+                  .agg(
+                      pl.len().alias("count"),
+                      pl.col("bytes").sum().alias("total_bytes"),
+                      pl.col("timestamp_ns").min().alias("ts_min"),
+                      pl.col("timestamp_ns").max().alias("ts_max"),
+                      pl.when(pl.col("bytes") > 0).then(pl.col("bytes")).otherwise(0).sum().alias("pos_bytes"),
+                  )
+                  .collect(engine="streaming"))
+    for comm in comm_agg["label"].unique().sort().to_list():
+        comm_rows = comm_agg.filter(pl.col("label") == comm)
+        comm_entry = ensure_label_entry(comm)
+        comm_counters = {}
 
-            comm_exit_io = comm_rows.filter((pl.col("event") == "exit") & pl.col("syscall").is_in(io_syscalls_list))
-            if len(comm_exit_io) > 0:
-                comm_counters["sc_completed"] = dict(zip(
-                    comm_exit_io["syscall"].to_list(),
-                    [int(v) for v in comm_exit_io["count"].to_list()]
-                ))
-
-            comm_enter_io = comm_rows.filter((pl.col("event") == "enter") & pl.col("syscall").is_in(io_syscalls_list))
-            if len(comm_enter_io) > 0:
-                comm_counters["sc_entered"] = dict(zip(
-                    comm_enter_io["syscall"].to_list(),
-                    [int(v) for v in comm_enter_io["count"].to_list()]
-                ))
-
-            if len(comm_exit_io) > 0:
-                comm_pos_bytes = comm_exit_io.filter(pl.col("pos_bytes") > 0)
-                if len(comm_pos_bytes) > 0:
-                    comm_counters["sc_total_bytes"] = dict(zip(
-                        comm_pos_bytes["syscall"].to_list(),
-                        [int(v) for v in comm_pos_bytes["pos_bytes"].to_list()]
-                    ))
-
-            comm_non_io_enters = comm_rows.filter((pl.col("event") == "enter") & ~pl.col("syscall").is_in(io_syscalls_list))
-            if len(comm_non_io_enters) > 0:
-                comm_counters["sc_count"] = dict(zip(
-                    comm_non_io_enters["syscall"].to_list(),
-                    [int(v) for v in comm_non_io_enters["count"].to_list()]
-                ))
-
-            comm_ts_min = comm_rows["ts_min"].min()
-            comm_ts_max = comm_rows["ts_max"].max()
-            if comm_ts_min is not None and comm_ts_max is not None and comm_ts_max > comm_ts_min:
-                comm_duration_s = (comm_ts_max - comm_ts_min) / 1e9
-            else:
-                comm_duration_s = 0
-
-            comm_derived = {"duration_s": round(comm_duration_s, 2)}
-            comm_derived.update(derive_throughput(
-                comm_counters, comm_duration_s, "sc_completed", "sc_total_bytes"
+        comm_exit_io = comm_rows.filter((pl.col("event") == "exit") & pl.col("syscall").is_in(io_syscalls_list))
+        if len(comm_exit_io) > 0:
+            comm_counters["sc_completed"] = dict(zip(
+                comm_exit_io["syscall"].to_list(),
+                [int(v) for v in comm_exit_io["count"].to_list()]
             ))
-            per_comm[comm] = {"counters": comm_counters, "derived": comm_derived}
-        result["per_comm"] = per_comm
 
-    # --- Scan 2: Distributions (Polars-native quantiles, no data in Python) ---
+        comm_enter_io = comm_rows.filter((pl.col("event") == "enter") & pl.col("syscall").is_in(io_syscalls_list))
+        if len(comm_enter_io) > 0:
+            comm_counters["sc_entered"] = dict(zip(
+                comm_enter_io["syscall"].to_list(),
+                [int(v) for v in comm_enter_io["count"].to_list()]
+            ))
+
+        if len(comm_exit_io) > 0:
+            comm_pos_bytes = comm_exit_io.filter(pl.col("pos_bytes") > 0)
+            if len(comm_pos_bytes) > 0:
+                comm_counters["sc_total_bytes"] = dict(zip(
+                    comm_pos_bytes["syscall"].to_list(),
+                    [int(v) for v in comm_pos_bytes["pos_bytes"].to_list()]
+                ))
+
+        comm_non_io_enters = comm_rows.filter((pl.col("event") == "enter") & ~pl.col("syscall").is_in(io_syscalls_list))
+        if len(comm_non_io_enters) > 0:
+            comm_counters["sc_count"] = dict(zip(
+                comm_non_io_enters["syscall"].to_list(),
+                [int(v) for v in comm_non_io_enters["count"].to_list()]
+            ))
+
+        comm_ts_min = comm_rows["ts_min"].min()
+        comm_ts_max = comm_rows["ts_max"].max()
+        if comm_ts_min is not None and comm_ts_max is not None and comm_ts_max > comm_ts_min:
+            comm_duration_s = (comm_ts_max - comm_ts_min) / 1e9
+        else:
+            comm_duration_s = 0
+
+        comm_entry["counters"] = comm_counters
+        comm_derived = {"duration_s": round(comm_duration_s, 2)}
+        comm_derived.update(derive_throughput(
+            comm_counters, comm_duration_s, "sc_completed", "sc_total_bytes"
+        ))
+        comm_entry["derived"] = comm_derived
+
+    # --- Scan 2: Distributions (per label) ---
     print("  Scan 2: distributions...", flush=True)
     lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
     lat_stats = (lf.filter(pl.col("event") == "exit")
                    .filter(pl.col("syscall").is_in(io_syscalls_list))
                    .filter(pl.col("latency_ns").is_not_null() & (pl.col("latency_ns") > 0))
-                   .group_by("syscall")
+                   .group_by("label", "syscall")
                    .agg(_series_stats_exprs("latency_ns"))
-                   .sort("syscall")
+                   .sort("label", "syscall")
                    .collect(engine="streaming"))
-    if len(lat_stats) > 0:
-        result["distributions"]["sc_latencies"] = {
-            row["syscall"]: _row_to_stats(row)
-            for row in lat_stats.iter_rows(named=True)
-        }
+    for row in lat_stats.iter_rows(named=True):
+        ensure_label_entry(row["label"])["distributions"].setdefault("sc_latencies", {})[row["syscall"]] = _row_to_stats(row)
     del lat_stats
 
     lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
     size_stats = (lf.filter(pl.col("event") == "exit")
                     .filter(pl.col("syscall").is_in(io_syscalls_list))
                     .filter(pl.col("bytes") > 0)
-                    .group_by("syscall")
+                    .group_by("label", "syscall")
                     .agg(_series_stats_exprs("bytes"))
-                    .sort("syscall")
+                    .sort("label", "syscall")
                     .collect(engine="streaming"))
-    if len(size_stats) > 0:
-        result["distributions"]["sc_sizes"] = {
-            row["syscall"]: _row_to_stats(row)
-            for row in size_stats.iter_rows(named=True)
-        }
+    for row in size_stats.iter_rows(named=True):
+        ensure_label_entry(row["label"])["distributions"].setdefault("sc_sizes", {})[row["syscall"]] = _row_to_stats(row)
     del size_stats
 
-    # --- Scan 3: Inflight time-series (aggregated, no full-data collect) ---
+    # --- Scan 3: Inflight time-series (per label) ---
     print("  Scan 3: tseries...", flush=True)
     if duration_s > 0:
         window_ns = 1_000_000_000
-        result["tseries"]["sc_inflight"] = {}
 
         lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
         inf_df = (lf.filter(pl.col("syscall").is_in(io_syscalls_list))
                     .with_columns(
                         ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
                     )
-                    .group_by("syscall", "sec")
+                    .group_by("label", "syscall", "sec")
                     .agg(pl.col("inflight").last())
-                    .sort("syscall", "sec")
+                    .sort("label", "syscall", "sec")
                     .collect(engine="streaming"))
 
-        for sc in inf_df["syscall"].unique().sort().to_list():
-            sc_df = inf_df.filter(pl.col("syscall") == sc)
-            points = [
-                {"time": _sec_to_time(int(s)), "value": max(0, int(v))}
-                for s, v in zip(sc_df["sec"].to_list(), sc_df["inflight"].to_list())
-                if v is not None
-            ]
-            if points:
-                result["tseries"]["sc_inflight"][sc] = tseries_stats(points)
+        for label in inf_df["label"].unique().sort().to_list():
+            lbl_df = inf_df.filter(pl.col("label") == label)
+            entry = ensure_label_entry(label)
+            entry["tseries"].setdefault("sc_inflight", {})
+            for sc in lbl_df["syscall"].unique().sort().to_list():
+                sc_df = lbl_df.filter(pl.col("syscall") == sc)
+                points = [
+                    {"time": _sec_to_time(int(s)), "value": max(0, int(v))}
+                    for s, v in zip(sc_df["sec"].to_list(), sc_df["inflight"].to_list())
+                    if v is not None
+                ]
+                if points:
+                    entry["tseries"]["sc_inflight"][sc] = tseries_stats(points)
         del inf_df
 
-    # --- Scan 4: Access pattern ---
+    # --- Scan 4: Access pattern (per label) ---
     print("  Scan 4: access pattern...", flush=True)
-    result["access_pattern"] = {"sc_offsets": {}}
-
-    # pread64/pwrite64: per-syscall scan with explicit offsets, per-fd analysis
     if has_offset:
         for sc in ["pread64", "pwrite64"]:
             lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
             sc_df = (lf.filter((pl.col("event") == "enter") & (pl.col("syscall") == sc)
                                & pl.col("offset").is_not_null())
-                       .select("timestamp_ns", "offset", "bytes", "fd")
-                       .sort("timestamp_ns")
+                       .select("label", "timestamp_ns", "offset", "bytes", "fd")
+                       .sort("label", "timestamp_ns")
                        .collect(engine="streaming"))
             if len(sc_df) < 2:
                 del sc_df
                 continue
 
-            total_ios = 0
-            seq_count = 0
-            rnd_count = 0
-            for fd_val in sc_df.drop_nulls("fd")["fd"].unique().to_list():
-                fd_group = sc_df.filter(pl.col("fd") == fd_val)
-                total_ios += len(fd_group)
-                if len(fd_group) < 2:
-                    continue
-                offsets = fd_group["offset"].cast(pl.Int64).to_numpy()
-                bytes_list = fd_group["bytes"].cast(pl.Int64).to_numpy()
-                pat = compute_fs_access_pattern(offsets, bytes_list)
-                seq_count += pat["sequential_count"]
-                rnd_count += pat["random_count"]
+            for label in sc_df["label"].unique().sort().to_list():
+                lbl_df = sc_df.filter(pl.col("label") == label)
+                entry = ensure_label_entry(label)
+                entry["access_pattern"].setdefault("sc_offsets", {})
+                total_ios = 0
+                seq_count = 0
+                rnd_count = 0
+                for fd_val in lbl_df.drop_nulls("fd")["fd"].unique().to_list():
+                    fd_group = lbl_df.filter(pl.col("fd") == fd_val)
+                    total_ios += len(fd_group)
+                    if len(fd_group) < 2:
+                        continue
+                    offsets = fd_group["offset"].cast(pl.Int64).to_numpy()
+                    bytes_list = fd_group["bytes"].cast(pl.Int64).to_numpy()
+                    pat = compute_fs_access_pattern(offsets, bytes_list)
+                    seq_count += pat["sequential_count"]
+                    rnd_count += pat["random_count"]
 
-            total_gaps = seq_count + rnd_count
-            if total_gaps > 0:
-                result["access_pattern"]["sc_offsets"][sc] = {
-                    "total_ios": total_ios,
-                    "sequential_count": seq_count,
-                    "random_count": rnd_count,
-                    "sequential_pct": round(100 * seq_count / total_gaps, 2),
-                    "random_pct": round(100 * rnd_count / total_gaps, 2),
-                }
+                total_gaps = seq_count + rnd_count
+                if total_gaps > 0:
+                    entry["access_pattern"]["sc_offsets"][sc] = {
+                        "total_ios": total_ios,
+                        "sequential_count": seq_count,
+                        "random_count": rnd_count,
+                        "sequential_pct": round(100 * seq_count / total_gaps, 2),
+                        "random_pct": round(100 * rnd_count / total_gaps, 2),
+                    }
             del sc_df
 
-    # read/write: pre-filter to relevant syscalls, reconstruct positions
     rw_relevant = ["read", "write", "openat", "lseek", "close"]
     lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
     rw_df = (lf.filter(pl.col("syscall").is_in(rw_relevant))
-               .select("event", "syscall", "timestamp_ns", "tid", "fd", "bytes")
+               .select("label", "event", "syscall", "timestamp_ns", "tid", "fd", "bytes")
                .collect(engine="streaming"))
 
-    rw_pattern = compute_rw_access_pattern(rw_df)
+    if len(rw_df) > 0:
+        for label in rw_df["label"].unique().sort().to_list():
+            lbl_df = rw_df.filter(pl.col("label") == label).select("event", "syscall", "timestamp_ns", "tid", "fd", "bytes")
+            rw_pattern = compute_rw_access_pattern(lbl_df)
+            if rw_pattern:
+                entry = ensure_label_entry(label)
+                entry["access_pattern"].setdefault("sc_offsets", {})
+                for sc, pat in rw_pattern.items():
+                    entry["access_pattern"]["sc_offsets"][sc] = pat
     del rw_df
-
-    for sc, pat in rw_pattern.items():
-        result["access_pattern"]["sc_offsets"][sc] = pat
 
     return result, event_counts
 
