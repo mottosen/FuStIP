@@ -2,10 +2,6 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ -z "${RESULTS_DIR:-}" ]; then
-    echo "Error: RESULTS_DIR is not set" >&2; exit 1
-fi
-
 DRY=false
 for arg in "$@"; do
     case "$arg" in

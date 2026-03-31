@@ -29,7 +29,8 @@ def parse_args(argv=None):
     parent.add_argument("-p", "--comm-filter", help="Process/command name filter, comma-separated for multiple (block, fs)")
     parent.add_argument("-c", "--container-filter", help="Container name filter, comma-separated for multiple (forces detailed)")
     parent.add_argument("-d", "--dev-filter", help="NVMe device filter, comma-separated for multiple (e.g. nvme0n1,nvme1n1)")
-    parent.add_argument("--clean", action="store_true", help="Clean results directory first")
+    parent.add_argument("--dir", "--results-dir", dest="results_dir", help="Results directory (overrides RESULTS_DIR env var)")
+    parent.add_argument("--clean", action="store_true", help="Clean each selected layer's results subdirectory")
     parent.add_argument("--visualize", action="store_true", help="Generate visualization dashboards (detailed mode only)")
     parent.add_argument("--debug", action="store_true", help="Enable verbose Makefile output (DEBUG=1)")
     parent.add_argument("--dry", action="store_true", help="Print commands instead of executing")
@@ -110,11 +111,11 @@ def validate(args):
 
 def resolve_env(args):
     """Resolve required environment variables onto args."""
-    results_dir = os.environ.get("RESULTS_DIR")
-    if not results_dir:
-        print("Error: RESULTS_DIR is not set", file=sys.stderr)
+    if not args.results_dir:
+        args.results_dir = os.environ.get("RESULTS_DIR")
+    if not args.results_dir:
+        print("Error: results dir not set (use --dir or RESULTS_DIR env var)", file=sys.stderr)
         sys.exit(1)
-    args.results_dir = results_dir
 
     if args.action == "test":
         fio_file = os.environ.get("FIO_FILE")
@@ -252,7 +253,8 @@ def main(argv=None):
     cmds = ["clear"]
 
     if args.clean:
-        cmds.append(f"rm -rf {args.results_dir}/*")
+        for layer in args.layers:
+            cmds.append(f"rm -rf {args.results_dir}/{layer}")
 
     if args.action == "profile":
         cmds.extend(generate_profile_commands(args))
