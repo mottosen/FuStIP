@@ -10,6 +10,7 @@ struct sc_enter_data {
 	__s32 fd;
 	__s64 offset;
 	__s64 bytes;    // count arg for IO syscalls, length for mmap
+	__u64 mntns_id;
 	__u8  sc_idx;
 	__u8  comm[16];
 };
@@ -68,6 +69,8 @@ static __always_inline int handle_sc_enter(__u8 sc_idx, __s32 fd,
 		.bytes = bytes,
 		.sc_idx = sc_idx,
 	};
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	data.mntns_id = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
 	bpf_get_current_comm(&data.comm, sizeof(data.comm));
 	bpf_map_update_elem(&sc_start, &tid, &data, BPF_ANY);
 
@@ -90,6 +93,7 @@ static __always_inline int handle_sc_enter(__u8 sc_idx, __s32 fd,
 	struct fs_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (e) {
 		e->timestamp_ns = ts;
+		e->mntns_id = data.mntns_id;
 		e->event_type = EVT_ENTER;
 		e->syscall = sc_idx;
 		e->bytes = bytes;
@@ -137,6 +141,7 @@ static __always_inline int handle_sc_exit(__s64 ret)
 	struct fs_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (e) {
 		e->timestamp_ns = now;
+		e->mntns_id = data->mntns_id;
 		e->event_type = EVT_EXIT;
 		e->syscall = data->sc_idx;
 		e->bytes = ret;

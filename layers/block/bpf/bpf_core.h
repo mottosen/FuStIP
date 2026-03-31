@@ -9,6 +9,7 @@ struct rq_data {
 	__u8  op;
 	__u32 bytes;
 	__u64 sector;
+	__u64 mntns_id;
 	__u8  comm[16];
 };
 
@@ -90,6 +91,8 @@ static __always_inline int handle_block_rq_insert(struct request *rq)
 		.bytes = bytes,
 		.sector = sector,
 	};
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	data.mntns_id = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
 	bpf_get_current_comm(&data.comm, sizeof(data.comm));
 	bpf_map_update_elem(&rq_metadata, &rq_key, &data, BPF_ANY);
 
@@ -117,6 +120,7 @@ static __always_inline int handle_block_rq_insert(struct request *rq)
 	struct block_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (e) {
 		e->timestamp_ns = ts;
+		e->mntns_id = data.mntns_id;
 		e->event_type = EVT_INSERT;
 		e->op = op;
 		e->bytes = bytes;
@@ -153,12 +157,15 @@ static __always_inline int handle_block_rq_issue(struct request *rq)
 		.bytes = bytes,
 		.sector = sector,
 	};
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	data.mntns_id = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
 
 	// Preserve comm from insert if available, else capture current
 	struct rq_data *old_data = bpf_map_lookup_elem(&rq_metadata, &rq_key);
-	if (old_data)
+	if (old_data) {
 		__builtin_memcpy(data.comm, old_data->comm, 16);
-	else
+		data.mntns_id = old_data->mntns_id;
+	} else
 		bpf_get_current_comm(&data.comm, sizeof(data.comm));
 	bpf_map_update_elem(&rq_metadata, &rq_key, &data, BPF_ANY);
 
@@ -199,6 +206,7 @@ static __always_inline int handle_block_rq_issue(struct request *rq)
 	struct block_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (e) {
 		e->timestamp_ns = now;
+		e->mntns_id = data.mntns_id;
 		e->event_type = EVT_ISSUE;
 		e->op = op;
 		e->bytes = bytes;
@@ -258,6 +266,7 @@ static __always_inline int handle_block_rq_complete(struct request *rq)
 	struct block_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (e) {
 		e->timestamp_ns = now;
+		e->mntns_id = data->mntns_id;
 		e->event_type = EVT_COMPLETE;
 		e->op = data->op;
 		e->bytes = data->bytes;

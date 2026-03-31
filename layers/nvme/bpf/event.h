@@ -16,6 +16,7 @@
 // ── Event struct (ring buffer → userspace) ──
 struct nvme_event {
   __u64 timestamp_ns;
+  __u64 mntns_id;   // mount namespace id of originating task (0 if unknown)
   __u8 event_type;  // EVT_SETUP, EVT_COMPLETE
   __u8 op;          // NVME_OP_*
   __u32 bytes;      // rq->__data_len

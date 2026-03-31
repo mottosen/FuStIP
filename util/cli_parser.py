@@ -162,17 +162,41 @@ def _concurrent(cmds):
     return [f"{cmd} &" for cmd in cmds] + ["wait"]
 
 
+def _container_map_start_cmd(args):
+    if not args.container_filter:
+        return None
+    return (
+        f"python ./util/container/generate_container_map.py "
+        f"\"{args.results_dir}\" \"{args.container_filter}\" >/dev/null 2>&1 "
+        f"& echo $! > /tmp/fustip-container-map.pid"
+    )
+
+
+def _container_map_stop_cmd():
+    return (
+        "if [ -f /tmp/fustip-container-map.pid ]; then "
+        "pid=$(cat /tmp/fustip-container-map.pid); "
+        "kill $pid 2>/dev/null || true; "
+        "i=0; while [ -d /proc/$pid ] && [ $i -lt 50 ]; do sleep 0.2; i=$((i+1)); done; "
+        "rm -f /tmp/fustip-container-map.pid; "
+        "fi"
+    )
+
+
 def generate_profile_commands(args):
     if args.sub_action == "start":
         cmds = []
+        map_cmd = _container_map_start_cmd(args)
+        if map_cmd:
+            cmds.append(map_cmd)
         for layer in PROFILE_START_ORDER:
             if layer in args.layers:
                 vs = build_layer_vars(layer, args)
                 cmds.append(f"make -C layers/{layer} start-collection {' '.join(vs)}")
-        return _concurrent(cmds)
+        return cmds[:1] + _concurrent(cmds[1:]) if map_cmd else _concurrent(cmds)
 
     # stop: parallel stop-profiling, then sequential csv-to-parquet + generate-stats
-    stop_cmds = []
+    stop_cmds = [_container_map_stop_cmd()] if args.container_filter else []
     for layer in PROFILE_STOP_ORDER:
         if layer in args.layers:
             vs = build_layer_vars(layer, args)
@@ -199,6 +223,9 @@ def generate_test_commands(args):
     selected = set(args.layers)
     target = TEST_TARGET_MAP[args.sub_action]
     cmds = []
+    map_cmd = _container_map_start_cmd(args)
+    if map_cmd:
+        cmds.append(map_cmd)
 
     # Determine which layers within each suite are selected
     block_nvme_layers = sorted(TEST_SUITES["block_nvme"] & selected)
@@ -236,6 +263,8 @@ def generate_test_commands(args):
         vs.append(f"RESULTS_DIR={args.results_dir}")
         cmds.append(f"make -C tests/filesystem {target} {' '.join(vs)} || echo '!! filesystem suite failed'")
 
+    if args.container_filter:
+        cmds.append(_container_map_stop_cmd())
     return cmds
 
 

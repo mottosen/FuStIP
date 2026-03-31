@@ -95,14 +95,16 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	memcpy(comm, e->comm, 16);
 
 	if (e->latency_ns > 0)
-		fprintf(output, "%llu,%s,%s,%u,%llu,%llu,0x%llx,%s,%d,%d\n",
-			e->timestamp_ns, event_name(e->event_type),
+		fprintf(output, "%llu,%llu,%s,%s,%u,%llu,%llu,0x%llx,%s,%d,%d\n",
+			e->timestamp_ns, e->mntns_id,
+			event_name(e->event_type),
 			op_name(e->op), e->bytes, e->latency_ns,
 			e->sector, e->rq, comm,
 			e->q_inflight, e->d_inflight);
 	else
-		fprintf(output, "%llu,%s,%s,%u,,%llu,0x%llx,%s,%d,%d\n",
-			e->timestamp_ns, event_name(e->event_type),
+		fprintf(output, "%llu,%llu,%s,%s,%u,,%llu,0x%llx,%s,%d,%d\n",
+			e->timestamp_ns, e->mntns_id,
+			event_name(e->event_type),
 			op_name(e->op), e->bytes,
 			e->sector, e->rq, comm,
 			e->q_inflight, e->d_inflight);
@@ -297,7 +299,7 @@ int main(int argc, char **argv)
 		standalone_bpf__destroy(skel);
 		return 1;
 	}
-	fprintf(output, "timestamp_ns,event,op,bytes,latency_ns,sector,rq,comm,q_inflight,d_inflight\n");
+	fprintf(output, "timestamp_ns,mntns_id,event,op,bytes,latency_ns,sector,rq,comm,q_inflight,d_inflight\n");
 
 	// Set up ring buffer
 	struct ring_buffer *rb = ring_buffer__new(

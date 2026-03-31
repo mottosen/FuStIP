@@ -20,7 +20,7 @@ STRING_COLS = {"event", "op", "syscall", "comm", "rq"}
 # Columns that can be empty (nullable) but must be numeric, not Utf8.
 # Polars infers Utf8 when a numeric column has empty cells in CSV.
 INT_COLS = {"latency_ns", "timestamp_ns", "bytes", "sector",
-            "q_inflight", "d_inflight", "offset", "count"}
+            "q_inflight", "d_inflight", "offset", "count", "mntns_id"}
 
 
 def convert(csv_path):

@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "u
 from stats_generation.shared import (compute_fs_access_pattern,
                                      derive_throughput,
                                      tseries_stats)
+from container.labeling import add_label_column, load_mntns_label_map
 
 LAYER_PREFIX = "fs"
 
@@ -165,14 +166,16 @@ def generate_stats(parquet_path):
     """Parse an FS layer detailed Parquet and compute stats."""
 
     # Check schema for optional columns
-    schema = pl.scan_parquet(parquet_path).collect_schema()
+    results_dir = parquet_path.parent.parent
+    mntns_map = load_mntns_label_map(results_dir)
+    schema = add_label_column(pl.scan_parquet(parquet_path), mntns_map).collect_schema()
     has_offset = "offset" in schema
 
     io_syscalls_list = list(IO_SYSCALLS)
 
     # --- Scan 1: Counters, duration, event counts ---
     print("  Scan 1: counters...", flush=True)
-    lf = pl.scan_parquet(parquet_path)
+    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
 
     # Get per-(event, syscall) aggregates — streaming to avoid 15GB+ materialization
     agg = (lf.group_by("event", "syscall")
@@ -241,11 +244,11 @@ def generate_stats(parquet_path):
 
     del agg
 
-    if "comm" in schema:
+    if "label" in schema:
         per_comm = {}
-        comm_agg = (pl.scan_parquet(parquet_path)
-                      .filter(pl.col("comm").is_not_null())
-                      .group_by("comm", "event", "syscall")
+        comm_agg = (add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+                      .filter(pl.col("label").is_not_null())
+                      .group_by("label", "event", "syscall")
                       .agg(
                           pl.len().alias("count"),
                           pl.col("bytes").sum().alias("total_bytes"),
@@ -254,8 +257,8 @@ def generate_stats(parquet_path):
                           pl.when(pl.col("bytes") > 0).then(pl.col("bytes")).otherwise(0).sum().alias("pos_bytes"),
                       )
                       .collect(engine="streaming"))
-        for comm in comm_agg["comm"].unique().sort().to_list():
-            comm_rows = comm_agg.filter(pl.col("comm") == comm)
+        for comm in comm_agg["label"].unique().sort().to_list():
+            comm_rows = comm_agg.filter(pl.col("label") == comm)
             comm_counters = {}
 
             comm_exit_io = comm_rows.filter((pl.col("event") == "exit") & pl.col("syscall").is_in(io_syscalls_list))
@@ -303,7 +306,7 @@ def generate_stats(parquet_path):
 
     # --- Scan 2: Distributions (Polars-native quantiles, no data in Python) ---
     print("  Scan 2: distributions...", flush=True)
-    lf = pl.scan_parquet(parquet_path)
+    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
     lat_stats = (lf.filter(pl.col("event") == "exit")
                    .filter(pl.col("syscall").is_in(io_syscalls_list))
                    .filter(pl.col("latency_ns").is_not_null() & (pl.col("latency_ns") > 0))
@@ -318,7 +321,7 @@ def generate_stats(parquet_path):
         }
     del lat_stats
 
-    lf = pl.scan_parquet(parquet_path)
+    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
     size_stats = (lf.filter(pl.col("event") == "exit")
                     .filter(pl.col("syscall").is_in(io_syscalls_list))
                     .filter(pl.col("bytes") > 0)
@@ -339,7 +342,7 @@ def generate_stats(parquet_path):
         window_ns = 1_000_000_000
         result["tseries"]["sc_inflight"] = {}
 
-        lf = pl.scan_parquet(parquet_path)
+        lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
         inf_df = (lf.filter(pl.col("syscall").is_in(io_syscalls_list))
                     .with_columns(
                         ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
@@ -367,7 +370,7 @@ def generate_stats(parquet_path):
     # pread64/pwrite64: per-syscall scan with explicit offsets, per-fd analysis
     if has_offset:
         for sc in ["pread64", "pwrite64"]:
-            lf = pl.scan_parquet(parquet_path)
+            lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
             sc_df = (lf.filter((pl.col("event") == "enter") & (pl.col("syscall") == sc)
                                & pl.col("offset").is_not_null())
                        .select("timestamp_ns", "offset", "bytes", "fd")
@@ -404,7 +407,7 @@ def generate_stats(parquet_path):
 
     # read/write: pre-filter to relevant syscalls, reconstruct positions
     rw_relevant = ["read", "write", "openat", "lseek", "close"]
-    lf = pl.scan_parquet(parquet_path)
+    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
     rw_df = (lf.filter(pl.col("syscall").is_in(rw_relevant))
                .select("event", "syscall", "timestamp_ns", "tid", "fd", "bytes")
                .collect(engine="streaming"))

@@ -92,9 +92,9 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	char comm[17] = {};
 	memcpy(comm, e->comm, 16);
 
-	// Format: timestamp_ns,event,syscall,bytes,latency_ns,fd,offset,tid,comm
-	fprintf(output, "%llu,%s,%s,",
-		e->timestamp_ns, event, sc_name(e->syscall));
+	// Format: timestamp_ns,mntns_id,event,syscall,bytes,latency_ns,fd,offset,tid,comm,inflight
+	fprintf(output, "%llu,%llu,%s,%s,",
+		e->timestamp_ns, e->mntns_id, event, sc_name(e->syscall));
 
 	// bytes
 	if (e->bytes != 0)
@@ -310,7 +310,7 @@ int main(int argc, char **argv)
 		standalone_bpf__destroy(skel);
 		return 1;
 	}
-	fprintf(output, "timestamp_ns,event,syscall,bytes,latency_ns,fd,offset,tid,comm,inflight\n");
+	fprintf(output, "timestamp_ns,mntns_id,event,syscall,bytes,latency_ns,fd,offset,tid,comm,inflight\n");
 
 	struct ring_buffer *rb = ring_buffer__new(
 		bpf_map__fd(skel->maps.events), handle_event, NULL, NULL);

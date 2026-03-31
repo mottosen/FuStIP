@@ -11,11 +11,15 @@ from pathlib import Path
 
 def _load_container_data(sysstat_dir: Path) -> dict[str, dict[str, set]]:
     """Return normalized container data: {container: {"comms": set, "tgids": set}}."""
-    container_map_path = sysstat_dir / "container_map.json"
-    if not container_map_path.exists():
+    # Prefer shared root-level map; fallback to legacy sysstat-local map.
+    candidates = [sysstat_dir.parent / "container_map.json", sysstat_dir / "container_map.json"]
+    data = None
+    for container_map_path in candidates:
+        if container_map_path.exists():
+            data = json.loads(container_map_path.read_text())
+            break
+    if data is None:
         return {}
-
-    data = json.loads(container_map_path.read_text())
     containers = {}
     for cname, raw in data.get("containers", {}).items():
         if isinstance(raw, dict):

@@ -31,6 +31,7 @@ ensure-results-exists:
 		exit 1; \
 	fi
 	$(Q)mkdir -p "$(RESULTS_DIR)/sysstat"
+	$(Q)rm -f "$(RESULTS_DIR)/sysstat/container_map.json"
 
 .PHONY: start-collection
 start-collection: ensure-results-exists ensure-sudo
@@ -41,11 +42,6 @@ start-collection: ensure-results-exists ensure-sudo
 	$(Q)sudo $(PIDSTAT) -turd $(INTERVAL) \
 		> "$(RESULTS_DIR)/sysstat/pidstat.out" \
 		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/pidstat.pid"
-
-ifdef CONTAINER_FILTER
-	$(Q)python "./util/poll_container_comms.py" "$(RESULTS_DIR)/sysstat" "$(CONTAINER_FILTER)" \
-		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/poller.pid"
-endif
 
 	$(Q)echo -e "sysstat collection is running!\n"
 

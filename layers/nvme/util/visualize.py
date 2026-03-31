@@ -7,6 +7,7 @@ from pathlib import Path
 import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
+from container.labeling import add_label_column, load_mntns_label_map
 from visualization.shared import (build_dashboard, plot_cumulated_mb_over_time,
                                    plot_gap_cdf, plot_inflight_from_column,
                                    plot_io_latency_cdf, plot_io_size_cdf,
@@ -16,14 +17,14 @@ LAYER = "nvme"
 WINDOW_NS = 1_000_000_000
 
 
-def _build_row(label, parquet_path, comm_filter=None):
+def _build_row(label, parquet_path, mntns_map, label_filter=None):
     """Build a dashboard row dict using per-plot Parquet scans."""
 
     def _scan(cols, event_filter=None):
         """Lazy scan of Parquet with column selection and optional filters."""
-        lf = pl.scan_parquet(parquet_path)
-        if comm_filter is not None:
-            lf = lf.filter(pl.col("comm") == comm_filter)
+        lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+        if label_filter is not None:
+            lf = lf.filter(pl.col("label") == label_filter)
         if event_filter is not None:
             lf = lf.filter(pl.col("event") == event_filter)
         return lf.select(cols)
@@ -93,17 +94,18 @@ def main():
         sys.exit(1)
 
     schema = pl.scan_parquet(parquet_path).collect_schema()
-    has_comm = "comm" in schema
+    mntns_map = load_mntns_label_map(results_dir)
+    has_label = "label" in add_label_column(pl.scan_parquet(parquet_path), mntns_map).collect_schema()
 
     rows = []
-    if has_comm:
-        comms = (pl.scan_parquet(parquet_path)
-                 .select("comm").drop_nulls().unique()
-                 .collect(engine="streaming"))["comm"].sort().to_list()
-        for comm_val in comms:
-            rows.append(_build_row(comm_val, parquet_path, comm_filter=comm_val))
+    if has_label:
+        labels = (add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+                  .select("label").drop_nulls().unique()
+                  .collect(engine="streaming"))["label"].sort().to_list()
+        for lbl in labels:
+            rows.append(_build_row(lbl, parquet_path, mntns_map, label_filter=lbl))
     else:
-        rows.append(_build_row("nvme", parquet_path))
+        rows.append(_build_row("nvme", parquet_path, mntns_map))
 
     output = results_dir / "visualizations" / "nvme-dashboard.png"
     build_dashboard(

@@ -9,6 +9,7 @@ struct cmd_data {
   __u8 op;
   __u32 bytes;
   __u64 sector;
+  __u64 mntns_id;
   __u8 comm[16];
 };
 
@@ -83,6 +84,8 @@ static __always_inline int handle_nvme_fentry_setup(struct request *req) {
       .bytes = bytes,
       .sector = sector,
   };
+  struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+  data.mntns_id = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
   bpf_get_current_comm(&data.comm, sizeof(data.comm));
   bpf_map_update_elem(&cmd_metadata, &rq_key, &data, BPF_ANY);
 
@@ -134,6 +137,7 @@ static __always_inline int handle_nvme_rawtp_setup(void) {
   struct nvme_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
   if (e) {
     e->timestamp_ns = ts;
+    e->mntns_id = data->mntns_id;
     e->event_type = EVT_SETUP;
     e->op = data->op;
     e->bytes = data->bytes;
@@ -188,6 +192,7 @@ static __always_inline int handle_nvme_complete(struct request *req) {
   struct nvme_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
   if (e) {
     e->timestamp_ns = now;
+    e->mntns_id = data->mntns_id;
     e->event_type = EVT_COMPLETE;
     e->op = data->op;
     e->bytes = data->bytes;
