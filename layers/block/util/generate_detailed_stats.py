@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "u
 from stats_generation.shared import (compute_access_pattern,
                                      derive_throughput,
                                      tseries_stats)
-from container.labeling import add_label_column, load_mntns_label_map
+from container.labeling import add_label_column, load_comm_label_map, load_mntns_label_map
 
 LAYER_PREFIX = "block"
 
@@ -75,11 +75,12 @@ def generate_stats(parquet_path):
     # Check schema for optional columns
     results_dir = parquet_path.parent.parent
     mntns_map = load_mntns_label_map(results_dir)
-    schema = add_label_column(pl.scan_parquet(parquet_path), mntns_map).collect_schema()
+    comm_map = load_comm_label_map(results_dir)
+    schema = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map).collect_schema()
     has_sector = "sector" in schema
 
     # --- Scan 1: Counters, duration, event counts ---
-    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
 
     agg = (lf.filter(pl.col("event").is_in(["insert", "issue", "complete"]))
              .group_by("event", "op")
@@ -119,7 +120,7 @@ def generate_stats(parquet_path):
 
     del agg
 
-    comm_agg = (add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+    comm_agg = (add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
                   .filter(pl.col("label").is_not_null())
                   .filter(pl.col("event").is_in(["insert", "issue", "complete"]))
                   .group_by("label", "event", "op")
@@ -175,7 +176,7 @@ def generate_stats(parquet_path):
         comm_entry["derived"] = comm_derived
 
     # --- Scan 2: Distributions (per label) ---
-    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
     driver_lat_stats = (lf.filter(pl.col("event") == "complete")
                           .filter(pl.col("latency_ns").is_not_null())
                           .group_by("label", "op")
@@ -186,7 +187,7 @@ def generate_stats(parquet_path):
         ensure_label_entry(row["label"])["distributions"].setdefault("driver_latencies", {})[row["op"]] = _row_to_stats(row)
     del driver_lat_stats
 
-    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
     queue_lat_stats = (lf.filter(pl.col("event") == "issue")
                          .filter(pl.col("latency_ns").is_not_null())
                          .group_by("label", "op")
@@ -197,7 +198,7 @@ def generate_stats(parquet_path):
         ensure_label_entry(row["label"])["distributions"].setdefault("queue_latencies", {})[row["op"]] = _row_to_stats(row)
     del queue_lat_stats
 
-    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
     size_stats = (lf.filter(pl.col("event") == "complete")
                     .group_by("label", "op")
                     .agg(_series_stats_exprs("bytes"))
@@ -210,18 +211,31 @@ def generate_stats(parquet_path):
     # --- Scan 3: Inflight time-series (per label) ---
     if duration_s > 0:
         window_ns = 1_000_000_000
-        lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
-        inf_df = (lf.filter(pl.col("event").is_in(["insert", "issue", "complete"]))
-                    .with_columns(
-                        ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
-                    )
+        lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
+        # Step 1: last inflight snapshot per (label, op, sec, comm).
+        # BPF counters are keyed by (op, comm), so each event carries only that
+        # comm's count.  Summing the per-comm last() values per second gives the
+        # correct aggregate inflight for containers (multiple comms) while leaving
+        # per-comm labels unchanged (sum of one value == last()).
+        per_comm_snap = (lf.filter(pl.col("event").is_in(["insert", "issue", "complete"]))
+                           .with_columns(
+                               ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
+                           )
+                           .group_by("label", "op", "sec", "comm")
+                           .agg(
+                               pl.col("q_inflight").last(),
+                               pl.col("d_inflight").last(),
+                           )
+                           .collect(engine="streaming"))
+        # Step 2: sum per-comm snapshots per (label, op, sec).
+        inf_df = (per_comm_snap
                     .group_by("label", "op", "sec")
                     .agg(
-                        pl.col("q_inflight").last(),
-                        pl.col("d_inflight").last(),
+                        pl.col("q_inflight").sum(),
+                        pl.col("d_inflight").sum(),
                     )
-                    .sort("label", "op", "sec")
-                    .collect(engine="streaming"))
+                    .sort("label", "op", "sec"))
+        del per_comm_snap
         for label in inf_df["label"].unique().sort().to_list():
             lbl_df = inf_df.filter(pl.col("label") == label)
             entry = ensure_label_entry(label)
@@ -240,7 +254,7 @@ def generate_stats(parquet_path):
 
     # --- Scan 4: Access pattern (per label) ---
     if has_sector:
-        lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+        lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
         issue_df = (lf.filter(pl.col("event") == "issue")
                       .filter(pl.col("sector").is_not_null())
                       .select("label", "op", "timestamp_ns", "sector", "bytes")

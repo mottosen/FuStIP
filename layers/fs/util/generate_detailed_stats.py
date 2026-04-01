@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "u
 from stats_generation.shared import (compute_fs_access_pattern,
                                      derive_throughput,
                                      tseries_stats)
-from container.labeling import add_label_column, load_mntns_label_map
+from container.labeling import add_label_column, load_comm_label_map, load_mntns_label_map
 
 LAYER_PREFIX = "fs"
 
@@ -168,14 +168,15 @@ def generate_stats(parquet_path):
     # Check schema for optional columns
     results_dir = parquet_path.parent.parent
     mntns_map = load_mntns_label_map(results_dir)
-    schema = add_label_column(pl.scan_parquet(parquet_path), mntns_map).collect_schema()
+    comm_map = load_comm_label_map(results_dir)
+    schema = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map).collect_schema()
     has_offset = "offset" in schema
 
     io_syscalls_list = list(IO_SYSCALLS)
 
     # --- Scan 1: Counters, duration, event counts ---
     print("  Scan 1: counters...", flush=True)
-    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
 
     # Get per-(event, syscall) aggregates — streaming to avoid 15GB+ materialization
     agg = (lf.group_by("event", "syscall")
@@ -216,7 +217,7 @@ def generate_stats(parquet_path):
 
     del agg
 
-    comm_agg = (add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+    comm_agg = (add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
                   .filter(pl.col("label").is_not_null())
                   .group_by("label", "event", "syscall")
                   .agg(
@@ -277,7 +278,7 @@ def generate_stats(parquet_path):
 
     # --- Scan 2: Distributions (per label) ---
     print("  Scan 2: distributions...", flush=True)
-    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
     lat_stats = (lf.filter(pl.col("event") == "exit")
                    .filter(pl.col("syscall").is_in(io_syscalls_list))
                    .filter(pl.col("latency_ns").is_not_null() & (pl.col("latency_ns") > 0))
@@ -289,7 +290,7 @@ def generate_stats(parquet_path):
         ensure_label_entry(row["label"])["distributions"].setdefault("sc_latencies", {})[row["syscall"]] = _row_to_stats(row)
     del lat_stats
 
-    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
     size_stats = (lf.filter(pl.col("event") == "exit")
                     .filter(pl.col("syscall").is_in(io_syscalls_list))
                     .filter(pl.col("bytes") > 0)
@@ -306,15 +307,23 @@ def generate_stats(parquet_path):
     if duration_s > 0:
         window_ns = 1_000_000_000
 
-        lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
-        inf_df = (lf.filter(pl.col("syscall").is_in(io_syscalls_list))
-                    .with_columns(
-                        ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
-                    )
+        lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
+        # Step 1: last inflight snapshot per (label, syscall, sec, comm).
+        # BPF counters are keyed by (syscall, comm); summing per-comm last()
+        # values gives correct container-level inflight without affecting per-comm labels.
+        per_comm_snap = (lf.filter(pl.col("syscall").is_in(io_syscalls_list))
+                           .with_columns(
+                               ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
+                           )
+                           .group_by("label", "syscall", "sec", "comm")
+                           .agg(pl.col("inflight").last())
+                           .collect(engine="streaming"))
+        # Step 2: sum per-comm snapshots per (label, syscall, sec).
+        inf_df = (per_comm_snap
                     .group_by("label", "syscall", "sec")
-                    .agg(pl.col("inflight").last())
-                    .sort("label", "syscall", "sec")
-                    .collect(engine="streaming"))
+                    .agg(pl.col("inflight").sum())
+                    .sort("label", "syscall", "sec"))
+        del per_comm_snap
 
         for label in inf_df["label"].unique().sort().to_list():
             lbl_df = inf_df.filter(pl.col("label") == label)
@@ -335,7 +344,7 @@ def generate_stats(parquet_path):
     print("  Scan 4: access pattern...", flush=True)
     if has_offset:
         for sc in ["pread64", "pwrite64"]:
-            lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+            lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
             sc_df = (lf.filter((pl.col("event") == "enter") & (pl.col("syscall") == sc)
                                & pl.col("offset").is_not_null())
                        .select("label", "timestamp_ns", "offset", "bytes", "fd")
@@ -375,7 +384,7 @@ def generate_stats(parquet_path):
             del sc_df
 
     rw_relevant = ["read", "write", "openat", "lseek", "close"]
-    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+    lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
     rw_df = (lf.filter(pl.col("syscall").is_in(rw_relevant))
                .select("label", "event", "syscall", "timestamp_ns", "tid", "fd", "bytes")
                .collect(engine="streaming"))

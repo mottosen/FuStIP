@@ -9,7 +9,7 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 import numpy as np
 
-from container.labeling import add_label_column, load_mntns_label_map
+from container.labeling import add_label_column, load_comm_label_map, load_mntns_label_map
 from visualization.shared import (_color_for, _linestyle_for, _subsample_cdf,
                                    build_dashboard, plot_cumulated_mb_over_time,
                                    plot_inflight_from_column, plot_io_latency_cdf,
@@ -102,7 +102,7 @@ def _compute_rw_gaps(tracker_df, sc_type):
     return np.concatenate(all_gaps) if all_gaps else np.array([])
 
 
-def _plot_fs_gap_cdf(ax, parquet_path, types, mntns_map, label_filter=None):
+def _plot_fs_gap_cdf(ax, parquet_path, types, mntns_map, comm_map, label_filter=None):
     """Plot gap CDF for FS layer using per-source lazy scanning.
 
     pread64/pwrite64: per-fd gaps using explicit offsets from enter events.
@@ -111,7 +111,7 @@ def _plot_fs_gap_cdf(ax, parquet_path, types, mntns_map, label_filter=None):
     for i, typ in enumerate(types):
         if typ in ("pread64", "pwrite64"):
             # Load only enter events for this syscall
-            lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+            lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
             if label_filter is not None:
                 lf = lf.filter(pl.col("label") == label_filter)
             df = (lf.filter((pl.col("event") == "enter") & (pl.col("syscall") == typ))
@@ -136,7 +136,7 @@ def _plot_fs_gap_cdf(ax, parquet_path, types, mntns_map, label_filter=None):
         elif typ in ("read", "write"):
             # Load tracker events for position replay
             tracker_syscalls = [typ, "openat", "close", "lseek"]
-            lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+            lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
             if label_filter is not None:
                 lf = lf.filter(pl.col("label") == label_filter)
             tracker_df = (lf.filter(pl.col("syscall").is_in(tracker_syscalls))
@@ -162,12 +162,12 @@ def _plot_fs_gap_cdf(ax, parquet_path, types, mntns_map, label_filter=None):
     ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
 
-def _build_row(label, parquet_path, mntns_map, label_filter=None):
+def _build_row(label, parquet_path, mntns_map, comm_map, label_filter=None):
     """Build a dashboard row dict using per-plot Parquet scans."""
 
     def _scan(cols, event_filter=None, syscall_filter=None):
         """Lazy scan of Parquet with column selection and optional filters."""
-        lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+        lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
         if label_filter is not None:
             lf = lf.filter(pl.col("label") == label_filter)
         if syscall_filter is not None:
@@ -217,7 +217,7 @@ def _build_row(label, parquet_path, mntns_map, label_filter=None):
         plot_io_latency_cdf(ax, df, "syscall", "latency_ns", t)
 
     def gap_fn(ax, t=types):
-        _plot_fs_gap_cdf(ax, parquet_path, t, mntns_map, label_filter=label_filter)
+        _plot_fs_gap_cdf(ax, parquet_path, t, mntns_map, comm_map, label_filter=label_filter)
 
     return {
         "label": label,
@@ -245,17 +245,18 @@ def main():
 
     schema = pl.scan_parquet(parquet_path).collect_schema()
     mntns_map = load_mntns_label_map(results_dir)
-    has_label = "label" in add_label_column(pl.scan_parquet(parquet_path), mntns_map).collect_schema()
+    comm_map = load_comm_label_map(results_dir)
+    has_label = "label" in add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map).collect_schema()
 
     rows = []
     if has_label:
-        labels = (add_label_column(pl.scan_parquet(parquet_path), mntns_map)
+        labels = (add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
                   .select("label").drop_nulls().unique()
                   .collect(engine="streaming"))["label"].sort().to_list()
         for lbl in labels:
-            rows.append(_build_row(lbl, parquet_path, mntns_map, label_filter=lbl))
+            rows.append(_build_row(lbl, parquet_path, mntns_map, comm_map, label_filter=lbl))
     else:
-        rows.append(_build_row("fs", parquet_path, mntns_map))
+        rows.append(_build_row("fs", parquet_path, mntns_map, comm_map))
 
     output = results_dir / "visualizations" / "fs-dashboard.png"
     build_dashboard(

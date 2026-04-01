@@ -18,6 +18,39 @@ from collections import defaultdict
 from pathlib import Path
 
 
+def _pids_from_cgroup(pid: str) -> set[str]:
+    """Return all process TGIDs in the container's cgroup (host-side, no shell needed).
+
+    Supports both cgroup v2 (unified hierarchy, hierarchy_id "0") and cgroup v1
+    (uses the memory subsystem as the canonical controller).
+    """
+    pids: set[str] = set()
+    try:
+        cgroup_lines = Path(f"/proc/{pid}/cgroup").read_text().splitlines()
+    except OSError:
+        return pids
+    for line in cgroup_lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        hierarchy_id, controllers, cgroup_path = parts
+        if hierarchy_id == "0":                          # cgroup v2 unified
+            procs = Path("/sys/fs/cgroup") / cgroup_path.lstrip("/") / "cgroup.procs"
+        elif "memory" in controllers.split(","):         # cgroup v1 memory subsystem
+            procs = Path("/sys/fs/cgroup/memory") / cgroup_path.lstrip("/") / "cgroup.procs"
+        else:
+            continue
+        try:
+            for p in procs.read_text().splitlines():
+                if p.strip().isdigit():
+                    pids.add(p.strip())
+        except OSError:
+            continue
+        if hierarchy_id == "0":
+            break  # cgroup v2: only one unified entry
+    return pids
+
+
 def _write(comms_per, tgids_per, containers, out_path):
     data = {
         "version": 2,
@@ -55,16 +88,33 @@ def main():
 
     while True:
         for cname in containers:
-            # Prefer robust PID identity first.
             pid_result = subprocess.run(
                 ["docker", "inspect", "-f", "{{.State.Pid}}", cname],
                 capture_output=True, text=True,
             )
-            if pid_result.returncode == 0:
-                pid_str = pid_result.stdout.strip()
-                if pid_str.isdigit():
-                    tgids_per[cname].add(pid_str)
+            if pid_result.returncode != 0:
+                continue
+            pid_str = pid_result.stdout.strip()
+            if not pid_str.isdigit():
+                continue
 
+            tgids_per[cname].add(pid_str)
+
+            # Primary: enumerate all container processes via cgroupfs
+            # (no container shell required, works for distroless images).
+            container_pids = _pids_from_cgroup(pid_str)
+            tgids_per[cname].update(container_pids)
+            for p in container_pids:
+                try:
+                    comm = Path(f"/proc/{p}/comm").read_text().strip()
+                    if comm:
+                        comms_per[cname].add(comm)
+                except OSError:
+                    pass
+            if container_pids:
+                continue
+
+            # Fallback 1: docker top (may fail on some Docker/ps configurations).
             result = subprocess.run(
                 ["docker", "top", cname, "-eo", "comm"],
                 capture_output=True, text=True,
@@ -76,18 +126,13 @@ def main():
                         comms_per[cname].add(comm)
                 continue
 
-            # Fallback for environments where `docker top -eo comm` is unsupported.
-            if pid_result.returncode != 0:
-                continue
-            pid_str = pid_result.stdout.strip()
-            if not pid_str.isdigit():
-                continue
-
-            proc_comm = Path(f"/proc/{pid_str}/comm")
-            if proc_comm.exists():
-                comm = proc_comm.read_text().strip()
+            # Fallback 2: single init process comm.
+            try:
+                comm = Path(f"/proc/{pid_str}/comm").read_text().strip()
                 if comm:
                     comms_per[cname].add(comm)
+            except OSError:
+                pass
         time.sleep(2)
 
 
