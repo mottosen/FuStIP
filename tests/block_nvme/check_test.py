@@ -29,22 +29,47 @@ def parse_fio_json(path):
     }
 
 
+def _iter_label_entries(stats):
+    """Yield all per-comm and per-container label entries from stats JSON."""
+    for label_entry in stats.get("per_comm", {}).values():
+        yield label_entry
+    for label_entry in stats.get("per_container", {}).values():
+        yield label_entry
+
+
 def parse_detailed_stats(path):
     """Parse detailed-stats.json into the same dict format as parse_counters().
 
-    The stats JSON has: {"counters": {"rq_completed": {"read": N}, ...}}
-    We flatten to: {"rq_completed": {"read": N}, ...}
+    The stats JSON has: {"per_comm": {"fio": {"counters": {"rq_completed": {"read": N}}}}}
+    We aggregate counters across all labels by summing inner values.
     """
     with open(path) as f:
         stats = json.load(f)
-    return stats.get("counters", {})
+    merged = {}
+    for entry in _iter_label_entries(stats):
+        for counter_name, op_dict in entry.get("counters", {}).items():
+            if counter_name not in merged:
+                merged[counter_name] = {}
+            for op, val in op_dict.items():
+                merged[counter_name][op] = merged[counter_name].get(op, 0) + val
+    return merged
 
 
 def parse_access_pattern(path):
-    """Extract access_pattern section from detailed-stats.json."""
+    """Extract access_pattern section from detailed-stats.json.
+
+    Merges access patterns across all per-comm and per-container labels.
+    In tests there is typically one label, so last-write-wins is fine.
+    """
     with open(path) as f:
         stats = json.load(f)
-    return stats.get("access_pattern", {})
+    merged = {}
+    for entry in _iter_label_entries(stats):
+        for key, val in entry.get("access_pattern", {}).items():
+            if key not in merged:
+                merged[key] = {}
+            merged[key].update(val)
+    return merged
 
 
 SEQUENTIAL_JOBS = {"val_seqread", "val_seqwrite", "work_bulk_insert", "work_scan"}
