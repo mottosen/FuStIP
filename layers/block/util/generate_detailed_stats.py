@@ -258,7 +258,6 @@ def generate_stats(parquet_path):
         issue_df = (lf.filter(pl.col("event") == "issue")
                       .filter(pl.col("sector").is_not_null())
                       .select("label", "op", "timestamp_ns", "sector", "bytes")
-                      .sort("label", "timestamp_ns")
                       .collect(engine="streaming"))
 
         for label in issue_df["label"].unique().sort().to_list():

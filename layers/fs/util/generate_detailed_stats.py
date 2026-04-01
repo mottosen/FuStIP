@@ -348,7 +348,6 @@ def generate_stats(parquet_path):
             sc_df = (lf.filter((pl.col("event") == "enter") & (pl.col("syscall") == sc)
                                & pl.col("offset").is_not_null())
                        .select("label", "timestamp_ns", "offset", "bytes", "fd")
-                       .sort("label", "timestamp_ns")
                        .collect(engine="streaming"))
             if len(sc_df) < 2:
                 del sc_df
