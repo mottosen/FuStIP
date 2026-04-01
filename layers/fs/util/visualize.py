@@ -11,10 +11,10 @@ import numpy as np
 
 from container.labeling import add_label_column, load_comm_label_map, load_mntns_label_map
 from visualization.shared import (_color_for, _linestyle_for, _subsample_cdf,
-                                   build_dashboard, plot_cumulated_mb_over_time,
-                                   plot_inflight_from_column, plot_io_latency_cdf,
-                                   plot_io_size_cdf, plot_type_distribution,
-                                   sort_types)
+                                     build_dashboard, plot_cumulated_mb_over_time,
+                                     plot_inflight_from_column, plot_io_latency_cdf,
+                                     plot_io_size_cdf, plot_type_distribution,
+                                     sort_types)
 
 LAYER = "fs"
 IO_SYSCALLS = {"read", "write", "pread64", "pwrite64"}
