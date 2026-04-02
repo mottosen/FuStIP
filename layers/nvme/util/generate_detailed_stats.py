@@ -107,7 +107,9 @@ def generate_stats(parquet_path):
     # --- Scan 1: Counters, duration, event counts ---
     # Group by raw (comm, mntns_id) to keep streaming engine effective.
     # ts_min/ts_max and event_counts derived from this result (no separate scan).
+    # Explicit select avoids loading 'rq' (~5 GB) and other unreferenced columns.
     comm_agg_raw = (pl.scan_parquet(parquet_path)
+                      .select([*id_keys, "event", "op", "bytes", "timestamp_ns"])
                       .filter(pl.col("event").is_in(["setup", "complete"]))
                       .group_by(*id_keys, "event", "op")
                       .agg(
@@ -230,19 +232,26 @@ def generate_stats(parquet_path):
         del per_comm_snap
 
     # --- Scan 4: Access pattern (per comm) ---
+    # Scan per-comm to avoid partition_by() on a 100M+ row DataFrame, which creates
+    # full copies of all partitions simultaneously and spikes RSS to 3× the frame size.
     if has_sector:
-        setup_df = (pl.scan_parquet(parquet_path)
-                      .select([*id_keys, "event", "op", "timestamp_ns", "sector", "bytes"])
-                      .filter(pl.col("event") == "setup")
-                      .filter(pl.col("sector").is_not_null())
-                      .collect(engine="streaming"))
-
-        for part in setup_df.partition_by(id_keys, maintain_order=False):
-            row0 = part.row(0, named=True)
-            comm, mntns_id_str = _comm_key(row0, has_mntns)
+        for (comm, mntns_id_str) in list(_entries.keys()):
+            if has_mntns and mntns_id_str:
+                comm_filter = (pl.col("comm") == comm) & (pl.col("mntns_id") == int(mntns_id_str))
+            else:
+                comm_filter = (pl.col("comm") == comm)
+            setup_df = (pl.scan_parquet(parquet_path)
+                          .filter(comm_filter)
+                          .filter(pl.col("event") == "setup")
+                          .filter(pl.col("sector").is_not_null())
+                          .select(["op", "sector", "bytes"])
+                          .collect(engine="streaming"))
+            if len(setup_df) == 0:
+                del setup_df
+                continue
             entry = ensure_comm_entry(comm, mntns_id_str)
             entry["access_pattern"].setdefault("cmd_sectors", {})
-            for op_part in part.partition_by("op", maintain_order=False):
+            for op_part in setup_df.partition_by("op", maintain_order=False):
                 op = op_part["op"][0]
                 sectors = op_part["sector"].cast(pl.Int64).to_numpy()
                 bytes_list = op_part["bytes"].cast(pl.Int64).to_numpy()
@@ -250,7 +259,7 @@ def generate_stats(parquet_path):
                     entry["access_pattern"]["cmd_sectors"][op] = compute_access_pattern(
                         sectors, bytes_list
                     )
-        del setup_df
+            del setup_df
 
     return bind_containers(_entries, mntns_map, comm_map), event_counts
 

@@ -203,7 +203,9 @@ def generate_stats(parquet_path):
     print("  Scan 1: counters...", flush=True)
     # Group by raw (comm, mntns_id) — streaming engine stays effective.
     # ts_min/ts_max and event_counts derived from this result (no separate scan).
+    # Explicit select avoids loading unreferenced columns (fd, offset, tid, etc.).
     comm_agg_raw = (pl.scan_parquet(parquet_path)
+                      .select([*id_keys, "event", "syscall", "bytes", "timestamp_ns"])
                       .group_by(*id_keys, "event", "syscall")
                       .agg(
                           pl.len().alias("count"),
