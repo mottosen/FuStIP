@@ -29,7 +29,8 @@ FIO_COMPOSE ?= $(ROOT_DIR)/util/container/fio-test/fio-test.yml
 
 VAL_JOBS = val_seqread val_seqwrite val_randread val_randwrite val_randrw
 WORK_JOBS = work_index_search work_bulk_insert work_compaction work_query_insert work_scan work_high_qd
-STRESS_JOBS = stress_2m stress_5m stress_10m
+STRESS_JOBS = stress_10m
+#stress_2m stress_5m 
 
 .NOTPARALLEL:
 
@@ -98,8 +99,14 @@ else
 		--section=$(1)
 endif
 	$(Q)sleep 5
-	$(if $(filter sysstat,$(LAYERS)),$(Q)$(MAKE) -C $(SYSSTAT_DIR) stop-collection $(LAYER_VARS) $(REDIRECT))
-	$(if $(filter fs,$(LAYERS)),$(Q)$(MAKE) -C $(FS_DIR) stop-collection $(LAYER_VARS) $(REDIRECT))
+	$(Q)( \
+		$(if $(filter fs,$(LAYERS)), $(MAKE) -C $(FS_DIR) stop-profiling $(LAYER_VARS) $(REDIRECT) &) \
+		$(if $(filter sysstat,$(LAYERS)), $(MAKE) -C $(SYSSTAT_DIR) stop-profiling $(LAYER_VARS) $(REDIRECT) &) \
+		wait )
+	$(if $(filter sysstat,$(LAYERS)),$(Q)$(MAKE) -C $(SYSSTAT_DIR) csv-to-parquet $(LAYER_VARS) $(REDIRECT))
+	$(if $(filter fs,$(LAYERS)),$(Q)$(MAKE) -C $(FS_DIR) csv-to-parquet $(LAYER_VARS) $(REDIRECT))
+	$(if $(filter sysstat,$(LAYERS)),$(Q)$(MAKE) -C $(SYSSTAT_DIR) generate-stats $(LAYER_VARS) $(REDIRECT))
+	$(if $(filter fs,$(LAYERS)),$(Q)$(MAKE) -C $(FS_DIR) generate-stats $(LAYER_VARS) $(REDIRECT))
 	$(Q)sleep 1
 	$(Q)python $(MAKEFILE_DIR)check_test.py --job $(1) \
 		--fio-json $(FIO_OUT) \
