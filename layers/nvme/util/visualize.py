@@ -7,7 +7,7 @@ from pathlib import Path
 import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
-from container.labeling import add_label_column, load_comm_label_map, load_mntns_label_map
+from container.labeling import get_comm_label, load_comm_label_map, load_mntns_label_map
 from visualization.shared import (build_dashboard, plot_cumulated_mb_over_time,
                                    plot_gap_cdf, plot_inflight_from_column,
                                    plot_io_latency_cdf, plot_io_size_cdf,
@@ -17,14 +17,29 @@ LAYER = "nvme"
 WINDOW_NS = 1_000_000_000
 
 
-def _build_row(label, parquet_path, mntns_map, comm_map, label_filter=None):
+def _comm_filter(comm_list, has_mntns):
+    """Build a Polars filter expression matching any of the (comm, mntns_id_str) pairs."""
+    if not comm_list:
+        return pl.lit(True)
+    if has_mntns:
+        parts = []
+        for comm, mntns_id_str in comm_list:
+            if mntns_id_str:
+                parts.append((pl.col("comm") == comm) & (pl.col("mntns_id") == int(mntns_id_str)))
+            else:
+                parts.append(pl.col("comm") == comm)
+        expr = parts[0]
+        for p in parts[1:]:
+            expr = expr | p
+        return expr
+    return pl.col("comm").is_in([c for c, _ in comm_list])
+
+
+def _build_row(label, parquet_path, comm_filter):
     """Build a dashboard row dict using per-plot Parquet scans."""
 
     def _scan(cols, event_filter=None):
-        """Lazy scan of Parquet with column selection and optional filters."""
-        lf = add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
-        if label_filter is not None:
-            lf = lf.filter(pl.col("label") == label_filter)
+        lf = pl.scan_parquet(parquet_path).filter(comm_filter)
         if event_filter is not None:
             lf = lf.filter(pl.col("event") == event_filter)
         return lf.select(cols)
@@ -93,20 +108,25 @@ def main():
         print(f"Parquet not found: {parquet_path}", file=sys.stderr)
         sys.exit(1)
 
-    schema = pl.scan_parquet(parquet_path).collect_schema()
     mntns_map = load_mntns_label_map(results_dir)
     comm_map = load_comm_label_map(results_dir)
-    has_label = "label" in add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map).collect_schema()
+    schema = pl.scan_parquet(parquet_path).collect_schema()
+    has_mntns = "mntns_id" in schema
+    id_keys = ["comm", "mntns_id"] if has_mntns else ["comm"]
+
+    # Group (comm, mntns_id) pairs by resolved label — no add_label_column in any scan.
+    comm_rows = pl.scan_parquet(parquet_path).select(id_keys).unique().collect(engine="streaming")
+    label_to_comms: dict = {}
+    for row in comm_rows.iter_rows(named=True):
+        comm = row["comm"]
+        mntns_id_str = str(row["mntns_id"]) if has_mntns and row.get("mntns_id") is not None else ""
+        label = get_comm_label(comm, mntns_id_str, mntns_map, comm_map)
+        label_to_comms.setdefault(label, []).append((comm, mntns_id_str))
 
     rows = []
-    if has_label:
-        labels = (add_label_column(pl.scan_parquet(parquet_path), mntns_map, comm_map)
-                  .select("label").drop_nulls().unique()
-                  .collect(engine="streaming"))["label"].sort().to_list()
-        for lbl in labels:
-            rows.append(_build_row(lbl, parquet_path, mntns_map, comm_map, label_filter=lbl))
-    else:
-        rows.append(_build_row("nvme", parquet_path, mntns_map, comm_map))
+    for label in sorted(label_to_comms):
+        cf = _comm_filter(label_to_comms[label], has_mntns)
+        rows.append(_build_row(label, parquet_path, cf))
 
     output = results_dir / "visualizations" / "nvme-dashboard.png"
     build_dashboard(
