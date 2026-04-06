@@ -29,8 +29,7 @@ FIO_COMPOSE ?= $(ROOT_DIR)/util/container/fio-test/fio-test.yml
 
 VAL_JOBS = val_seqread val_seqwrite val_randread val_randwrite val_randrw
 WORK_JOBS = work_index_search work_bulk_insert work_compaction work_query_insert work_scan work_high_qd
-STRESS_JOBS = stress_10m
-#stress_2m stress_5m 
+STRESS_JOBS = stress_2m stress_5m stress_10m
 
 .NOTPARALLEL:
 
