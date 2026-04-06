@@ -6,6 +6,8 @@ from pathlib import Path
 
 import polars as pl
 
+from stats_generation.shared import derive_throughput
+
 
 def load_mntns_label_map(results_dir: Path) -> dict[str, str]:
     """Load results/container_map.json as {mntns_id_str: container_label}."""
@@ -101,7 +103,7 @@ def _merge_entry_list(entries: list[dict]) -> dict:
     """Merge a list of per-comm entries (dominant first) into one.
 
     - counters: sum per-op values across all entries
-    - derived: max duration_s; sum per-op iops/throughput
+    - derived: max duration_s; iops/throughput recomputed from merged counters
     - distributions: merge stats (sum count/min/max/mean; dominant's quantiles)
     - tseries: keep dominant comm's (background comms have negligible inflight)
     - access_pattern: keep dominant comm's
@@ -128,12 +130,8 @@ def _merge_entry_list(entries: list[dict]) -> dict:
         for k, v in entry.get("derived", {}).items():
             if k == "duration_s":
                 merged["derived"]["duration_s"] = max(merged["derived"].get("duration_s", 0.0), v)
-            elif isinstance(v, dict):
-                if k not in merged["derived"]:
-                    merged["derived"][k] = dict(v)
-                else:
-                    for op, vv in v.items():
-                        merged["derived"][k][op] = round(merged["derived"][k].get(op, 0.0) + vv, 2)
+            # iops and throughput_mb_s are recomputed below from merged counters;
+            # summing per-comm rates would be wrong when comms have different durations.
 
         for metric, ops_dict in entry.get("distributions", {}).items():
             merged["distributions"].setdefault(metric, {})
@@ -144,6 +142,17 @@ def _merge_entry_list(entries: list[dict]) -> dict:
                     merged["distributions"][metric][op] = _merge_stats(
                         merged["distributions"][metric][op], stats
                     )
+
+    # Recompute IOPS and throughput from the merged counters and merged duration.
+    # Counter key conventions across layers: *_completed (count) and *_total_bytes (bytes).
+    duration_s = merged["derived"].get("duration_s", 0.0)
+    if duration_s > 0:
+        count_key = next((k for k in merged["counters"] if k.endswith("_completed")), None)
+        bytes_key = next((k for k in merged["counters"] if k.endswith("_total_bytes")), None)
+        if count_key and bytes_key:
+            merged["derived"].update(
+                derive_throughput(merged["counters"], duration_s, count_key, bytes_key)
+            )
 
     return merged
 
