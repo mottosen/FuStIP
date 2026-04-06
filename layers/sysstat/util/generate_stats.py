@@ -17,7 +17,7 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
-from stats_generation.shared import tseries_stats
+from stats_generation.shared import tseries_stats, _time_to_secs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from container_map import build_label_maps, get_label_order, remap_rows
@@ -42,11 +42,16 @@ def parse_csv(path, label_maps=None, processes=None):
 
 
 def compute_duration(rows, time_field="time"):
-    """Compute duration in seconds from unique timestamps."""
+    """Compute duration in seconds from the wall-clock span of unique timestamps.
+
+    Uses the actual time difference between first and last sample, so gaps in
+    pidstat output don't cause undercounting, and the duration correctly covers
+    the full collection window (container startup through shutdown).
+    """
     times = sorted(set(row[time_field] for row in rows))
     if len(times) < 2:
         return 0
-    return len(times) - 1
+    return _time_to_secs(times[-1]) - _time_to_secs(times[0])
 
 
 def cpu_stats(rows, duration_s):
@@ -106,8 +111,34 @@ def mem_stats(rows, duration_s):
     return result
 
 
+def _drop_first_tgid_appearances(rows):
+    """Drop the first row per tgid from dev rows before aggregation.
+
+    pidstat computes rates as (cumulative_now - cumulative_prev) / interval.
+    For a tgid's first appearance, prev=0, so the reported rate equals the
+    process's total accumulated I/O since start divided by one second.  For
+    long-running processes that pidstat encounters only at the end (e.g. a fio
+    master process, or a parent whose children's I/O rolls up on exit), this
+    produces a massive single-sample spike that corrupts mean and AUC.
+
+    Dropping the first row per tgid eliminates these artifacts without any
+    hardware-specific threshold.  The cost is one data point per process; for
+    processes that genuinely just started, the first sample would have been
+    valid but losing it is negligible over a full collection window.
+    """
+    seen = set()
+    result = []
+    for row in sorted(rows, key=lambda r: _time_to_secs(r["time"])):
+        if row["tgid"] not in seen:
+            seen.add(row["tgid"])
+            continue
+        result.append(row)
+    return result
+
+
 def dev_stats(rows):
     """Compute per-command device IO stats as time-series with AUC."""
+    rows = _drop_first_tgid_appearances(rows)
     metrics = ["kb_rd_s", "kb_wr_s", "kb_ccwr_s", "iodelay"]
 
     # Aggregate: command -> time -> {metric: summed_value}
