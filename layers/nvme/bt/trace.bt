@@ -72,11 +72,11 @@ rawtracepoint:nvme_complete_rq
 
 interval:s:1
 {
-    @cmd_inflight["read"] = tseries(@cmd_setup["read"] - @cmd_completed["read"], 1s, 120);
-    @cmd_inflight["write"] = tseries(@cmd_setup["write"] - @cmd_completed["write"], 1s, 120);
-    @cmd_inflight["flush"] = tseries(@cmd_setup["flush"] - @cmd_completed["flush"], 1s, 120);
-    @cmd_inflight["discard"] = tseries(@cmd_setup["discard"] - @cmd_completed["discard"], 1s, 120);
-    @cmd_inflight["write_zeros"] = tseries(@cmd_setup["write_zeros"] - @cmd_completed["write_zeros"], 1s, 120);
+    @cmd_inflight["read"] = tseries(@cmd_setup["read"] - @cmd_completed["read"], 1s, 7200);
+    @cmd_inflight["write"] = tseries(@cmd_setup["write"] - @cmd_completed["write"], 1s, 7200);
+    @cmd_inflight["flush"] = tseries(@cmd_setup["flush"] - @cmd_completed["flush"], 1s, 7200);
+    @cmd_inflight["discard"] = tseries(@cmd_setup["discard"] - @cmd_completed["discard"], 1s, 7200);
+    @cmd_inflight["write_zeros"] = tseries(@cmd_setup["write_zeros"] - @cmd_completed["write_zeros"], 1s, 7200);
 }
 
 END

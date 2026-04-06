@@ -206,10 +206,10 @@ tracepoint:syscalls:sys_enter_munmap
 
 interval:s:1
 {
-    @sc_inflight["read"] = tseries(@sc_entered["read"] - @sc_completed["read"], 1s, 120);
-    @sc_inflight["write"] = tseries(@sc_entered["write"] - @sc_completed["write"], 1s, 120);
-    @sc_inflight["pread64"] = tseries(@sc_entered["pread64"] - @sc_completed["pread64"], 1s, 120);
-    @sc_inflight["pwrite64"] = tseries(@sc_entered["pwrite64"] - @sc_completed["pwrite64"], 1s, 120);
+    @sc_inflight["read"] = tseries(@sc_entered["read"] - @sc_completed["read"], 1s, 7200);
+    @sc_inflight["write"] = tseries(@sc_entered["write"] - @sc_completed["write"], 1s, 7200);
+    @sc_inflight["pread64"] = tseries(@sc_entered["pread64"] - @sc_completed["pread64"], 1s, 7200);
+    @sc_inflight["pwrite64"] = tseries(@sc_entered["pwrite64"] - @sc_completed["pwrite64"], 1s, 7200);
 }
 
 // ── Output ──
