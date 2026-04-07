@@ -159,7 +159,8 @@ def plot_type_distribution(ax, counts_by_type):
 
 
 def plot_inflight_from_column(ax, df, type_col, types,
-                              inflight_col="inflight", title="Inflight Over Time"):
+                              inflight_col="inflight", title="Inflight Over Time",
+                              ylabel=None):
     """Plot inflight from pre-aggregated per-sec data.
 
     Expects df with columns: type_col, "sec", inflight_col
@@ -174,7 +175,7 @@ def plot_inflight_from_column(ax, df, type_col, types,
                 label=typ, color=_color_for(typ, i),
                 linestyle=_linestyle_for(typ), linewidth=0.8)
     ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Inflight")
+    ax.set_ylabel(ylabel if ylabel is not None else "Inflight")
     ax.set_title(title)
     ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
 

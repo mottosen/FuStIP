@@ -81,7 +81,7 @@ def _build_row(label, parquet_path, comm_filter, ts_min):
               .group_by("op", "sec").agg(pl.len().alias("iops"))
               .sort("op", "sec")
               .collect(engine="streaming"))
-        plot_inflight_from_column(ax, df, "op", t, inflight_col="iops", title="IOPS")
+        plot_inflight_from_column(ax, df, "op", t, inflight_col="iops", title="IOPS", ylabel="IOPS")
 
     def gap_fn(ax, t=types):
         df = _scan(["op", "sector", "bytes", "timestamp_ns"], event_filter="setup").collect(engine="streaming")

@@ -293,7 +293,7 @@ def _build_row(label, parquet_path, comm_filter, ts_min):
         plot_inflight_from_column(ax, df, "syscall", t)
 
     def iops_fn(ax, t=types, df=iops_df):
-        plot_inflight_from_column(ax, df, "syscall", t, inflight_col="iops", title="IOPS")
+        plot_inflight_from_column(ax, df, "syscall", t, inflight_col="iops", title="IOPS", ylabel="IOPS")
 
     def cumul_fn(ax, t=types, df=cumul_df):
         plot_cumulated_mb_over_time(ax, df, "syscall", "bytes", t)
