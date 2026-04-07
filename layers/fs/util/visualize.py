@@ -213,14 +213,14 @@ def _plot_fs_gap_cdf(ax, parquet_path, types, comm_filter):
     ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
 
-def _build_row(label, parquet_path, comm_filter):
+def _build_row(label, parquet_path, comm_filter, ts_min):
     """Build a dashboard row dict using lazy-loaded exit_df for size/latency plots.
 
     Memory design: with multiple labels (comms/containers), eagerly pre-collecting
     exit_df for all rows simultaneously would stack N × ~7 GB in memory before any
     plot is rendered.  Instead:
 
-      Scan 1 (tiny streaming):  ts_min scalar + counts dict.
+      Scan 1 (tiny streaming):  counts dict.
       Scan 2 (tiny streaming):  cumul MB per-second (~240 rows).
       Scan 3 (tiny streaming):  inflight per-second (~240 rows).
       Lazy exit_df:  collected on-demand by size_fn, reused by latency_fn, then
@@ -231,16 +231,15 @@ def _build_row(label, parquet_path, comm_filter):
     """
     io_list = list(IO_SYSCALLS)
 
-    # === Scan 1: tiny aggregated scan for ts_min and type counts ===
+    # === Scan 1: tiny aggregated scan for type counts ===
     counts_and_ts = (pl.scan_parquet(parquet_path)
                      .filter(comm_filter)
                      .filter(pl.col("event") == "exit")
                      .filter(pl.col("syscall").is_in(io_list))
-                     .select(["syscall", "timestamp_ns"])
+                     .select(["syscall"])
                      .group_by("syscall")
-                     .agg(pl.len().alias("cnt"), pl.col("timestamp_ns").min().alias("ts_min"))
+                     .agg(pl.len().alias("cnt"))
                      .collect(engine="streaming"))
-    ts_min = counts_and_ts["ts_min"].min()
     counts = dict(zip(counts_and_ts["syscall"].to_list(), counts_and_ts["cnt"].to_list()))
     types = sort_types(counts.keys())
 
@@ -335,10 +334,14 @@ def main():
         label = get_comm_label(comm, mntns_id_str, mntns_map, comm_map)
         label_to_comms.setdefault(label, []).append((comm, mntns_id_str))
 
+    global_ts_min = (pl.scan_parquet(parquet_path)
+                     .select(pl.col("timestamp_ns").min())
+                     .collect(engine="streaming").item())
+
     rows = []
     for label in sorted(label_to_comms):
         cf = _comm_filter(label_to_comms[label], has_mntns)
-        rows.append(_build_row(label, parquet_path, cf))
+        rows.append(_build_row(label, parquet_path, cf, global_ts_min))
 
     output = results_dir / "visualizations" / "fs-dashboard.png"
     build_dashboard(

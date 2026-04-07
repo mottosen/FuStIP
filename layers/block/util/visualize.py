@@ -35,7 +35,7 @@ def _comm_filter(comm_list, has_mntns):
     return pl.col("comm").is_in([c for c, _ in comm_list])
 
 
-def _build_row(label, parquet_path, comm_filter):
+def _build_row(label, parquet_path, comm_filter, ts_min):
     """Build a dashboard row dict using per-plot Parquet scans."""
 
     def _scan(cols, event_filter=None):
@@ -50,11 +50,6 @@ def _build_row(label, parquet_path, comm_filter):
                  .collect(engine="streaming"))
     counts = dict(zip(*counts_df.select("op", "len").get_columns()))
     types = sort_types(counts.keys())
-
-    # Pre-compute ts_min once (tiny scan)
-    ts_min = (_scan(["timestamp_ns"])
-              .select(pl.col("timestamp_ns").min())
-              .collect(engine="streaming").item())
 
     def q_fn(ax, t=types, ts_min=ts_min):
         df = (_scan(["timestamp_ns", "op", "q_inflight"])
@@ -127,11 +122,15 @@ def main():
         label = get_comm_label(comm, mntns_id_str, mntns_map, comm_map)
         label_to_comms.setdefault(label, []).append((comm, mntns_id_str))
 
+    global_ts_min = (pl.scan_parquet(parquet_path)
+                     .select(pl.col("timestamp_ns").min())
+                     .collect(engine="streaming").item())
+
     print("Building dashboard...")
     rows = []
     for label in sorted(label_to_comms):
         cf = _comm_filter(label_to_comms[label], has_mntns)
-        rows.append(_build_row(label, parquet_path, cf))
+        rows.append(_build_row(label, parquet_path, cf, global_ts_min))
 
     output = results_dir / "visualizations" / "block-dashboard.png"
     build_dashboard(

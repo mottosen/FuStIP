@@ -312,6 +312,17 @@ def build_dashboard(rows, col_titles, title, output_path, col_ylims=None):
         for r in range(nrows):
             axes[r, c].set_ylim(y_min, y_max)
 
+    # Unify x-axes per column for time-series columns (non-CDF, non-pie)
+    for c in range(ncols):
+        if "CDF" in col_titles[c] or "Distribution" in col_titles[c]:
+            continue
+        xlims = [axes[r, c].get_xlim() for r in range(nrows)]
+        x_min = min(lim[0] for lim in xlims)
+        x_max = max(lim[1] for lim in xlims)
+        if x_min < x_max:
+            for r in range(nrows):
+                axes[r, c].set_xlim(x_min, x_max)
+
     cdf_cols = [c for c, title_str in enumerate(col_titles) if "CDF" in title_str]
     for c in cdf_cols:
         x_scale_set = {axes[r, c].get_xscale() for r in range(nrows)}
