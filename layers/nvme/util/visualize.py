@@ -75,6 +75,14 @@ def _build_row(label, parquet_path, comm_filter, ts_min):
         df = _scan(["op", "latency_ns"], event_filter="complete").collect(engine="streaming")
         plot_io_latency_cdf(ax, df, "op", "latency_ns", t)
 
+    def iops_fn(ax, t=types, ts_min=ts_min):
+        df = (_scan(["timestamp_ns", "op"], event_filter="complete")
+              .with_columns(((pl.col("timestamp_ns") - ts_min) // WINDOW_NS).cast(pl.Int64).alias("sec"))
+              .group_by("op", "sec").agg(pl.len().alias("iops"))
+              .sort("op", "sec")
+              .collect(engine="streaming"))
+        plot_inflight_from_column(ax, df, "op", t, inflight_col="iops", title="IOPS")
+
     def gap_fn(ax, t=types):
         df = _scan(["op", "sector", "bytes", "timestamp_ns"], event_filter="setup").collect(engine="streaming")
         plot_gap_cdf(ax, df, "op", "sector", "bytes", t)
@@ -84,6 +92,7 @@ def _build_row(label, parquet_path, comm_filter, ts_min):
         "plots": [
             lambda ax, c=counts: plot_type_distribution(ax, c),
             inflight_fn,
+            iops_fn,
             cumul_fn,
             size_fn,
             latency_fn,
@@ -130,7 +139,7 @@ def main():
     output = results_dir / "visualizations" / "nvme-dashboard.png"
     build_dashboard(
         rows=rows,
-        col_titles=["Type Distribution", "Inflight", "Cumul. MB", "IO Size CDF", "Latency CDF", "Gap CDF"],
+        col_titles=["Type Distribution", "Inflight", "IOPS", "Cumul. MB", "IO Size CDF", "Latency CDF", "Gap CDF"],
         title="NVMe Layer Dashboard",
         output_path=output,
     )

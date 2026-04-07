@@ -22,6 +22,7 @@ Usage:
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -29,7 +30,6 @@ import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from stats_generation.shared import (compute_access_pattern,
-                                     derive_throughput,
                                      tseries_stats)
 from container.labeling import bind_containers, load_comm_label_map, load_mntns_label_map
 
@@ -99,7 +99,6 @@ def generate_stats(parquet_path):
         if key not in _entries:
             _entries[key] = {
                 "counters": {},
-                "derived": {},
                 "distributions": {},
                 "tseries": {},
                 "access_pattern": {},
@@ -159,18 +158,7 @@ def generate_stats(parquet_path):
                 [int(v) for v in insert_rows["count"].to_list()]
             ))
 
-        comm_ts_min = part["ts_min"].min()
-        comm_ts_max = part["ts_max"].max()
-        comm_duration_s = (comm_ts_max - comm_ts_min) / 1e9 if (
-            comm_ts_min and comm_ts_max and comm_ts_max > comm_ts_min
-        ) else 0
-
         entry["counters"] = comm_counters
-        comm_derived = {"duration_s": round(comm_duration_s, 2)}
-        comm_derived.update(derive_throughput(
-            comm_counters, comm_duration_s, "rq_completed", "rq_total_bytes"
-        ))
-        entry["derived"] = comm_derived
 
     del comm_agg_raw
 
@@ -246,9 +234,12 @@ def generate_stats(parquet_path):
                            .agg(
                                pl.col("q_inflight").last(),
                                pl.col("d_inflight").last(),
+                               pl.when(pl.col("event") == "complete")
+                                 .then(pl.lit(1)).otherwise(pl.lit(0)).sum().alias("io_count"),
                            )
                            .collect(engine="streaming"))
 
+        total_secs = math.ceil(duration_s)
         for part in per_comm_snap.partition_by(id_keys, maintain_order=False):
             row0 = part.row(0, named=True)
             comm, mntns_id_str = _comm_key(row0, has_mntns)
@@ -263,6 +254,18 @@ def generate_stats(parquet_path):
                     ]
                     if points:
                         entry["tseries"].setdefault(stage, {})[op] = tseries_stats(points)
+                # IOPS time series: zero-filled over the global profiling window
+                sec_to_iops = {
+                    int(s): int(v)
+                    for s, v in zip(op_part["sec"].to_list(), op_part["io_count"].to_list())
+                    if v is not None
+                }
+                iops_points = [
+                    {"time": _sec_to_time(s), "value": sec_to_iops.get(s, 0)}
+                    for s in range(total_secs)
+                ]
+                if iops_points:
+                    entry["tseries"].setdefault("iops", {})[op] = tseries_stats(iops_points)
         del per_comm_snap
 
     # --- Scan 4: Access pattern (per comm) ---

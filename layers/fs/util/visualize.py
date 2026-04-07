@@ -264,6 +264,16 @@ def _build_row(label, parquet_path, comm_filter, ts_min):
                    .sort("syscall", "sec")
                    .collect(engine="streaming"))
 
+    # === Scan 3b: IOPS per-second (tiny streaming aggregation) ===
+    iops_df = (pl.scan_parquet(parquet_path)
+               .filter(comm_filter)
+               .filter((pl.col("event") == "exit") & pl.col("syscall").is_in(io_list))
+               .select(["syscall", "timestamp_ns"])
+               .with_columns(((pl.col("timestamp_ns") - ts_min) // WINDOW_NS).cast(pl.Int64).alias("sec"))
+               .group_by("syscall", "sec").agg(pl.len().alias("iops"))
+               .sort("syscall", "sec")
+               .collect(engine="streaming"))
+
     # === Lazy exit_df: loaded on first call, freed after latency_fn ===
     # Mutable single-element list used as a shared cache between size_fn and
     # latency_fn closures so both share one scan and exit_df is freed before gap_fn.
@@ -281,6 +291,9 @@ def _build_row(label, parquet_path, comm_filter, ts_min):
 
     def inflight_fn(ax, t=types, df=inflight_df):
         plot_inflight_from_column(ax, df, "syscall", t)
+
+    def iops_fn(ax, t=types, df=iops_df):
+        plot_inflight_from_column(ax, df, "syscall", t, inflight_col="iops", title="IOPS")
 
     def cumul_fn(ax, t=types, df=cumul_df):
         plot_cumulated_mb_over_time(ax, df, "syscall", "bytes", t)
@@ -300,6 +313,7 @@ def _build_row(label, parquet_path, comm_filter, ts_min):
         "plots": [
             lambda ax, c=counts: plot_type_distribution(ax, c),
             inflight_fn,
+            iops_fn,
             cumul_fn,
             size_fn,
             latency_fn,
@@ -346,7 +360,7 @@ def main():
     output = results_dir / "visualizations" / "fs-dashboard.png"
     build_dashboard(
         rows=rows,
-        col_titles=["Type Distribution", "Inflight", "Cumul. MB", "IO Size CDF", "Latency CDF", "Gap CDF"],
+        col_titles=["Type Distribution", "Inflight", "IOPS", "Cumul. MB", "IO Size CDF", "Latency CDF", "Gap CDF"],
         title="Filesystem Layer Dashboard",
         output_path=output,
     )
