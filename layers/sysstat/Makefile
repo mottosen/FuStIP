@@ -12,6 +12,9 @@ endif
 PIDSTAT := $(shell which pidstat)
 PIDS_DIR = /tmp/sysstat-pids
 
+export TZ := UTC
+export LC_ALL := C
+
 INTERVAL ?= 1
 
 .NOTPARALLEL:
@@ -39,7 +42,7 @@ start-collection: ensure-results-exists ensure-sudo
 
 	$(Q)mkdir -p "$(PIDS_DIR)"
 
-	$(Q)sudo $(PIDSTAT) -turd $(INTERVAL) \
+	$(Q)sudo -E $(PIDSTAT) -turd $(INTERVAL) \
 		> "$(RESULTS_DIR)/sysstat/pidstat.out" \
 		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/pidstat.pid"
 

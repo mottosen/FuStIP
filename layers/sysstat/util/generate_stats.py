@@ -17,7 +17,7 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
-from stats_generation.shared import tseries_stats, _time_to_secs
+from stats_generation.shared import tseries_stats, _time_to_secs, _sort_times_chronological
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from container_map import build_label_maps, get_label_order, remap_rows
@@ -48,10 +48,14 @@ def compute_duration(rows, time_field="time"):
     pidstat output don't cause undercounting, and the duration correctly covers
     the full collection window (container startup through shutdown).
     """
-    times = sorted(set(row[time_field] for row in rows))
+    times = _sort_times_chronological(row[time_field] for row in rows)
     if len(times) < 2:
         return 0
-    return _time_to_secs(times[-1]) - _time_to_secs(times[0])
+    start = _time_to_secs(times[0])
+    end = _time_to_secs(times[-1])
+    if end < start:
+        end += 86400  # end is next day
+    return end - start
 
 
 def cpu_stats(rows, duration_s):

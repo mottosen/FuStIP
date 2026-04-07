@@ -31,8 +31,9 @@ def _read_csv(path):
 
 
 def _unique_times(rows):
-    """Sorted unique time values from rows."""
-    return sorted(set(row["time"] for row in rows))
+    """Chronologically sorted unique time values from rows, midnight-aware."""
+    from stats_generation.shared import _sort_times_chronological
+    return _sort_times_chronological(row["time"] for row in rows)
 
 
 def _group_timeseries(rows, metric, time_index):

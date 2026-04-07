@@ -480,16 +480,27 @@ def histogram_with_buckets(buckets):
 
 
 def _time_to_secs(t):
-    """Parse a time string (HH:MM:SS or HH:MM:SS AM/PM) to seconds."""
-    parts = t.strip().split()
-    h, m, s = (int(x) for x in parts[0].split(":"))
-    if len(parts) > 1:
-        ampm = parts[1].upper()
-        if ampm == "PM" and h != 12:
-            h += 12
-        elif ampm == "AM" and h == 12:
-            h = 0
+    """Parse a 24-hour time string HH:MM:SS to seconds."""
+    h, m, s = (int(x) for x in t.strip().split(":"))
     return h * 3600 + m * 60 + s
+
+
+def _sort_times_chronological(time_strings):
+    """Sort HH:MM:SS strings chronologically, handling midnight crossings.
+
+    Sorts by numeric value, then detects a gap > 12 hours between consecutive
+    entries — the signature of a midnight boundary.  The sequence is rotated at
+    that point so the chronological start (pre-midnight values) comes first.
+    """
+    times = sorted(set(time_strings), key=_time_to_secs)
+    if len(times) < 2:
+        return times
+    secs = [_time_to_secs(t) for t in times]
+    max_gap_idx = max(range(len(secs) - 1), key=lambda i: secs[i + 1] - secs[i])
+    if secs[max_gap_idx + 1] - secs[max_gap_idx] > 43200:  # > 12 h → midnight
+        split = max_gap_idx + 1
+        times = times[split:] + times[:split]
+    return times
 
 
 def _normalize_times(points):
@@ -500,6 +511,8 @@ def _normalize_times(points):
     result = []
     for p in points:
         offset = _time_to_secs(p["time"]) - base
+        if offset < 0:
+            offset += 86400  # run crossed midnight
         h, rem = divmod(offset, 3600)
         m, s = divmod(rem, 60)
         result.append({"time": f"{h:02d}:{m:02d}:{s:02d}", "value": p["value"]})
