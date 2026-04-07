@@ -163,6 +163,9 @@ def main():
         for cname in containers
     }
 
+    # Reset immediately — container data is scoped to one profiling session.
+    _write(out_path, state)
+
     def _exit(sig, frame):
         _write(out_path, state)
         sys.exit(0)
@@ -179,19 +182,22 @@ def main():
             # Enumerate all container PIDs from cgroup for comprehensive tgid/comm coverage
             container_pids = _pids_from_cgroup(pid)
             state[cname]["tgids"].update(container_pids)
-            # Try mntns from init pid, then all cgroup pids, then docker exec fallback
-            if not state[cname]["mntns_ids"]:
-                mntns_id = _mntns_from_pid(pid)
-                if not mntns_id:
-                    for p in container_pids:
-                        mntns_id = _mntns_from_pid(p)
-                        if mntns_id:
-                            break
-                if not mntns_id:
-                    mntns_id = _mntns_from_container(cname)
-                if mntns_id:
-                    state[cname]["mntns_ids"].add(mntns_id)
+            # Always discover mntns_id — accumulate across container instances
+            # so each job's ephemeral container is captured for stats binding.
+            mntns_id = _mntns_from_pid(pid)
+            if not mntns_id:
+                for p in container_pids:
+                    mntns_id = _mntns_from_pid(p)
+                    if mntns_id:
+                        break
+            if not mntns_id:
+                mntns_id = _mntns_from_container(cname)
+            if mntns_id:
+                state[cname]["mntns_ids"].add(mntns_id)
             state[cname]["comms"].update(_collect_comms(cname, pid))
+        # Write after every poll so generate_detailed_stats.py always sees the
+        # current container's mntns_id (not just the final state on exit).
+        _write(out_path, state)
         time.sleep(2)
 
 
