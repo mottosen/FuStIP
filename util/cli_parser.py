@@ -17,6 +17,35 @@ TEST_SUITES = {
 }
 
 
+def _as_csv(val):
+    if isinstance(val, list):
+        return ",".join(str(v) for v in val)
+    return str(val)
+
+
+def _load_config(path):
+    try:
+        import yaml
+    except ImportError:
+        print("Error: PyYAML is required for --config (pip install pyyaml)", file=sys.stderr)
+        sys.exit(1)
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _apply_config_defaults(args, cfg):
+    if args.layers is None and "layers" in cfg:
+        args.layers = [_as_csv(cfg["layers"])]
+    if args.mode is None and "mode" in cfg:
+        args.mode = cfg["mode"]
+    if args.comm_filter is None and "comm_filter" in cfg:
+        args.comm_filter = _as_csv(cfg["comm_filter"])
+    if args.container_filter is None and "container_filter" in cfg:
+        args.container_filter = _as_csv(cfg["container_filter"])
+    if args.dev_filter is None and "dev_filter" in cfg:
+        args.dev_filter = _as_csv(cfg["dev_filter"])
+
+
 def parse_args(argv=None):
     parent = argparse.ArgumentParser(add_help=False)
     parent.add_argument(
@@ -25,10 +54,11 @@ def parse_args(argv=None):
         default=None,
         help="Layers to target, comma-separated and/or repeatable (default: all)",
     )
-    parent.add_argument("-m", "--mode", choices=["summary", "detailed"], default="summary")
+    parent.add_argument("-m", "--mode", choices=["summary", "detailed"], default=None)
     parent.add_argument("-p", "--comm-filter", help="Process/command name filter, comma-separated for multiple (block, fs)")
     parent.add_argument("-c", "--container-filter", help="Container name filter, comma-separated for multiple (forces detailed)")
     parent.add_argument("-d", "--dev-filter", help="NVMe device filter, comma-separated for multiple (e.g. nvme0n1,nvme1n1)")
+    parent.add_argument("--config", metavar="FILE", help="YAML config file; CLI flags override file values")
     parent.add_argument("--dir", "--results-dir", dest="results_dir", help="Results directory (overrides RESULTS_DIR env var)")
     parent.add_argument("--clean", action="store_true", help="Clean each selected layer's results subdirectory")
     parent.add_argument("--visualize", action="store_true", help="Generate visualization dashboards (detailed mode only)")
@@ -55,6 +85,14 @@ def parse_args(argv=None):
     test_sub.add_parser("all", parents=[parent], help="Run all test jobs")
 
     args = parser.parse_args(argv)
+
+    # Apply config file defaults (CLI flags win: they set args away from sentinel)
+    if args.config:
+        _apply_config_defaults(args, _load_config(args.config))
+
+    # Apply built-in default for mode (after config, before layer processing)
+    if args.mode is None:
+        args.mode = "summary"
 
     # Flatten comma-separated values from repeated -l flags
     if args.layers is None:
