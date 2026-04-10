@@ -88,6 +88,33 @@ def cpu_stats(rows, duration_s):
     return result
 
 
+def cpu_per_core_stats(rows):
+    """Compute per-core CPU AUC per container.
+
+    For each (command, core), sums cpu_pct across all threads on that core at
+    each timestamp, then computes the area under the resulting time series.
+
+    Returns: {"per_command": {"container": {"0": {"area_under_curve": float}, ...}}}
+    """
+    # Aggregate: command -> core -> time -> summed cpu_pct
+    agg = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+    for row in rows:
+        cmd, core, time = row["command"], row["cpu"], row["time"]
+        agg[cmd][core][time] += float(row["cpu_pct"])
+
+    result = {}
+    for cmd, cores in agg.items():
+        cmd_result = {}
+        for core, times in cores.items():
+            points = [{"time": t, "value": round(times[t], 2)}
+                      for t in sorted(times)]
+            stats = tseries_stats(points)
+            cmd_result[core] = {"area_under_curve": stats["area_under_curve"]}
+        result[cmd] = cmd_result
+
+    return {"per_command": result}
+
+
 def mem_stats(rows, duration_s):
     """Compute per-command memory stats as time-series with AUC."""
     metrics = ["minflt_s", "majflt_s", "vsz_kb", "rss_kb", "mem_pct"]
@@ -214,6 +241,7 @@ def main():
 
     if "cpu" in csv_data:
         result["cpu"] = {"per_command": cpu_stats(csv_data["cpu"], duration_s)}
+        result["cpu_per_core"] = cpu_per_core_stats(csv_data["cpu"])
     if "mem" in csv_data:
         result["mem"] = {"per_command": mem_stats(csv_data["mem"], duration_s)}
     if "dev" in csv_data:
