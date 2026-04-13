@@ -17,22 +17,54 @@ TEST_SUITES = {
 }
 
 
+def _as_csv(val):
+    if isinstance(val, list):
+        return ",".join(str(v) for v in val)
+    return str(val)
+
+
+def _load_config(path):
+    try:
+        import yaml
+    except ImportError:
+        print("Error: PyYAML is required for --config (pip install pyyaml)", file=sys.stderr)
+        sys.exit(1)
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _apply_config_defaults(args, cfg):
+    if args.layers is None and "layers" in cfg:
+        args.layers = [_as_csv(cfg["layers"])]
+    if args.mode is None and "mode" in cfg:
+        args.mode = cfg["mode"]
+    if args.comm_filter is None and "comm_filter" in cfg:
+        args.comm_filter = _as_csv(cfg["comm_filter"])
+    if args.container_filter is None and "container_filter" in cfg:
+        args.container_filter = _as_csv(cfg["container_filter"])
+    if args.dev_filter is None and "dev_filter" in cfg:
+        args.dev_filter = _as_csv(cfg["dev_filter"])
+
+
 def parse_args(argv=None):
     parent = argparse.ArgumentParser(add_help=False)
     parent.add_argument(
         "-l", "--layers",
         action="append",
         default=None,
-        help="Layers to target, comma-separated and/or repeatable (default: all)",
+        help="Layers to target, comma-separated and/or repeatable (default: all) [config: layers]",
     )
-    parent.add_argument("-m", "--mode", choices=["summary", "detailed"], default="summary")
-    parent.add_argument("-p", "--comm-filter", help="Process/command name filter, comma-separated for multiple (block, fs)")
-    parent.add_argument("-c", "--container-filter", help="Container name filter, comma-separated for multiple (forces detailed)")
-    parent.add_argument("-d", "--dev-filter", help="NVMe device filter, comma-separated for multiple (e.g. nvme0n1,nvme1n1)")
-    parent.add_argument("--clean", action="store_true", help="Clean results directory first")
-    parent.add_argument("--visualize", action="store_true", help="Generate visualization dashboards (detailed mode only)")
-    parent.add_argument("--debug", action="store_true", help="Enable verbose Makefile output (DEBUG=1)")
-    parent.add_argument("--dry", action="store_true", help="Print commands instead of executing")
+    parent.add_argument("-m", "--mode", choices=["summary", "detailed"], default=None,
+                        help="Profiling mode: summary or detailed (default: summary) [config: mode]")
+    parent.add_argument("-p", "--comm-filter", help="Process/command name filter, comma-separated for multiple (block, fs) [config: comm_filter]")
+    parent.add_argument("-c", "--container-filter", help="Container name filter, comma-separated for multiple (forces detailed) [config: container_filter]")
+    parent.add_argument("-d", "--dev-filter", help="NVMe device filter, comma-separated for multiple (e.g. nvme0n1,nvme1n1) [config: dev_filter]")
+    parent.add_argument("--config", metavar="FILE", help="YAML config file; CLI flags override file values [CLI only]")
+    parent.add_argument("--dir", "--results-dir", dest="results_dir", help="Results directory (overrides RESULTS_DIR env var) [CLI only]")
+    parent.add_argument("--clean", action="store_true", help="Clean each selected layer's results subdirectory [CLI only]")
+    parent.add_argument("--visualize", action="store_true", help="Generate visualization dashboards (detailed mode only) [CLI only]")
+    parent.add_argument("--debug", action="store_true", help="Enable verbose Makefile output (DEBUG=1) [CLI only]")
+    parent.add_argument("--dry", action="store_true", help="Print commands instead of executing [CLI only]")
 
     parser = argparse.ArgumentParser(
         prog="run.sh",
@@ -54,6 +86,14 @@ def parse_args(argv=None):
     test_sub.add_parser("all", parents=[parent], help="Run all test jobs")
 
     args = parser.parse_args(argv)
+
+    # Apply config file defaults (CLI flags win: they set args away from sentinel)
+    if args.config:
+        _apply_config_defaults(args, _load_config(args.config))
+
+    # Apply built-in default for mode (after config, before layer processing)
+    if args.mode is None:
+        args.mode = "summary"
 
     # Flatten comma-separated values from repeated -l flags
     if args.layers is None:
@@ -110,11 +150,11 @@ def validate(args):
 
 def resolve_env(args):
     """Resolve required environment variables onto args."""
-    results_dir = os.environ.get("RESULTS_DIR")
-    if not results_dir:
-        print("Error: RESULTS_DIR is not set", file=sys.stderr)
+    if not args.results_dir:
+        args.results_dir = os.environ.get("RESULTS_DIR")
+    if not args.results_dir:
+        print("Error: results dir not set (use --dir or RESULTS_DIR env var)", file=sys.stderr)
         sys.exit(1)
-    args.results_dir = results_dir
 
     if args.action == "test":
         fio_file = os.environ.get("FIO_FILE")
@@ -131,6 +171,8 @@ def build_layer_vars(layer, args):
     if layer == "sysstat":
         if args.comm_filter:
             vs.append(f"COMM_FILTER={args.comm_filter}")
+        if args.container_filter:
+            vs.append(f"CONTAINER_FILTER={args.container_filter}")
         vs.append(f"RESULTS_DIR={args.results_dir}")
         return vs
 
@@ -159,17 +201,51 @@ def _concurrent(cmds):
     return [f"{cmd} &" for cmd in cmds] + ["wait"]
 
 
+def _concurrent_isolated(cmds):
+    """Run commands concurrently inside a subshell, isolating wait from prior jobs."""
+    if len(cmds) <= 1:
+        return cmds
+    body = " ".join(f"{cmd} &" for cmd in cmds) + " wait"
+    return [f"( {body} )"]
+
+
+def _container_map_start_cmd(args):
+    if not args.container_filter:
+        return None
+    return (
+        f"python ./util/container/generate_container_map.py "
+        f"\"{args.results_dir}\" \"{args.container_filter}\" >/dev/null 2>&1 "
+        f"& echo $! > /tmp/fustip-container-map.pid"
+    )
+
+
+def _container_map_stop_cmd():
+    return (
+        "if [ -f /tmp/fustip-container-map.pid ]; then "
+        "pid=$(cat /tmp/fustip-container-map.pid); "
+        "kill $pid 2>/dev/null || true; "
+        "i=0; while [ -d /proc/$pid ] && [ $i -lt 50 ]; do sleep 0.2; i=$((i+1)); done; "
+        "rm -f /tmp/fustip-container-map.pid; "
+        "fi"
+    )
+
+
 def generate_profile_commands(args):
     if args.sub_action == "start":
         cmds = []
+        map_cmd = _container_map_start_cmd(args)
+        if map_cmd:
+            cmds.append(map_cmd)
+        layer_cmds = []
         for layer in PROFILE_START_ORDER:
             if layer in args.layers:
                 vs = build_layer_vars(layer, args)
-                cmds.append(f"make -C layers/{layer} start-collection {' '.join(vs)}")
-        return _concurrent(cmds)
+                layer_cmds.append(f"make -C layers/{layer} start-collection {' '.join(vs)}")
+        # Keep container-map detached from shell wait; otherwise profile start hangs.
+        return cmds + _concurrent_isolated(layer_cmds)
 
     # stop: parallel stop-profiling, then sequential csv-to-parquet + generate-stats
-    stop_cmds = []
+    stop_cmds = [_container_map_stop_cmd()] if args.container_filter else []
     for layer in PROFILE_STOP_ORDER:
         if layer in args.layers:
             vs = build_layer_vars(layer, args)
@@ -196,6 +272,9 @@ def generate_test_commands(args):
     selected = set(args.layers)
     target = TEST_TARGET_MAP[args.sub_action]
     cmds = []
+    map_cmd = _container_map_start_cmd(args)
+    if map_cmd:
+        cmds.append(map_cmd)
 
     # Determine which layers within each suite are selected
     block_nvme_layers = sorted(TEST_SUITES["block_nvme"] & selected)
@@ -233,6 +312,8 @@ def generate_test_commands(args):
         vs.append(f"RESULTS_DIR={args.results_dir}")
         cmds.append(f"make -C tests/filesystem {target} {' '.join(vs)} || echo '!! filesystem suite failed'")
 
+    if args.container_filter:
+        cmds.append(_container_map_stop_cmd())
     return cmds
 
 
@@ -252,7 +333,8 @@ def main(argv=None):
     cmds = ["clear"]
 
     if args.clean:
-        cmds.append(f"rm -rf {args.results_dir}/*")
+        for layer in args.layers:
+            cmds.append(f"rm -rf {args.results_dir}/{layer}")
 
     if args.action == "profile":
         cmds.extend(generate_profile_commands(args))

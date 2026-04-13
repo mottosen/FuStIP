@@ -77,16 +77,16 @@ rawtracepoint:block_rq_complete
 
 interval:s:1
 {
-    @q_inflight["read"] = tseries(@rq_queued["read"] - @rq_queue_done["read"], 1s, 120);
-    @q_inflight["write"] = tseries(@rq_queued["write"] - @rq_queue_done["write"], 1s, 120);
-    @d_inflight["read"] = tseries(@rq_issued["read"] - @rq_completed["read"], 1s, 120);
-    @d_inflight["write"] = tseries(@rq_issued["write"] - @rq_completed["write"], 1s, 120);
-    @q_inflight["flush"] = tseries(@rq_queued["flush"] - @rq_queue_done["flush"], 1s, 120);
-    @q_inflight["discard"] = tseries(@rq_queued["discard"] - @rq_queue_done["discard"], 1s, 120);
-    @q_inflight["write_zeros"] = tseries(@rq_queued["write_zeros"] - @rq_queue_done["write_zeros"], 1s, 120);
-    @d_inflight["flush"] = tseries(@rq_issued["flush"] - @rq_completed["flush"], 1s, 120);
-    @d_inflight["discard"] = tseries(@rq_issued["discard"] - @rq_completed["discard"], 1s, 120);
-    @d_inflight["write_zeros"] = tseries(@rq_issued["write_zeros"] - @rq_completed["write_zeros"], 1s, 120);
+    @q_inflight["read"] = tseries(@rq_queued["read"] - @rq_queue_done["read"], 1s, 7200);
+    @q_inflight["write"] = tseries(@rq_queued["write"] - @rq_queue_done["write"], 1s, 7200);
+    @d_inflight["read"] = tseries(@rq_issued["read"] - @rq_completed["read"], 1s, 7200);
+    @d_inflight["write"] = tseries(@rq_issued["write"] - @rq_completed["write"], 1s, 7200);
+    @q_inflight["flush"] = tseries(@rq_queued["flush"] - @rq_queue_done["flush"], 1s, 7200);
+    @q_inflight["discard"] = tseries(@rq_queued["discard"] - @rq_queue_done["discard"], 1s, 7200);
+    @q_inflight["write_zeros"] = tseries(@rq_queued["write_zeros"] - @rq_queue_done["write_zeros"], 1s, 7200);
+    @d_inflight["flush"] = tseries(@rq_issued["flush"] - @rq_completed["flush"], 1s, 7200);
+    @d_inflight["discard"] = tseries(@rq_issued["discard"] - @rq_completed["discard"], 1s, 7200);
+    @d_inflight["write_zeros"] = tseries(@rq_issued["write_zeros"] - @rq_completed["write_zeros"], 1s, 7200);
 }
 
 END

@@ -82,7 +82,7 @@ $(1): ensure-sudo
 	$(Q)echo -e "  Running: $(1)  [mode=$(MODE)]"
 	$(Q)echo -e "============================================================\n"
 	$(if $(filter fs,$(LAYERS)),$(Q)$(MAKE) -C $(FS_DIR) start-collection $(LAYER_VARS) $(REDIRECT))
-	$(if $(filter sysstat,$(LAYERS)),$(Q)$(MAKE) -C $(SYSSTAT_DIR) start-collection RESULTS_DIR=$(RESULTS_DIR) $(REDIRECT))
+	$(if $(filter sysstat,$(LAYERS)),$(Q)$(MAKE) -C $(SYSSTAT_DIR) start-collection $(LAYER_VARS) $(REDIRECT))
 	$(Q)sleep 5
 	$(Q)mkdir -p $(RESULTS_DIR)/fio
 ifdef CONTAINER_FILTER
@@ -98,8 +98,14 @@ else
 		--section=$(1)
 endif
 	$(Q)sleep 5
-	$(if $(filter sysstat,$(LAYERS)),$(Q)$(MAKE) -C $(SYSSTAT_DIR) stop-collection $(REDIRECT))
-	$(if $(filter fs,$(LAYERS)),$(Q)$(MAKE) -C $(FS_DIR) stop-collection $(LAYER_VARS) $(REDIRECT))
+	$(Q)( \
+		$(if $(filter fs,$(LAYERS)), $(MAKE) -C $(FS_DIR) stop-profiling $(LAYER_VARS) $(REDIRECT) &) \
+		$(if $(filter sysstat,$(LAYERS)), $(MAKE) -C $(SYSSTAT_DIR) stop-profiling $(LAYER_VARS) $(REDIRECT) &) \
+		wait )
+	$(if $(filter sysstat,$(LAYERS)),$(Q)$(MAKE) -C $(SYSSTAT_DIR) csv-to-parquet $(LAYER_VARS) $(REDIRECT))
+	$(if $(filter fs,$(LAYERS)),$(Q)$(MAKE) -C $(FS_DIR) csv-to-parquet $(LAYER_VARS) $(REDIRECT))
+	$(if $(filter sysstat,$(LAYERS)),$(Q)$(MAKE) -C $(SYSSTAT_DIR) generate-stats $(LAYER_VARS) $(REDIRECT))
+	$(if $(filter fs,$(LAYERS)),$(Q)$(MAKE) -C $(FS_DIR) generate-stats $(LAYER_VARS) $(REDIRECT))
 	$(Q)sleep 1
 	$(Q)python $(MAKEFILE_DIR)check_test.py --job $(1) \
 		--fio-json $(FIO_OUT) \

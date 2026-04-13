@@ -25,6 +25,7 @@
 // ── Event struct (ring buffer → userspace) ──
 struct fs_event {
 	__u64 timestamp_ns;
+	__u64 mntns_id;     // mount namespace id of originating task (0 if unknown)
 	__u8  event_type;   // EVT_ENTER, EVT_EXIT
 	__u8  syscall;      // SC_* index
 	__s64 bytes;        // count/ret value; 0 if N/A

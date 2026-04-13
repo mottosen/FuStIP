@@ -6,12 +6,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
+from matplotlib.ticker import FixedLocator, FuncFormatter, NullFormatter, NullLocator
 
 TYPE_COLORS = {
-    "read": "#cecece",
-    "write": "#a559aa",
-    "pread64": "#cecece",
-    "pwrite64": "#a559aa",
+    "read": "#007191",
+    "write": "#62c8d3",
+    "pread64": "#f47a00",
+    "pwrite64": "#d31f11",
     "flush": "#e02b35",
     "discard": "#082a54",
     "write_zeros": "#d47264",
@@ -20,8 +21,8 @@ TYPE_COLORS = {
 TYPE_LINESTYLES = {
     "read": "solid",
     "write": "solid",
-    "pread64": "dashed",
-    "pwrite64": "dashed",
+    "pread64": "solid",
+    "pwrite64": "solid",
 }
 
 TYPE_ORDER = {
@@ -57,6 +58,92 @@ def _subsample_cdf(sorted_vals, max_points=MAX_CDF_POINTS):
     return sorted_vals[idx], (idx + 1) / n
 
 
+def _format_gap_axis_exponents(ax):
+    """Reduce gap-CDF x-axis clutter by labeling powers of 10 as exponents."""
+    x_max = ax.get_xlim()[1]
+    if x_max <= 0:
+        return
+
+    max_exp = int(np.floor(np.log10(x_max)))
+    if max_exp < 0:
+        return
+
+    ticks = [float(10 ** exp) for exp in range(0, max_exp + 1)]
+    exp_by_tick = {tick: exp for exp, tick in enumerate(ticks)}
+
+    ax.xaxis.set_major_locator(FixedLocator(ticks))
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _pos: str(exp_by_tick.get(float(x), ""))))
+    ax.xaxis.set_minor_locator(NullLocator())
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.tick_params(axis="x", which="minor", bottom=False, labelbottom=False)
+    ax.set_xlabel(f"{ax.get_xlabel()} (10^x)")
+
+
+def _format_io_size_axis_powers_of_two(ax):
+    """Format IO-size CDF axis with explicit binary-size labels (e.g. 4K, 64K)."""
+    x_min, x_max = ax.get_xlim()
+    if x_max <= 0:
+        return
+
+    x_min = max(x_min, 1.0)
+    min_exp = int(np.floor(np.log2(x_min)))
+    max_exp = int(np.ceil(np.log2(x_max)))
+    if max_exp < min_exp:
+        return
+
+    span = max_exp - min_exp + 1
+    step = 1 if span <= 16 else 2
+    exps = list(range(min_exp, max_exp + 1, step))
+    ticks = [float(2 ** exp) for exp in exps]
+
+    ax.xaxis.set_major_locator(FixedLocator(ticks))
+
+    def _fmt_size(v):
+        v_i = int(round(v))
+        units = [("T", 1024 ** 4), ("G", 1024 ** 3), ("M", 1024 ** 2), ("K", 1024)]
+        for suffix, scale in units:
+            if v_i >= scale and v_i % scale == 0:
+                return f"{v_i // scale}{suffix}"
+        return str(v_i)
+
+    label_by_tick = {tick: _fmt_size(tick) for tick in ticks if tick > 0}
+    ax.xaxis.set_major_formatter(
+        FuncFormatter(lambda x, _pos: label_by_tick.get(float(x), ""))
+    )
+    ax.xaxis.set_minor_locator(NullLocator())
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.tick_params(axis="x", which="minor", bottom=False, labelbottom=False)
+    ax.tick_params(axis="x", labelrotation=45)
+
+
+def _format_log10_exponent_axis(ax, base_xlabel):
+    """Format log-scale axis as exponent-only ticks with explicit 10^x label."""
+    x_min, x_max = ax.get_xlim()
+    if x_max <= 0:
+        return
+
+    x_min = max(x_min, np.finfo(float).tiny)
+    min_exp = int(np.floor(np.log10(x_min)))
+    max_exp = int(np.ceil(np.log10(x_max)))
+    if max_exp < min_exp:
+        return
+
+    span = max_exp - min_exp + 1
+    step = max(1, int(np.ceil(span / 8)))
+    exps = list(range(min_exp, max_exp + 1, step))
+    ticks = [float(10 ** exp) for exp in exps]
+    exp_by_tick = {tick: exp for tick, exp in zip(ticks, exps)}
+
+    ax.xaxis.set_major_locator(FixedLocator(ticks))
+    ax.xaxis.set_major_formatter(
+        FuncFormatter(lambda x, _pos: str(exp_by_tick.get(float(x), "")) if x > 0 else "")
+    )
+    ax.xaxis.set_minor_locator(NullLocator())
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.tick_params(axis="x", which="minor", bottom=False, labelbottom=False)
+    ax.set_xlabel(f"{base_xlabel} (10^x)")
+
+
 def plot_type_distribution(ax, counts_by_type):
     """Pie chart of IO type distribution with side legend."""
     types = sort_types(counts_by_type.keys())
@@ -72,7 +159,8 @@ def plot_type_distribution(ax, counts_by_type):
 
 
 def plot_inflight_from_column(ax, df, type_col, types,
-                              inflight_col="inflight", title="Inflight Over Time"):
+                              inflight_col="inflight", title="Inflight Over Time",
+                              ylabel=None):
     """Plot inflight from pre-aggregated per-sec data.
 
     Expects df with columns: type_col, "sec", inflight_col
@@ -87,7 +175,7 @@ def plot_inflight_from_column(ax, df, type_col, types,
                 label=typ, color=_color_for(typ, i),
                 linestyle=_linestyle_for(typ), linewidth=0.8)
     ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Inflight")
+    ax.set_ylabel(ylabel if ylabel is not None else "Inflight")
     ax.set_title(title)
     ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
@@ -115,19 +203,31 @@ def plot_cumulated_mb_over_time(ax, df, type_col, bytes_col, types):
 
 def plot_io_size_cdf(ax, df, type_col, bytes_col, types):
     """CDF of IO sizes per type, log-scale x-axis."""
+    data_min = None
+    data_max = None
     for i, typ in enumerate(types):
         vals = df.filter(pl.col(type_col) == typ).drop_nulls(bytes_col)[bytes_col].to_numpy()
+        vals = vals[vals > 0]
         if len(vals) == 0:
             continue
+        t_min = float(vals.min())
+        t_max = float(vals.max())
+        data_min = t_min if data_min is None else min(data_min, t_min)
+        data_max = t_max if data_max is None else max(data_max, t_max)
         sorted_vals = np.sort(vals)
         sorted_vals, cdf = _subsample_cdf(sorted_vals)
         ax.plot(sorted_vals, cdf, label=typ, color=_color_for(typ, i),
                 linestyle=_linestyle_for(typ), linewidth=0.8)
 
-    ax.set_xscale("log")
+    ax.set_xscale("log", base=2)
     ax.set_xlabel("IO Size (bytes)")
     ax.set_ylabel("CDF")
     ax.set_title("IO Size CDF")
+    if data_min is not None and data_max is not None:
+        min_exp = int(np.floor(np.log2(data_min))) - 1
+        max_exp = int(np.ceil(np.log2(data_max))) + 1
+        ax.set_xlim(2 ** min_exp, 2 ** max_exp)
+    _format_io_size_axis_powers_of_two(ax)
     ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
 
@@ -147,6 +247,7 @@ def plot_io_latency_cdf(ax, df, type_col, latency_col, types):
     ax.set_xlabel("Latency (us)")
     ax.set_ylabel("CDF")
     ax.set_title("IO Latency CDF")
+    _format_log10_exponent_axis(ax, "Latency (us)")
     ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
 
@@ -176,7 +277,7 @@ def plot_gap_cdf(ax, df, type_col, sector_or_offset_col, bytes_col, types,
     ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
 
-def build_dashboard(rows, col_titles, title, output_path):
+def build_dashboard(rows, col_titles, title, output_path, col_ylims=None):
     """Build a multi-row dashboard.
 
     Args:
@@ -186,6 +287,8 @@ def build_dashboard(rows, col_titles, title, output_path):
         col_titles: list of column title strings
         title: overall figure title
         output_path: Path to save PNG
+        col_ylims: optional list of (ymin, ymax) tuples per column, or None
+            for auto-scaled columns. Length must match col_titles.
     """
     nrows = len(rows)
     ncols = len(col_titles)
@@ -200,16 +303,59 @@ def build_dashboard(rows, col_titles, title, output_path):
 
     # Unify y-axes per column, starting at 0 for non-negative data
     for c in range(ncols):
-        y_min = min(axes[r, c].get_ylim()[0] for r in range(nrows))
-        y_max = max(axes[r, c].get_ylim()[1] for r in range(nrows))
-        if y_min >= 0:
-            y_min = 0
+        if col_ylims and col_ylims[c] is not None:
+            y_min, y_max = col_ylims[c]
+        else:
+            y_min = min(axes[r, c].get_ylim()[0] for r in range(nrows))
+            y_max = max(axes[r, c].get_ylim()[1] for r in range(nrows))
+            if y_min >= 0:
+                y_min = 0
         for r in range(nrows):
             axes[r, c].set_ylim(y_min, y_max)
 
+    # Unify x-axes per column for time-series columns (non-CDF, non-pie)
+    for c in range(ncols):
+        if "CDF" in col_titles[c] or "Distribution" in col_titles[c]:
+            continue
+        xlims = [axes[r, c].get_xlim() for r in range(nrows)]
+        x_min = min(lim[0] for lim in xlims)
+        x_max = max(lim[1] for lim in xlims)
+        if x_min < x_max:
+            for r in range(nrows):
+                axes[r, c].set_xlim(x_min, x_max)
+
+    cdf_cols = [c for c, title_str in enumerate(col_titles) if "CDF" in title_str]
+    for c in cdf_cols:
+        x_scale_set = {axes[r, c].get_xscale() for r in range(nrows)}
+        if len(x_scale_set) != 1:
+            continue
+
+        x_scale = x_scale_set.pop()
+        x_max = max(axes[r, c].get_xlim()[1] for r in range(nrows))
+        x_min_candidates = [axes[r, c].get_xlim()[0] for r in range(nrows)]
+        if x_scale == "log":
+            pos_mins = [x for x in x_min_candidates if x > 0]
+            if not pos_mins:
+                continue
+            x_min = min(pos_mins)
+        elif x_scale == "symlog":
+            x_min = min(0.0, *(x for x in x_min_candidates if np.isfinite(x)))
+        else:
+            x_min = min(x_min_candidates)
+
+        for r in range(nrows):
+            axes[r, c].set_xlim(x_min, x_max)
+            axes[r, c].set_ylim(0.0, 1.0)
+            if "IO Size CDF" in col_titles[c]:
+                _format_io_size_axis_powers_of_two(axes[r, c])
+            if "Latency CDF" in col_titles[c]:
+                _format_log10_exponent_axis(axes[r, c], "Latency (us)")
+            if "Gap CDF" in col_titles[c]:
+                _format_gap_axis_exponents(axes[r, c])
+
     # Leave room at top for suptitle and left for row labels
     fig.tight_layout(pad=1.5, h_pad=3.0, w_pad=3.5,
-                     rect=[0.03, 0, 1, 0.96])
+                     rect=[0.03, 0.03, 1, 0.96])
 
     # Add row labels on the far left after layout
     for r, row in enumerate(rows):

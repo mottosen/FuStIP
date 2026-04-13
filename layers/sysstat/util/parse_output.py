@@ -82,11 +82,6 @@ def parse_pidstat(input_file: Path, output_dir: Path) -> dict[str, int]:
 
             parts = line.split()
 
-            # Handle 12-hour AM/PM timestamp: merge "HH:MM:SS" "AM"/"PM"
-            # into a single token so field indices stay consistent.
-            if len(parts) > 1 and parts[1] in ("AM", "PM"):
-                parts = [parts[0] + " " + parts[1]] + parts[2:]
-
             n_fields = FIELD_COUNTS[current_section]
 
             if len(parts) < n_fields:

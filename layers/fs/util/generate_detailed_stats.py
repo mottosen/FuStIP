@@ -11,12 +11,16 @@ to limit peak memory on large files (100M+ rows):
   Scan 3: inflight time-series (aggregated per-second counts)
   Scan 4: access pattern (per-syscall scans + read/write position tracking)
 
+Container/comm binding is deferred to a final bind_containers() pass over
+the small in-memory result — no add_label_column() in any Polars scan.
+
 Usage:
     python ./util/generate_detailed_stats.py <results_dir>
 """
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -25,8 +29,8 @@ import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from stats_generation.shared import (compute_fs_access_pattern,
-                                     derive_throughput,
                                      tseries_stats)
+from container.labeling import bind_containers, load_comm_label_map, load_mntns_label_map
 
 LAYER_PREFIX = "fs"
 
@@ -70,6 +74,12 @@ def _row_to_stats(row):
         "p95": _val(row["p95"]),
         "p99": _val(row["p99"]),
     }
+
+
+def _comm_key(row, has_mntns):
+    """Extract (comm, mntns_id_str) key from a row dict."""
+    mntns_id = row.get("mntns_id") if has_mntns else None
+    return row["comm"], (str(mntns_id) if mntns_id is not None else "")
 
 
 def compute_rw_access_pattern(df):
@@ -164,198 +174,244 @@ def compute_rw_access_pattern(df):
 def generate_stats(parquet_path):
     """Parse an FS layer detailed Parquet and compute stats."""
 
-    # Check schema for optional columns
+    results_dir = parquet_path.parent.parent
+    mntns_map = load_mntns_label_map(results_dir)
+    comm_map = load_comm_label_map(results_dir)
     schema = pl.scan_parquet(parquet_path).collect_schema()
     has_offset = "offset" in schema
+    has_mntns = "mntns_id" in schema
+    id_keys = ["comm", "mntns_id"] if has_mntns else ["comm"]
 
     io_syscalls_list = list(IO_SYSCALLS)
 
+    # Entries keyed by (comm, mntns_id_str) — bind_containers maps to labels at the end.
+    _entries: dict = {}
+
+    def ensure_comm_entry(comm, mntns_id_str):
+        key = (comm, mntns_id_str)
+        if key not in _entries:
+            _entries[key] = {
+                "counters": {},
+                "distributions": {},
+                "tseries": {},
+                "access_pattern": {},
+            }
+        return _entries[key]
+
     # --- Scan 1: Counters, duration, event counts ---
     print("  Scan 1: counters...", flush=True)
-    lf = pl.scan_parquet(parquet_path)
+    # Group by raw (comm, mntns_id) — streaming engine stays effective.
+    # ts_min/ts_max and event_counts derived from this result (no separate scan).
+    # Explicit select avoids loading unreferenced columns (fd, offset, tid, etc.).
+    comm_agg_raw = (pl.scan_parquet(parquet_path)
+                      .select([*id_keys, "event", "syscall", "bytes", "timestamp_ns"])
+                      .group_by(*id_keys, "event", "syscall")
+                      .agg(
+                          pl.len().alias("count"),
+                          pl.col("bytes").sum().alias("total_bytes"),
+                          pl.col("timestamp_ns").min().alias("ts_min"),
+                          pl.col("timestamp_ns").max().alias("ts_max"),
+                          pl.when(pl.col("bytes") > 0).then(pl.col("bytes")).otherwise(0).sum().alias("pos_bytes"),
+                      )
+                      .collect(engine="streaming"))
 
-    # Get per-(event, syscall) aggregates — streaming to avoid 15GB+ materialization
-    agg = (lf.group_by("event", "syscall")
-             .agg(
-                 pl.len().alias("count"),
-                 pl.col("bytes").sum().alias("total_bytes"),
-                 pl.col("timestamp_ns").min().alias("ts_min"),
-                 pl.col("timestamp_ns").max().alias("ts_max"),
-                 pl.when(pl.col("bytes") > 0).then(pl.col("bytes")).otherwise(0).sum().alias("pos_bytes"),
-             )
-             .collect(engine="streaming"))
-
-    # Duration from all events
-    ts_min = agg["ts_min"].min()
-    ts_max = agg["ts_max"].max()
-    if ts_min is not None and ts_max is not None and ts_max > ts_min:
-        duration_s = (ts_max - ts_min) / 1e9
-    else:
-        duration_s = 0
-
-    # Build counters
-    counters = {}
-
-    exit_io = agg.filter((pl.col("event") == "exit") & pl.col("syscall").is_in(io_syscalls_list))
-    if len(exit_io) > 0:
-        counters["sc_completed"] = dict(zip(
-            exit_io["syscall"].to_list(),
-            [int(v) for v in exit_io["count"].to_list()]
-        ))
-
-    enter_io = agg.filter((pl.col("event") == "enter") & pl.col("syscall").is_in(io_syscalls_list))
-    if len(enter_io) > 0:
-        counters["sc_entered"] = dict(zip(
-            enter_io["syscall"].to_list(),
-            [int(v) for v in enter_io["count"].to_list()]
-        ))
-
-    if len(exit_io) > 0:
-        pos_bytes_rows = exit_io.filter(pl.col("pos_bytes") > 0)
-        if len(pos_bytes_rows) > 0:
-            counters["sc_total_bytes"] = dict(zip(
-                pos_bytes_rows["syscall"].to_list(),
-                [int(v) for v in pos_bytes_rows["pos_bytes"].to_list()]
-            ))
-
-    non_io_enters = agg.filter((pl.col("event") == "enter") & ~pl.col("syscall").is_in(io_syscalls_list))
-    if len(non_io_enters) > 0:
-        counters["sc_count"] = dict(zip(
-            non_io_enters["syscall"].to_list(),
-            [int(v) for v in non_io_enters["count"].to_list()]
-        ))
-
-    # Event counts for data quality (avoids separate scan)
-    event_agg = agg.group_by("event").agg(pl.col("count").sum())
+    ts_min = comm_agg_raw["ts_min"].min()
+    ts_max = comm_agg_raw["ts_max"].max()
+    duration_s = (ts_max - ts_min) / 1e9 if ts_min and ts_max and ts_max > ts_min else 0
+    event_agg = comm_agg_raw.group_by("event").agg(pl.col("count").sum())
     event_counts = dict(zip(event_agg["event"].to_list(), event_agg["count"].to_list()))
 
-    result = {
-        "counters": counters,
-        "derived": {"duration_s": round(duration_s, 2)},
-        "distributions": {},
-        "tseries": {},
-    }
+    for part in comm_agg_raw.partition_by(id_keys, maintain_order=False):
+        row0 = part.row(0, named=True)
+        comm, mntns_id_str = _comm_key(row0, has_mntns)
+        entry = ensure_comm_entry(comm, mntns_id_str)
+        comm_counters = {}
 
-    throughput = derive_throughput(counters, duration_s, "sc_completed", "sc_total_bytes")
-    result["derived"].update(throughput)
+        comm_exit_io = part.filter((pl.col("event") == "exit") & pl.col("syscall").is_in(io_syscalls_list))
+        if len(comm_exit_io) > 0:
+            comm_counters["sc_completed"] = dict(zip(
+                comm_exit_io["syscall"].to_list(),
+                [int(v) for v in comm_exit_io["count"].to_list()]
+            ))
 
-    del agg
+        comm_enter_io = part.filter((pl.col("event") == "enter") & pl.col("syscall").is_in(io_syscalls_list))
+        if len(comm_enter_io) > 0:
+            comm_counters["sc_entered"] = dict(zip(
+                comm_enter_io["syscall"].to_list(),
+                [int(v) for v in comm_enter_io["count"].to_list()]
+            ))
 
-    # --- Scan 2: Distributions (Polars-native quantiles, no data in Python) ---
+        if len(comm_exit_io) > 0:
+            comm_pos_bytes = comm_exit_io.filter(pl.col("pos_bytes") > 0)
+            if len(comm_pos_bytes) > 0:
+                comm_counters["sc_total_bytes"] = dict(zip(
+                    comm_pos_bytes["syscall"].to_list(),
+                    [int(v) for v in comm_pos_bytes["pos_bytes"].to_list()]
+                ))
+
+        comm_non_io_enters = part.filter((pl.col("event") == "enter") & ~pl.col("syscall").is_in(io_syscalls_list))
+        if len(comm_non_io_enters) > 0:
+            comm_counters["sc_count"] = dict(zip(
+                comm_non_io_enters["syscall"].to_list(),
+                [int(v) for v in comm_non_io_enters["count"].to_list()]
+            ))
+
+        entry["counters"] = comm_counters
+
+    del comm_agg_raw
+
+    # --- Scan 2: Distributions (per comm, per syscall) ---
+    # Process one IO syscall at a time: each scan buffers ~93M latency values
+    # for exact quantile computation (~11 GB RSS per scan). Per-syscall scans
+    # reuse allocator memory, staying under 13 GB total.
     print("  Scan 2: distributions...", flush=True)
-    lf = pl.scan_parquet(parquet_path)
-    lat_stats = (lf.filter(pl.col("event") == "exit")
-                   .filter(pl.col("syscall").is_in(io_syscalls_list))
-                   .filter(pl.col("latency_ns").is_not_null() & (pl.col("latency_ns") > 0))
-                   .group_by("syscall")
-                   .agg(_series_stats_exprs("latency_ns"))
-                   .sort("syscall")
-                   .collect(engine="streaming"))
-    if len(lat_stats) > 0:
-        result["distributions"]["sc_latencies"] = {
-            row["syscall"]: _row_to_stats(row)
-            for row in lat_stats.iter_rows(named=True)
-        }
-    del lat_stats
+    for sc in io_syscalls_list:
+        raw_lat_sc = (pl.scan_parquet(parquet_path)
+                        .select([*id_keys, "event", "syscall", "latency_ns"])
+                        .filter(pl.col("event") == "exit")
+                        .filter(pl.col("syscall") == sc)
+                        .filter(pl.col("latency_ns").is_not_null() & (pl.col("latency_ns") > 0))
+                        .group_by(*id_keys)
+                        .agg(_series_stats_exprs("latency_ns"))
+                        .collect(engine="streaming"))
+        for row in raw_lat_sc.iter_rows(named=True):
+            comm, mntns_id_str = _comm_key(row, has_mntns)
+            ensure_comm_entry(comm, mntns_id_str)["distributions"].setdefault("sc_latencies", {})[sc] = _row_to_stats(row)
+        del raw_lat_sc
 
-    lf = pl.scan_parquet(parquet_path)
-    size_stats = (lf.filter(pl.col("event") == "exit")
-                    .filter(pl.col("syscall").is_in(io_syscalls_list))
-                    .filter(pl.col("bytes") > 0)
-                    .group_by("syscall")
-                    .agg(_series_stats_exprs("bytes"))
-                    .sort("syscall")
-                    .collect(engine="streaming"))
-    if len(size_stats) > 0:
-        result["distributions"]["sc_sizes"] = {
-            row["syscall"]: _row_to_stats(row)
-            for row in size_stats.iter_rows(named=True)
-        }
-    del size_stats
+    for sc in io_syscalls_list:
+        raw_size_sc = (pl.scan_parquet(parquet_path)
+                         .select([*id_keys, "event", "syscall", "bytes"])
+                         .filter(pl.col("event") == "exit")
+                         .filter(pl.col("syscall") == sc)
+                         .filter(pl.col("bytes") > 0)
+                         .group_by(*id_keys)
+                         .agg(_series_stats_exprs("bytes"))
+                         .collect(engine="streaming"))
+        for row in raw_size_sc.iter_rows(named=True):
+            comm, mntns_id_str = _comm_key(row, has_mntns)
+            ensure_comm_entry(comm, mntns_id_str)["distributions"].setdefault("sc_sizes", {})[sc] = _row_to_stats(row)
+        del raw_size_sc
 
-    # --- Scan 3: Inflight time-series (aggregated, no full-data collect) ---
+    # --- Scan 3: Inflight time-series (per comm) ---
+    # Explicit select for projection pushdown.
+    # tseries computed per comm; bind_containers keeps dominant comm's for container labels.
     print("  Scan 3: tseries...", flush=True)
     if duration_s > 0:
         window_ns = 1_000_000_000
-        result["tseries"]["sc_inflight"] = {}
+        total_secs = math.ceil(duration_s)
+        per_comm_snap = (pl.scan_parquet(parquet_path)
+                           .select([*id_keys, "event", "syscall", "timestamp_ns", "inflight"])
+                           .filter(pl.col("syscall").is_in(io_syscalls_list))
+                           .with_columns(
+                               ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
+                           )
+                           .group_by(*id_keys, "syscall", "sec")
+                           .agg(
+                               pl.col("inflight").last(),
+                               pl.when(pl.col("event") == "exit")
+                                 .then(pl.lit(1)).otherwise(pl.lit(0)).sum().alias("io_count"),
+                           )
+                           .collect(engine="streaming"))
 
-        lf = pl.scan_parquet(parquet_path)
-        inf_df = (lf.filter(pl.col("syscall").is_in(io_syscalls_list))
-                    .with_columns(
-                        ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
-                    )
-                    .group_by("syscall", "sec")
-                    .agg(pl.col("inflight").last())
-                    .sort("syscall", "sec")
-                    .collect(engine="streaming"))
-
-        for sc in inf_df["syscall"].unique().sort().to_list():
-            sc_df = inf_df.filter(pl.col("syscall") == sc)
-            points = [
-                {"time": _sec_to_time(int(s)), "value": max(0, int(v))}
-                for s, v in zip(sc_df["sec"].to_list(), sc_df["inflight"].to_list())
-                if v is not None
-            ]
-            if points:
-                result["tseries"]["sc_inflight"][sc] = tseries_stats(points)
-        del inf_df
-
-    # --- Scan 4: Access pattern ---
-    print("  Scan 4: access pattern...", flush=True)
-    result["access_pattern"] = {"sc_offsets": {}}
-
-    # pread64/pwrite64: per-syscall scan with explicit offsets, per-fd analysis
-    if has_offset:
-        for sc in ["pread64", "pwrite64"]:
-            lf = pl.scan_parquet(parquet_path)
-            sc_df = (lf.filter((pl.col("event") == "enter") & (pl.col("syscall") == sc)
-                               & pl.col("offset").is_not_null())
-                       .select("timestamp_ns", "offset", "bytes", "fd")
-                       .sort("timestamp_ns")
-                       .collect(engine="streaming"))
-            if len(sc_df) < 2:
-                del sc_df
-                continue
-
-            total_ios = 0
-            seq_count = 0
-            rnd_count = 0
-            for fd_val in sc_df.drop_nulls("fd")["fd"].unique().to_list():
-                fd_group = sc_df.filter(pl.col("fd") == fd_val)
-                total_ios += len(fd_group)
-                if len(fd_group) < 2:
-                    continue
-                offsets = fd_group["offset"].cast(pl.Int64).to_numpy()
-                bytes_list = fd_group["bytes"].cast(pl.Int64).to_numpy()
-                pat = compute_fs_access_pattern(offsets, bytes_list)
-                seq_count += pat["sequential_count"]
-                rnd_count += pat["random_count"]
-
-            total_gaps = seq_count + rnd_count
-            if total_gaps > 0:
-                result["access_pattern"]["sc_offsets"][sc] = {
-                    "total_ios": total_ios,
-                    "sequential_count": seq_count,
-                    "random_count": rnd_count,
-                    "sequential_pct": round(100 * seq_count / total_gaps, 2),
-                    "random_pct": round(100 * rnd_count / total_gaps, 2),
+        for part in per_comm_snap.partition_by(id_keys, maintain_order=False):
+            row0 = part.row(0, named=True)
+            comm, mntns_id_str = _comm_key(row0, has_mntns)
+            entry = ensure_comm_entry(comm, mntns_id_str)
+            for sc_part in part.partition_by("syscall", maintain_order=False):
+                sc = sc_part["syscall"][0]
+                points = [
+                    {"time": _sec_to_time(int(s)), "value": max(0, int(v))}
+                    for s, v in zip(sc_part["sec"].to_list(), sc_part["inflight"].to_list())
+                    if v is not None
+                ]
+                if points:
+                    entry["tseries"].setdefault("sc_inflight", {})[sc] = tseries_stats(points)
+                # IOPS time series: zero-filled over the global profiling window
+                sec_to_iops = {
+                    int(s): int(v)
+                    for s, v in zip(sc_part["sec"].to_list(), sc_part["io_count"].to_list())
+                    if v is not None
                 }
-            del sc_df
+                iops_points = [
+                    {"time": _sec_to_time(s), "value": sec_to_iops.get(s, 0)}
+                    for s in range(total_secs)
+                ]
+                if iops_points:
+                    entry["tseries"].setdefault("iops", {})[sc] = tseries_stats(iops_points)
+        del per_comm_snap
 
-    # read/write: pre-filter to relevant syscalls, reconstruct positions
+    # --- Scan 4: Access pattern (per comm) ---
+    print("  Scan 4: access pattern...", flush=True)
+    if has_offset:
+        # Scan per-comm to avoid partition_by on 80M-row DataFrames (partition_by
+        # creates full copies — 80M rows × 2 copies = OOM on tight memory budget).
+        # Filter at scan time, keep only the 3 columns needed for gap analysis.
+        comm_keys = list(_entries.keys())
+        for sc in ["pread64", "pwrite64"]:
+            for (comm, mntns_id_str) in comm_keys:
+                if has_mntns and mntns_id_str:
+                    comm_filter = (pl.col("comm") == comm) & (pl.col("mntns_id") == int(mntns_id_str))
+                else:
+                    comm_filter = (pl.col("comm") == comm)
+
+                sc_df = (pl.scan_parquet(parquet_path)
+                           .filter((pl.col("event") == "enter") & (pl.col("syscall") == sc)
+                                   & pl.col("offset").is_not_null() & comm_filter)
+                           .select(["offset", "bytes", "fd"])
+                           .collect(engine="streaming"))
+                if len(sc_df) < 2:
+                    del sc_df
+                    continue
+
+                entry = ensure_comm_entry(comm, mntns_id_str)
+                entry["access_pattern"].setdefault("sc_offsets", {})
+                total_ios = 0
+                seq_count = 0
+                rnd_count = 0
+                for fd_val in sc_df.drop_nulls("fd")["fd"].unique().to_list():
+                    fd_group = sc_df.filter(pl.col("fd") == fd_val)
+                    total_ios += len(fd_group)
+                    if len(fd_group) < 2:
+                        continue
+                    offsets = fd_group["offset"].cast(pl.Int64).to_numpy()
+                    bytes_list = fd_group["bytes"].cast(pl.Int64).to_numpy()
+                    pat = compute_fs_access_pattern(offsets, bytes_list)
+                    seq_count += pat["sequential_count"]
+                    rnd_count += pat["random_count"]
+
+                total_gaps = seq_count + rnd_count
+                if total_gaps > 0:
+                    entry["access_pattern"]["sc_offsets"][sc] = {
+                        "total_ios": total_ios,
+                        "sequential_count": seq_count,
+                        "random_count": rnd_count,
+                        "sequential_pct": round(100 * seq_count / total_gaps, 2),
+                        "random_pct": round(100 * rnd_count / total_gaps, 2),
+                    }
+                del sc_df
+
     rw_relevant = ["read", "write", "openat", "lseek", "close"]
-    lf = pl.scan_parquet(parquet_path)
-    rw_df = (lf.filter(pl.col("syscall").is_in(rw_relevant))
-               .select("event", "syscall", "timestamp_ns", "tid", "fd", "bytes")
+    rw_df = (pl.scan_parquet(parquet_path)
+               .filter(pl.col("syscall").is_in(rw_relevant))
+               .select([*id_keys, "event", "syscall", "timestamp_ns", "tid", "fd", "bytes"])
                .collect(engine="streaming"))
 
-    rw_pattern = compute_rw_access_pattern(rw_df)
+    if len(rw_df) > 0:
+        for part in rw_df.partition_by(id_keys, maintain_order=False):
+            row0 = part.row(0, named=True)
+            comm, mntns_id_str = _comm_key(row0, has_mntns)
+            entry = ensure_comm_entry(comm, mntns_id_str)
+            rw_pattern = compute_rw_access_pattern(
+                part.select("event", "syscall", "timestamp_ns", "tid", "fd", "bytes")
+            )
+            if rw_pattern:
+                entry["access_pattern"].setdefault("sc_offsets", {})
+                for sc, pat in rw_pattern.items():
+                    entry["access_pattern"]["sc_offsets"][sc] = pat
     del rw_df
 
-    for sc, pat in rw_pattern.items():
-        result["access_pattern"]["sc_offsets"][sc] = pat
-
-    return result, event_counts
+    return bind_containers(_entries, mntns_map, comm_map), event_counts
 
 
 def load_data_quality(layer_dir, event_counts):

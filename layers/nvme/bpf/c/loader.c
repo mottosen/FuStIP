@@ -11,9 +11,13 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <ctype.h>
 
 static volatile sig_atomic_t running = 1;
 static FILE *output;
+#define MAX_CONTAINER_FILTERS 32
+#define MAX_DEV_FILTERS 8
+#define MAX_COMM_FILTERS 8
 
 static const char *op_name(__u8 op) {
   switch (op) {
@@ -90,12 +94,12 @@ static int handle_event(void *ctx, void *data, size_t data_sz) {
   memcpy(comm, e->comm, 16);
 
   if (e->latency_ns > 0)
-    fprintf(output, "%llu,%s,%s,%u,%llu,%llu,0x%llx,%s,%d\n", e->timestamp_ns,
-            event_name(e->event_type), op_name(e->op), e->bytes, e->latency_ns,
+    fprintf(output, "%llu,%llu,%s,%s,%u,%llu,%llu,0x%llx,%s,%d\n", e->timestamp_ns,
+            e->mntns_id, event_name(e->event_type), op_name(e->op), e->bytes, e->latency_ns,
             e->sector, e->rq, comm, e->inflight);
   else
-    fprintf(output, "%llu,%s,%s,%u,,%llu,0x%llx,%s,%d\n", e->timestamp_ns,
-            event_name(e->event_type), op_name(e->op), e->bytes, e->sector,
+    fprintf(output, "%llu,%llu,%s,%s,%u,,%llu,0x%llx,%s,%d\n", e->timestamp_ns,
+            e->mntns_id, event_name(e->event_type), op_name(e->op), e->bytes, e->sector,
             e->rq, comm, e->inflight);
 
   return 0;
@@ -109,11 +113,13 @@ static int parse_dev_filters(struct standalone_bpf *skel, const char *filter) {
   int count = 0;
   char *saveptr = NULL;
   char *token = strtok_r(buf, ",", &saveptr);
-  while (token && count < 8) {
+  while (token && count < MAX_DEV_FILTERS) {
     strncpy((char *)skel->rodata->dev_filters[count], token, 31);
     count++;
     token = strtok_r(NULL, ",", &saveptr);
   }
+  if (token)
+    fprintf(stderr, "Warning: only first %d device filters are used\n", MAX_DEV_FILTERS);
   skel->rodata->num_dev_filters = count;
   return count;
 }
@@ -126,18 +132,46 @@ static int parse_comm_filters(struct standalone_bpf *skel, const char *filter) {
   int count = 0;
   char *saveptr = NULL;
   char *token = strtok_r(buf, ",", &saveptr);
-  while (token && count < 8) {
+  while (token && count < MAX_COMM_FILTERS) {
     strncpy((char *)skel->rodata->comm_filters[count], token, 15);
     count++;
     token = strtok_r(NULL, ",", &saveptr);
   }
+  if (token)
+    fprintf(stderr, "Warning: only first %d comm filters are used\n", MAX_COMM_FILTERS);
   skel->rodata->num_comm_filters = count;
+  return count;
+}
+
+static int parse_container_filters(const char *csv, char out[][128], int max_entries) {
+  char buf[1024];
+  strncpy(buf, csv, sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = '\0';
+
+  int count = 0;
+  char *saveptr = NULL;
+  char *token = strtok_r(buf, ",", &saveptr);
+  while (token && count < max_entries) {
+    while (*token && isspace((unsigned char)*token))
+      token++;
+    char *end = token + strlen(token);
+    while (end > token && isspace((unsigned char)*(end - 1)))
+      *--end = '\0';
+    if (*token != '\0') {
+      strncpy(out[count], token, 127);
+      out[count][127] = '\0';
+      count++;
+    }
+    token = strtok_r(NULL, ",", &saveptr);
+  }
+  if (token)
+    fprintf(stderr, "Warning: only first %d containers are used\n", max_entries);
   return count;
 }
 
 static void usage(const char *prog) {
   fprintf(stderr,
-          "Usage: %s -o <output_csv> [-f <dev_filter>] [-p <comm_filter>] [-c <container_name>]\n",
+          "Usage: %s -o <output_csv> [-f <dev_filter[,dev2,...]>] [-p <comm_filter[,comm2,...]>] [-c <container_name[,container2,...]>]\n",
           prog);
   fprintf(stderr, "  -f (device), -p (comm), or -c (container); at least one required\n");
   exit(1);
@@ -201,7 +235,10 @@ int main(int argc, char **argv) {
   char *output_path = NULL;
   char *dev_filter = NULL;
   char *comm_filter = NULL;
-  char *container_name = NULL;
+  char *container_filter = NULL;
+  char container_names[MAX_CONTAINER_FILTERS][128] = {};
+  int container_count = 0;
+  int container_resolved[MAX_CONTAINER_FILTERS] = {};
   int opt;
 
   while ((opt = getopt(argc, argv, "o:f:p:c:")) != -1) {
@@ -216,15 +253,23 @@ int main(int argc, char **argv) {
       comm_filter = optarg;
       break;
     case 'c':
-      container_name = optarg;
+      container_filter = optarg;
       break;
     default:
       usage(argv[0]);
     }
   }
 
-  if (!output_path || (!dev_filter && !comm_filter && !container_name))
+  if (!output_path || (!dev_filter && !comm_filter && !container_filter))
     usage(argv[0]);
+
+  if (container_filter) {
+    container_count = parse_container_filters(container_filter, container_names, MAX_CONTAINER_FILTERS);
+    if (container_count == 0) {
+      fprintf(stderr, "Error: no valid container names parsed from -c\n");
+      return 1;
+    }
+  }
 
   signal(SIGINT, sig_handler);
   signal(SIGTERM, sig_handler);
@@ -239,9 +284,9 @@ int main(int argc, char **argv) {
     parse_dev_filters(skel, dev_filter);
   if (comm_filter)
     parse_comm_filters(skel, comm_filter);
-  if (container_name)
+  if (container_count > 0)
     skel->rodata->filter_by_mntns = true;
-  if ((dev_filter || comm_filter) && container_name)
+  if ((dev_filter || comm_filter) && container_count > 0)
     skel->rodata->filter_or_mode = true;
 
   int err = standalone_bpf__load(skel);
@@ -265,7 +310,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   fprintf(output,
-          "timestamp_ns,event,op,bytes,latency_ns,sector,rq,comm,inflight\n");
+          "timestamp_ns,mntns_id,event,op,bytes,latency_ns,sector,rq,comm,inflight\n");
 
   struct ring_buffer *rb = ring_buffer__new(bpf_map__fd(skel->maps.events),
                                             handle_event, NULL, NULL);
@@ -276,23 +321,34 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (dev_filter || comm_filter)
+  if ((dev_filter || comm_filter) && container_count > 0)
+    fprintf(stderr, "NVMe layer detailed tracing started (dev: %s, comm: %s, containers: %s, OR mode)...\n",
+            dev_filter ? dev_filter : "none",
+            comm_filter ? comm_filter : "none",
+            container_filter);
+  else if (dev_filter || comm_filter)
     fprintf(stderr, "NVMe layer detailed tracing started (dev: %s, comm: %s)...\n",
             dev_filter ? dev_filter : "none",
             comm_filter ? comm_filter : "none");
   else
     fprintf(stderr,
-            "NVMe layer detailed tracing started (container: %s)...\n",
-            container_name);
+            "NVMe layer detailed tracing started (containers: %s)...\n",
+            container_filter);
 
-  int container_resolved = 0;
+  int num_resolved = 0;
   time_t last_attempt = 0;
 
   while (running) {
-    if (container_name && !container_resolved) {
+    if (container_count > 0 && num_resolved < container_count) {
       time_t now = time(NULL);
       if (now - last_attempt >= 1) {
-        container_resolved = try_resolve_container(skel, container_name);
+        for (int i = 0; i < container_count; i++) {
+          if (!container_resolved[i] &&
+              try_resolve_container(skel, container_names[i])) {
+            container_resolved[i] = 1;
+            num_resolved++;
+          }
+        }
         last_attempt = now;
       }
     }

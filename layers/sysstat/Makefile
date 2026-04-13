@@ -12,6 +12,9 @@ endif
 PIDSTAT := $(shell which pidstat)
 PIDS_DIR = /tmp/sysstat-pids
 
+export TZ := UTC
+export LC_ALL := C
+
 INTERVAL ?= 1
 
 .NOTPARALLEL:
@@ -31,6 +34,7 @@ ensure-results-exists:
 		exit 1; \
 	fi
 	$(Q)mkdir -p "$(RESULTS_DIR)/sysstat"
+	$(Q)rm -f "$(RESULTS_DIR)/sysstat/container_map.json"
 
 .PHONY: start-collection
 start-collection: ensure-results-exists ensure-sudo
@@ -38,7 +42,7 @@ start-collection: ensure-results-exists ensure-sudo
 
 	$(Q)mkdir -p "$(PIDS_DIR)"
 
-	$(Q)sudo $(PIDSTAT) -turd $(INTERVAL) \
+	$(Q)sudo -E $(PIDSTAT) -turd $(INTERVAL) \
 		> "$(RESULTS_DIR)/sysstat/pidstat.out" \
 		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/pidstat.pid"
 
@@ -75,18 +79,16 @@ parse: ensure-results-exists
 
 .PHONY: generate-stats
 generate-stats: ensure-results-exists
-ifdef COMM_FILTER
-	$(Q)python "./util/generate_stats.py" --process "$$(echo '$(COMM_FILTER)' | tr ',' ' ')" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
-else
-	$(Q)python "./util/generate_stats.py" $(OPTIONS) "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
-endif
+	$(Q)python "./util/generate_stats.py" \
+		$(if $(COMM_FILTER),--process "$$(echo '$(COMM_FILTER)' | tr ',' ' ')") \
+		$(if $(CONTAINER_FILTER),--container "$$(echo '$(CONTAINER_FILTER)' | tr ',' ' ')") \
+		"$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
 	@echo "sysstat stats generated"
 
 .PHONY: visualize
 visualize: ensure-results-exists
-ifdef COMM_FILTER
-	$(Q)python "./util/visualize.py" --process "$$(echo '$(COMM_FILTER)' | tr ',' ' ')" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
-else
-	$(Q)python "./util/visualize.py" "$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
-endif
+	$(Q)python "./util/visualize.py" \
+		$(if $(COMM_FILTER),--process "$$(echo '$(COMM_FILTER)' | tr ',' ' ')") \
+		$(if $(CONTAINER_FILTER),--container "$$(echo '$(CONTAINER_FILTER)' | tr ',' ' ')") \
+		"$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
 	$(Q)echo -e "sysstat visualization generated"

@@ -13,11 +13,13 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import matplotlib
 matplotlib.use("Agg")
 
 from visualization.shared import build_dashboard, _color_for, DEFAULT_COLOR_CYCLE
+from container_map import build_label_maps, get_label_order, remap_rows
 
 MAX_ROWS = 5
 
@@ -29,8 +31,9 @@ def _read_csv(path):
 
 
 def _unique_times(rows):
-    """Sorted unique time values from rows."""
-    return sorted(set(row["time"] for row in rows))
+    """Chronologically sorted unique time values from rows, midnight-aware."""
+    from stats_generation.shared import _sort_times_chronological
+    return _sort_times_chronological(row["time"] for row in rows)
 
 
 def _group_timeseries(rows, metric, time_index):
@@ -106,6 +109,8 @@ def main():
     parser.add_argument("results_dir", type=Path)
     parser.add_argument("--process", "-p", type=str.split, default=None,
                         help="Process names to show individually (rest grouped as 'other')")
+    parser.add_argument("--container", "-c", type=str.split, default=None,
+                        help="Container names for container-based grouping")
     args = parser.parse_args()
 
     sysstat_dir = args.results_dir / "sysstat"
@@ -123,7 +128,12 @@ def main():
     print("Reading sysstat CSVs...")
 
     # Select top commands or use filter, remap rest to "other"
-    _select_and_remap(cpu_rows, mem_rows, dev_rows, process_filter)
+    label_maps = build_label_maps(sysstat_dir, args.process)
+    if label_maps is not None:
+        for rows in (cpu_rows, mem_rows, dev_rows):
+            remap_rows(rows, label_maps)
+    else:
+        _select_and_remap(cpu_rows, mem_rows, dev_rows, process_filter)
 
     # Build time indices
     cpu_times = _unique_times(cpu_rows)
@@ -142,9 +152,11 @@ def main():
         cpu_per_core[row["command"]][row["time"]][int(row["cpu"])] += float(row["cpu_pct"])
 
     # Collect all commands that appear in any section, sort with "other" last
+    order = get_label_order(args.container, args.process)
+    position = {lbl: i for i, lbl in enumerate(order)}
     commands = sorted(
         set(cpu_by_cmd) | set(mem_by_cmd) | set(dev_rd_by_cmd),
-        key=lambda c: (c == "other", c),
+        key=lambda c: (c == "other", position.get(c, len(order)), c),
     )
 
     rows = []
@@ -221,6 +233,7 @@ def main():
     build_dashboard(
         rows=rows,
         col_titles=["CPU %", "Memory %", "Disk IO (KB/s)"],
+        col_ylims=[(0, 100), (0, 100), None],
         title="Sysstat Dashboard",
         output_path=output,
     )
