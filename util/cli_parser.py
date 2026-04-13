@@ -52,18 +52,19 @@ def parse_args(argv=None):
         "-l", "--layers",
         action="append",
         default=None,
-        help="Layers to target, comma-separated and/or repeatable (default: all)",
+        help="Layers to target, comma-separated and/or repeatable (default: all) [config: layers]",
     )
-    parent.add_argument("-m", "--mode", choices=["summary", "detailed"], default=None)
-    parent.add_argument("-p", "--comm-filter", help="Process/command name filter, comma-separated for multiple (block, fs)")
-    parent.add_argument("-c", "--container-filter", help="Container name filter, comma-separated for multiple (forces detailed)")
-    parent.add_argument("-d", "--dev-filter", help="NVMe device filter, comma-separated for multiple (e.g. nvme0n1,nvme1n1)")
-    parent.add_argument("--config", metavar="FILE", help="YAML config file; CLI flags override file values")
-    parent.add_argument("--dir", "--results-dir", dest="results_dir", help="Results directory (overrides RESULTS_DIR env var)")
-    parent.add_argument("--clean", action="store_true", help="Clean each selected layer's results subdirectory")
-    parent.add_argument("--visualize", action="store_true", help="Generate visualization dashboards (detailed mode only)")
-    parent.add_argument("--debug", action="store_true", help="Enable verbose Makefile output (DEBUG=1)")
-    parent.add_argument("--dry", action="store_true", help="Print commands instead of executing")
+    parent.add_argument("-m", "--mode", choices=["summary", "detailed"], default=None,
+                        help="Profiling mode: summary or detailed (default: summary) [config: mode]")
+    parent.add_argument("-p", "--comm-filter", help="Process/command name filter, comma-separated for multiple (block, fs) [config: comm_filter]")
+    parent.add_argument("-c", "--container-filter", help="Container name filter, comma-separated for multiple (forces detailed) [config: container_filter]")
+    parent.add_argument("-d", "--dev-filter", help="NVMe device filter, comma-separated for multiple (e.g. nvme0n1,nvme1n1) [config: dev_filter]")
+    parent.add_argument("--config", metavar="FILE", help="YAML config file; CLI flags override file values [CLI only]")
+    parent.add_argument("--dir", "--results-dir", dest="results_dir", help="Results directory (overrides RESULTS_DIR env var) [CLI only]")
+    parent.add_argument("--clean", action="store_true", help="Clean each selected layer's results subdirectory [CLI only]")
+    parent.add_argument("--visualize", action="store_true", help="Generate visualization dashboards (detailed mode only) [CLI only]")
+    parent.add_argument("--debug", action="store_true", help="Enable verbose Makefile output (DEBUG=1) [CLI only]")
+    parent.add_argument("--dry", action="store_true", help="Print commands instead of executing [CLI only]")
 
     parser = argparse.ArgumentParser(
         prog="run.sh",

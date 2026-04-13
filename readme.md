@@ -89,6 +89,35 @@ stopping FuStIP inside the DevBox.
 > command(s) for running the tool. This can be useful for using the tool as
 > part of a pipeline of another tool/setup.
 
+### Using a config file
+This tool allows for specifying cli options through a config file also, with
+the option `--config`. Below are the formatting of such a yaml file:
+
+```yaml
+mode: detailed
+
+layers:
+    - sysstat
+    - fs
+    - block
+    - nvme
+
+comm_filter: 
+    - fio
+    - pidstat
+
+container_filter:
+    - fio-container
+    - pidstat-container
+
+dev_filter:
+    - nvme0n1
+    - nvme1n1
+```
+
+Note, that some options cannot be specified through a config file, and must
+be passed with other options (see example below).
+
 ### Start IO Profiling
 **For all layers for a fio process with nvme dev nvme0n1**:
 
@@ -114,6 +143,10 @@ stopping FuStIP inside the DevBox.
 
     ./run.sh profile start --clean -p fio -d nvme0n1
 
+**Using a config file to specify options**:
+
+    ./run.sh profile start --clean --config ./fustip-config.yml
+
 ### Stop IO Profiling
 **For all layers**:
 
@@ -122,6 +155,10 @@ stopping FuStIP inside the DevBox.
 **Generate visualizations with results**:
 
     ./run.sh profile stop --visualize -m detailed -p fio -d nvme0n1
+
+**Using a config file to specify options**:
+
+    ./run.sh profile stop --visualize --config ./fustip-config.yml
 
 
 ### Run full test suite
