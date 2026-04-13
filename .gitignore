@@ -4,7 +4,7 @@ __pycache__
 *.lock
 *.swp
 
-# BPF CO-RE build artifacts
+# BPF CORE build artifacts
 util/bpf/include
 *.bpf.o
 *.skel.h

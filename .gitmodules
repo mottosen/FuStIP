@@ -1,3 +1,0 @@
-[submodule "subs/inspektor-gadget"]
-	path = subs/inspektor-gadget
-    url = git@github.com:mottosen/inspektor-gadget.git
