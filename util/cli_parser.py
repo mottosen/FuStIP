@@ -60,7 +60,11 @@ def parse_args(argv=None):
     parent.add_argument("-c", "--container-filter", help="Container name filter, comma-separated for multiple (forces detailed) [config: container_filter]")
     parent.add_argument("-d", "--dev-filter", help="NVMe device filter, comma-separated for multiple (e.g. nvme0n1,nvme1n1) [config: dev_filter]")
     parent.add_argument("--config", metavar="FILE", help="YAML config file; CLI flags override file values [CLI only]")
-    parent.add_argument("--dir", "--results-dir", dest="results_dir", help="Results directory (overrides RESULTS_DIR env var) [CLI only]")
+    parent.add_argument("--results-dir", dest="results_dir", help="Results directory for stats and visualizations (overrides RESULTS_DIR env var) [CLI only]")
+    parent.add_argument("--tmp-dir", "--data-dir", dest="tmp_dir", default=None,
+                        help="Temporary directory for raw trace data (overrides FUSTIP_TMP_DIR env var). "
+                             "On profile stop, stats JSON and visualizations are copied to --results-dir and "
+                             "raw trace data is deleted. Defaults to --results-dir when unset. [CLI only]")
     parent.add_argument("--clean", action="store_true", help="Clean each selected layer's results subdirectory [CLI only]")
     parent.add_argument("--visualize", action="store_true", help="Generate visualization dashboards (detailed mode only) [CLI only]")
     parent.add_argument("--debug", action="store_true", help="Enable verbose Makefile output (DEBUG=1) [CLI only]")
@@ -124,6 +128,11 @@ def parse_args(argv=None):
     return args
 
 
+def _data_dir(args):
+    """Return the directory to use for raw trace data collection."""
+    return args.tmp_dir if args.tmp_dir else args.results_dir
+
+
 def validate(args):
     if args.container_filter:
         args.mode = "detailed"
@@ -153,8 +162,11 @@ def resolve_env(args):
     if not args.results_dir:
         args.results_dir = os.environ.get("RESULTS_DIR")
     if not args.results_dir:
-        print("Error: results dir not set (use --dir or RESULTS_DIR env var)", file=sys.stderr)
+        print("Error: results dir not set (use --results-dir or RESULTS_DIR env var)", file=sys.stderr)
         sys.exit(1)
+
+    if not args.tmp_dir:
+        args.tmp_dir = os.environ.get("FUSTIP_TMP_DIR") or None
 
     if args.action == "test":
         fio_file = os.environ.get("FIO_FILE")
@@ -173,7 +185,7 @@ def build_layer_vars(layer, args):
             vs.append(f"COMM_FILTER={args.comm_filter}")
         if args.container_filter:
             vs.append(f"CONTAINER_FILTER={args.container_filter}")
-        vs.append(f"RESULTS_DIR={args.results_dir}")
+        vs.append(f"RESULTS_DIR={_data_dir(args)}")
         return vs
 
     if args.container_filter:
@@ -190,7 +202,7 @@ def build_layer_vars(layer, args):
         if args.comm_filter:
             vs.append(f"COMM_FILTER={args.comm_filter}")
 
-    vs.append(f"RESULTS_DIR={args.results_dir}")
+    vs.append(f"RESULTS_DIR={_data_dir(args)}")
     return vs
 
 
@@ -214,7 +226,7 @@ def _container_map_start_cmd(args):
         return None
     return (
         f"python ./util/container/generate_container_map.py "
-        f"\"{args.results_dir}\" \"{args.container_filter}\" >/dev/null 2>&1 "
+        f"\"{_data_dir(args)}\" \"{args.container_filter}\" >/dev/null 2>&1 "
         f"& echo $! > /tmp/fustip-container-map.pid"
     )
 
@@ -325,6 +337,35 @@ def generate_visualize_commands(args):
     return cmds
 
 
+def generate_tmp_finalize_commands(args):
+    """Copy stats/visualizations from tmp_dir to results_dir.
+
+    Called after profile stop (and optional visualize) when --tmp-dir differs from --results-dir.
+    For each layer: copies *.json and *.png files to results_dir/{layer}/.
+    Raw trace data in tmp_dir is left in place — overwritten by the next run.
+    Also handles a top-level visualizations/ subdirectory if present.
+    """
+    td = args.tmp_dir
+    rd = args.results_dir
+    cmds = []
+    for layer in args.layers:
+        cmds.append(
+            f'mkdir -p "{rd}/{layer}" && '
+            f'cp "{td}/{layer}"/*.json "{rd}/{layer}/" 2>/dev/null || true && '
+            f'cp "{td}/{layer}"/*.parquet "{rd}/{layer}/" 2>/dev/null || true && '
+            f'cp "{td}/{layer}"/*.csv "{rd}/{layer}/" 2>/dev/null || true && '
+            f'cp "{td}/{layer}"/*.png "{rd}/{layer}/" 2>/dev/null || true'
+        )
+    # Handle shared visualizations/ directory written by some visualize targets
+    cmds.append(
+        f'if [ -d "{td}/visualizations" ]; then '
+        f'mkdir -p "{rd}/visualizations" && '
+        f'cp -r "{td}/visualizations/." "{rd}/visualizations/"; '
+        f'fi'
+    )
+    return cmds
+
+
 def main(argv=None):
     args = parse_args(argv)
     validate(args)
@@ -334,7 +375,7 @@ def main(argv=None):
 
     if args.clean:
         for layer in args.layers:
-            cmds.append(f"rm -rf {args.results_dir}/{layer}")
+            cmds.append(f"rm -rf {_data_dir(args)}/{layer}")
 
     if args.action == "profile":
         cmds.extend(generate_profile_commands(args))
@@ -343,6 +384,11 @@ def main(argv=None):
 
     if args.visualize:
         cmds.extend(generate_visualize_commands(args))
+
+    # After stop+visualize: copy stats to results_dir and clean up raw trace data from tmp_dir
+    if (args.action == "profile" and args.sub_action == "stop"
+            and args.tmp_dir and args.tmp_dir != args.results_dir):
+        cmds.extend(generate_tmp_finalize_commands(args))
 
     for cmd in cmds:
         print(cmd)
