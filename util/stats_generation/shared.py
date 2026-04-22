@@ -566,6 +566,45 @@ def compute_access_pattern(sectors, bytes_list):
     }
 
 
+def compute_lba_distribution(sectors, bytes_list, device_sectors=None, n_bins=512):
+    """Compute LBA space distribution histogram.
+
+    For each IO, the start LBA (sector) is binned into one of n_bins buckets
+    spanning [lba_min, lba_max).  lba_max is the total device size in sectors
+    when device_sectors is provided, otherwise the observed maximum end-LBA.
+
+    Accepts lists or numpy arrays.
+
+    Returns: {"lba_min": int, "lba_max": int, "device_sectors": int|None,
+              "n_bins": int,
+              "bins": [{"lba_start": int, "count": int}, ...]}  # non-zero only
+    """
+    s = np.asarray(sectors, dtype=np.int64)
+    b = np.asarray(bytes_list, dtype=np.int64)
+    if len(s) == 0:
+        return {"lba_min": 0, "lba_max": device_sectors or 0,
+                "device_sectors": device_sectors, "n_bins": n_bins, "bins": []}
+    lba_min = int(s.min())
+    lba_observed_max = int((s + b // 512).max())
+    lba_max = device_sectors if device_sectors is not None else lba_observed_max
+    lba_range = max(lba_max - lba_min, 1)
+
+    bin_idx = np.clip((s - lba_min) * n_bins // lba_range, 0, n_bins - 1).astype(np.int64)
+    counts = np.bincount(bin_idx, minlength=n_bins)
+    bin_lba_size = lba_range / n_bins
+
+    return {
+        "lba_min": lba_min,
+        "lba_max": lba_max,
+        "device_sectors": device_sectors,
+        "n_bins": n_bins,
+        "bins": [
+            {"lba_start": int(lba_min + i * bin_lba_size), "count": int(counts[i])}
+            for i in range(n_bins) if counts[i] > 0
+        ],
+    }
+
+
 def compute_fs_access_pattern(offsets, bytes_list):
     """Compute sequential/random access pattern from byte offsets.
 

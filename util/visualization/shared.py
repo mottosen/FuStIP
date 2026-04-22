@@ -277,6 +277,62 @@ def plot_gap_cdf(ax, df, type_col, sector_or_offset_col, bytes_col, types,
     ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
 
+def plot_lba_density(ax, density_df, type_col, lba_bin_col, count_col,
+                     lba_min, lba_max, types, n_bins=512):
+    """Plot LBA density histogram from pre-binned data.
+
+    density_df: DataFrame with columns [type_col, lba_bin_col (0..n_bins-1), count_col]
+    """
+    lba_range = max(lba_max - lba_min, 1)
+    bin_size = lba_range / n_bins
+    x_ticks = np.arange(n_bins) * bin_size + lba_min
+
+    for i, typ in enumerate(types):
+        sub = density_df.filter(pl.col(type_col) == typ).sort(lba_bin_col)
+        if len(sub) == 0:
+            continue
+        counts = np.zeros(n_bins, dtype=np.int64)
+        for row in sub.iter_rows(named=True):
+            counts[row[lba_bin_col]] = row[count_col]
+        ax.plot(counts, x_ticks, label=typ, color=_color_for(typ, i),
+                linestyle=_linestyle_for(typ), linewidth=0.8)
+
+    ax.set_xlabel("IO Count")
+    ax.set_ylabel("LBA")
+    ax.set_ylim(lba_min, lba_max)
+    ax.set_title("LBA Density")
+    ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
+
+
+def plot_lba_heatmap_2d(ax, heatmap_df, op, n_lba_bins, n_time_bins,
+                         lba_min, lba_max, duration_s):
+    """Plot 2D time×LBA heatmap for a single op type.
+
+    heatmap_df: DataFrame with columns ["time_bin", "lba_bin", "count"] for this op.
+    """
+    mat = np.zeros((n_lba_bins, n_time_bins), dtype=np.float32)
+    for row in heatmap_df.iter_rows(named=True):
+        mat[row["lba_bin"], row["time_bin"]] = row["count"]
+
+    mat_log = np.log1p(mat)
+    vmax_log = float(mat_log.max())
+    im = ax.imshow(mat_log, aspect="auto", origin="lower", cmap="inferno",
+                   extent=[0, duration_s, lba_min, lba_max],
+                   vmin=0, vmax=max(vmax_log, 1e-6))
+    cb = ax.figure.colorbar(im, ax=ax, label="IO count")
+    # Tick labels show actual IO counts (inverse of log1p)
+    if vmax_log > 0:
+        actual_max = float(mat.max())
+        magnitude = max(0, int(np.log10(max(actual_max, 1))))
+        raw_ticks = sorted({0} | {10**i for i in range(magnitude + 1)} | {int(actual_max)})
+        log_ticks = [np.log1p(v) for v in raw_ticks if np.log1p(v) <= vmax_log * 1.001]
+        cb.set_ticks(log_ticks)
+        cb.set_ticklabels([str(int(np.expm1(t))) for t in log_ticks])
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("LBA")
+    ax.set_title(f"LBA Heatmap ({op})")
+
+
 def build_dashboard(rows, col_titles, title, output_path, col_ylims=None):
     """Build a multi-row dashboard.
 
