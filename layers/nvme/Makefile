@@ -63,6 +63,9 @@ ifeq ($(MODE),detailed)
 
 	$(Q)sudo rm -f "$(RESULTS_DIR)/nvme/detailed.csv" "$(RESULTS_DIR)/nvme/counters.json" $(ERR_REDIRECT) || true
 	$(Q)touch "$(RESULTS_DIR)/nvme/detailed.csv" "$(RESULTS_DIR)/nvme/counters.json"
+	$(Q)if [ -n "$(DEV_FILTER)" ]; then \
+		printf '{"device": "%s"}\n' "$(DEV_FILTER)" > "$(RESULTS_DIR)/nvme/device-info.json"; \
+	fi
 	$(Q)sudo ./bpf/c/standalone \
 		-o "$(RESULTS_DIR)/nvme/detailed.csv" \
 		$(if $(DEV_FILTER),-f $(DEV_FILTER)) \

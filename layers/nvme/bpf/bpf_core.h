@@ -11,6 +11,7 @@ struct cmd_data {
   __u64 sector;
   __u64 mntns_id;
   __u8 comm[16];
+  char disk_name[32]; // kernel gendisk name, read once at fentry setup
 };
 
 // ── Per-(op, comm) key for inflight counters ──
@@ -87,6 +88,9 @@ static __always_inline int handle_nvme_fentry_setup(struct request *req) {
   struct task_struct *task = (struct task_struct *)bpf_get_current_task();
   data.mntns_id = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
   bpf_get_current_comm(&data.comm, sizeof(data.comm));
+  struct gendisk *disk = BPF_CORE_READ(req, q, disk);
+  if (disk)
+    bpf_probe_read_kernel_str(&data.disk_name, sizeof(data.disk_name), &disk->disk_name);
   bpf_map_update_elem(&cmd_metadata, &rq_key, &data, BPF_ANY);
 
   // Bridge: store rq pointer for the rawtracepoint to pick up
@@ -146,6 +150,7 @@ static __always_inline int handle_nvme_rawtp_setup(void) {
     e->rq = rq_key;
     __builtin_memcpy(e->comm, data->comm, 16);
     e->inflight = cur_inflight;
+    __builtin_memcpy(e->disk_name, data->disk_name, 32);
     bpf_ringbuf_submit(e, 0);
   } else {
     __u32 drop_key = 1;
@@ -201,6 +206,7 @@ static __always_inline int handle_nvme_complete(struct request *req) {
     e->rq = rq_key;
     __builtin_memcpy(e->comm, data->comm, 16);
     e->inflight = cur_inflight;
+    __builtin_memcpy(e->disk_name, data->disk_name, 32);
     bpf_ringbuf_submit(e, 0);
   } else {
     __u32 drop_key = 3;  // COMPLETE_DROP

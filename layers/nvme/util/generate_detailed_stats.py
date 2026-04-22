@@ -28,6 +28,7 @@ import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from stats_generation.shared import (compute_access_pattern,
+                                     compute_lba_distribution,
                                      tseries_stats)
 from container.labeling import bind_containers, load_comm_label_map, load_mntns_label_map
 
@@ -76,6 +77,39 @@ def _comm_key(row, has_mntns):
     """Extract (comm, mntns_id_str) key from a row dict."""
     mntns_id = row.get("mntns_id") if has_mntns else None
     return row["comm"], (str(mntns_id) if mntns_id is not None else "")
+
+
+def load_device_sectors(parquet_path, schema):
+    """Infer total device sector count from disk_name column via sysfs.
+
+    Reads the most common disk_name from setup events in the Parquet, then
+    looks up /sys/block/<disk_name>/size.  Returns None if the column is
+    absent (old Parquet without disk_name) or the device is not found.
+    """
+    if "disk_name" not in schema:
+        return None
+    result = (pl.scan_parquet(parquet_path)
+              .filter(pl.col("event") == "setup")
+              .filter(pl.col("disk_name").is_not_null())
+              .filter(pl.col("disk_name") != "")
+              .select("disk_name")
+              .group_by("disk_name")
+              .agg(pl.len().alias("count"))
+              .sort("count", descending=True)
+              .limit(1)
+              .collect(engine="streaming"))
+    if len(result) == 0:
+        return None
+    dev = result["disk_name"][0]
+    if not dev:
+        return None
+    size_path = Path(f"/sys/block/{dev}/size")
+    if size_path.exists():
+        try:
+            return int(size_path.read_text().strip())
+        except ValueError:
+            pass
+    return None
 
 
 def generate_stats(parquet_path):
@@ -239,6 +273,7 @@ def generate_stats(parquet_path):
     # --- Scan 4: Access pattern (per comm) ---
     # Scan per-comm to avoid partition_by() on a 100M+ row DataFrame, which creates
     # full copies of all partitions simultaneously and spikes RSS to 3× the frame size.
+    device_sectors = load_device_sectors(parquet_path, schema)
     if has_sector:
         for (comm, mntns_id_str) in list(_entries.keys()):
             if has_mntns and mntns_id_str:
@@ -256,6 +291,7 @@ def generate_stats(parquet_path):
                 continue
             entry = ensure_comm_entry(comm, mntns_id_str)
             entry["access_pattern"].setdefault("cmd_sectors", {})
+            entry["access_pattern"].setdefault("lba_distribution", {})
             for op_part in setup_df.partition_by("op", maintain_order=False):
                 op = op_part["op"][0]
                 sectors = op_part["sector"].cast(pl.Int64).to_numpy()
@@ -263,6 +299,10 @@ def generate_stats(parquet_path):
                 if len(sectors) >= 2:
                     entry["access_pattern"]["cmd_sectors"][op] = compute_access_pattern(
                         sectors, bytes_list
+                    )
+                if len(sectors) >= 1:
+                    entry["access_pattern"]["lba_distribution"][op] = compute_lba_distribution(
+                        sectors, bytes_list, device_sectors
                     )
             del setup_df
 
