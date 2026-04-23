@@ -586,8 +586,7 @@ def compute_lba_distribution(sectors, bytes_list, device_sectors=None, n_bins=51
                 "device_sectors": device_sectors, "n_bins": n_bins, "bins": []}
     lba_min = int(s.min())
     lba_observed_max = int((s + b // 512).max())
-    lba_max = device_sectors if device_sectors is not None else lba_observed_max
-    lba_range = max(lba_max - lba_min, 1)
+    lba_range = max(lba_observed_max - lba_min, 1)
 
     bin_idx = np.clip((s - lba_min) * n_bins // lba_range, 0, n_bins - 1).astype(np.int64)
     counts = np.bincount(bin_idx, minlength=n_bins)
@@ -595,7 +594,7 @@ def compute_lba_distribution(sectors, bytes_list, device_sectors=None, n_bins=51
 
     return {
         "lba_min": lba_min,
-        "lba_max": lba_max,
+        "lba_max": lba_observed_max,
         "device_sectors": device_sectors,
         "n_bins": n_bins,
         "bins": [

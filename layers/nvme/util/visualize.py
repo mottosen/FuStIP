@@ -4,6 +4,7 @@
 import sys
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
@@ -16,6 +17,8 @@ from visualization.shared import (build_dashboard, plot_cumulated_mb_over_time,
 
 LAYER = "nvme"
 WINDOW_NS = 1_000_000_000
+N_HEATMAP_LBA_BINS = 256
+N_HEATMAP_TIME_BINS = 256
 
 
 def load_device_sectors(parquet_path, schema):
@@ -70,7 +73,8 @@ def _comm_filter(comm_list, has_mntns):
 
 
 def _build_row(label, parquet_path, comm_filter, ts_min, device_sectors=None,
-               ts_max=None, heatmap_ops=None, lba_min=None, lba_max=None):
+               ts_max=None, heatmap_ops=None, lba_min=None, lba_max=None,
+               heatmap_vmax_log=None):
     """Build a dashboard row dict using per-plot Parquet scans."""
 
     def _scan(cols, event_filter=None):
@@ -143,10 +147,27 @@ def _build_row(label, parquet_path, comm_filter, ts_min, device_sectors=None,
                     else (int(_lba_df["lba_observed_max"][0]) if _has_lba else 1))
     _lba_range = max(_lba_max - _lba_min, 1)
 
+    # Percentile-based (p1/p99) local bounds — zoomed to where 98% of IOs land.
+    # Computed once here and shared by local_density_fn and _make_heatmap_fn.
+    _local_lba_min = _lba_min
+    _local_lba_max = _lba_max
+    if _has_lba:
+        _local_bounds_df = (_scan(["sector"], event_filter="setup")
+                            .filter(pl.col("sector").is_not_null())
+                            .select([
+                                pl.col("sector").quantile(0.01).alias("lba_p1"),
+                                pl.col("sector").quantile(0.99).alias("lba_p99"),
+                            ])
+                            .collect(engine="streaming"))
+        if len(_local_bounds_df) > 0 and _local_bounds_df["lba_p1"][0] is not None:
+            _local_lba_min = int(_local_bounds_df["lba_p1"][0])
+            _local_lba_max = int(_local_bounds_df["lba_p99"][0])
+    _local_lba_range = max(_local_lba_max - _local_lba_min, 1)
+
     def density_fn(ax, t=types, lba_min=_lba_min, lba_max=_lba_max,
                    lba_range=_lba_range, has_lba=_has_lba):
         if not has_lba:
-            ax.set_title("LBA Density")
+            ax.set_title("LBA Density (global)")
             ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
             return
         n_bins = 512
@@ -161,15 +182,36 @@ def _build_row(label, parquet_path, comm_filter, ts_min, device_sectors=None,
                       .collect(engine="streaming"))
         plot_lba_density(ax, density_df, "op", "lba_bin", "count",
                          lba_min, lba_max, t, n_bins=n_bins)
+        ax.set_title("LBA Density (global)")
+
+    def local_density_fn(ax, t=types, lba_min=_local_lba_min, lba_max=_local_lba_max,
+                         lba_range=_local_lba_range, has_lba=_has_lba):
+        if not has_lba:
+            ax.set_title("LBA Density (local, p1–p99)")
+            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+            return
+        n_bins = 512
+        density_df = (_scan(["op", "sector"], event_filter="setup")
+                      .filter(pl.col("sector").is_not_null())
+                      .with_columns(
+                          ((pl.col("sector") - lba_min) * n_bins // lba_range)
+                          .clip(0, n_bins - 1).cast(pl.Int32).alias("lba_bin")
+                      )
+                      .group_by("op", "lba_bin")
+                      .agg(pl.len().alias("count"))
+                      .collect(engine="streaming"))
+        plot_lba_density(ax, density_df, "op", "lba_bin", "count",
+                         lba_min, lba_max, t, n_bins=n_bins)
+        ax.set_title("LBA Density (local, p1–p99)")
 
     def _make_heatmap_fn(op):
-        N_LBA_BINS = 256
-        N_TIME_BINS = 256
+        vmax_log = heatmap_vmax_log.get(op) if heatmap_vmax_log else None
 
-        def heatmap_fn(ax, op=op, lba_min=_lba_min, lba_max=_lba_max,
-                       lba_range=_lba_range, has_lba=_has_lba, ts=ts_min, te=ts_max):
+        def heatmap_fn(ax, op=op, lba_min=_local_lba_min, lba_max=_local_lba_max,
+                       lba_range=_local_lba_range, has_lba=_has_lba, ts=ts_min, te=ts_max,
+                       vmax_log=vmax_log):
             if not has_lba or te is None or te <= ts:
-                ax.set_title(f"Heatmap ({op})")
+                ax.set_title(f"LBA Heatmap ({op})")
                 ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
                 return
             duration_s = (te - ts) / 1e9
@@ -177,16 +219,16 @@ def _build_row(label, parquet_path, comm_filter, ts_min, device_sectors=None,
                           .filter(pl.col("op") == op)
                           .filter(pl.col("sector").is_not_null())
                           .with_columns([
-                              ((pl.col("sector") - lba_min) * N_LBA_BINS // lba_range)
-                              .clip(0, N_LBA_BINS - 1).cast(pl.Int32).alias("lba_bin"),
-                              ((pl.col("timestamp_ns") - ts) * N_TIME_BINS // (te - ts + 1))
-                              .clip(0, N_TIME_BINS - 1).cast(pl.Int32).alias("time_bin"),
+                              ((pl.col("sector") - lba_min) * N_HEATMAP_LBA_BINS // lba_range)
+                              .clip(0, N_HEATMAP_LBA_BINS - 1).cast(pl.Int32).alias("lba_bin"),
+                              ((pl.col("timestamp_ns") - ts) * N_HEATMAP_TIME_BINS // (te - ts + 1))
+                              .clip(0, N_HEATMAP_TIME_BINS - 1).cast(pl.Int32).alias("time_bin"),
                           ])
                           .group_by("time_bin", "lba_bin")
                           .agg(pl.len().alias("count"))
                           .collect(engine="streaming"))
-            plot_lba_heatmap_2d(ax, heatmap_df, op, N_LBA_BINS, N_TIME_BINS,
-                                lba_min, lba_max, duration_s)
+            plot_lba_heatmap_2d(ax, heatmap_df, op, N_HEATMAP_LBA_BINS, N_HEATMAP_TIME_BINS,
+                                lba_min, lba_max, duration_s, vmax_log=vmax_log)
         return heatmap_fn
 
     return {
@@ -200,6 +242,7 @@ def _build_row(label, parquet_path, comm_filter, ts_min, device_sectors=None,
             latency_fn,
             gap_fn,
             density_fn,
+            local_density_fn,
         ] + [_make_heatmap_fn(op) for op in (heatmap_ops or [])],
     }
 
@@ -263,10 +306,54 @@ def main():
             global_lba_max = (device_sectors if device_sectors is not None
                               else int(lba_bounds_df["lba_observed_max"][0]))
 
-    # col_ylims: None (auto) for non-LBA columns; explicit range for LBA Density + heatmaps
-    # so build_dashboard's "y_min >= 0 → y_min = 0" normalisation is bypassed.
-    lba_ylim = (global_lba_min, global_lba_max) if global_lba_min is not None else None
-    col_ylims = [None] * 7 + [lba_ylim] + [lba_ylim] * len(global_ops)
+    # "per_row" tells build_dashboard to skip cross-row y-axis unification for that column,
+    # letting each row auto-scale to its own observed LBA range.
+    col_ylims = [None] * 7 + ["per_row"] + ["per_row"] + ["per_row"] * len(global_ops)
+
+    # Pre-compute per-row p1/p99 LBA bounds and the global max bin count per op so that
+    # heatmap colour scales are shared across rows (enabling count comparison).
+    row_local_lba_bounds: dict = {}  # label -> (lba_min, lba_max)
+    if "sector" in schema:
+        for label in sorted(label_to_comms):
+            cf = _comm_filter(label_to_comms[label], has_mntns)
+            b = (pl.scan_parquet(parquet_path)
+                 .filter(cf)
+                 .filter(pl.col("event") == "setup")
+                 .filter(pl.col("sector").is_not_null())
+                 .select([pl.col("sector").quantile(0.01).alias("p1"),
+                          pl.col("sector").quantile(0.99).alias("p99")])
+                 .collect(engine="streaming"))
+            if len(b) > 0 and b["p1"][0] is not None:
+                row_local_lba_bounds[label] = (int(b["p1"][0]), int(b["p99"][0]))
+            else:
+                row_local_lba_bounds[label] = (global_lba_min or 0, global_lba_max or 1)
+
+    global_heatmap_vmax_log: dict = {}  # op -> log1p(global max bin count)
+    ts_range = max((global_ts_max or 1) - (global_ts_min or 0), 1)
+    for op in global_ops:
+        op_vmax = 0.0
+        for label in sorted(label_to_comms):
+            cf = _comm_filter(label_to_comms[label], has_mntns)
+            loc_min, loc_max = row_local_lba_bounds.get(label, (global_lba_min or 0, global_lba_max or 1))
+            loc_range = max(loc_max - loc_min, 1)
+            mc = (pl.scan_parquet(parquet_path)
+                  .filter(cf)
+                  .filter(pl.col("event") == "setup")
+                  .filter(pl.col("op") == op)
+                  .filter(pl.col("sector").is_not_null())
+                  .with_columns([
+                      ((pl.col("sector") - loc_min) * N_HEATMAP_LBA_BINS // loc_range)
+                      .clip(0, N_HEATMAP_LBA_BINS - 1).cast(pl.Int32).alias("lba_bin"),
+                      ((pl.col("timestamp_ns") - (global_ts_min or 0)) * N_HEATMAP_TIME_BINS // ts_range)
+                      .clip(0, N_HEATMAP_TIME_BINS - 1).cast(pl.Int32).alias("time_bin"),
+                  ])
+                  .group_by("time_bin", "lba_bin")
+                  .agg(pl.len().alias("count"))
+                  .select(pl.col("count").max())
+                  .collect(engine="streaming"))
+            if len(mc) > 0 and mc["count"][0] is not None:
+                op_vmax = max(op_vmax, float(np.log1p(mc["count"][0])))
+        global_heatmap_vmax_log[op] = max(op_vmax, 1e-6)
 
     rows = []
     for label in sorted(label_to_comms):
@@ -276,14 +363,16 @@ def main():
                                ts_max=global_ts_max,
                                heatmap_ops=global_ops,
                                lba_min=global_lba_min,
-                               lba_max=global_lba_max))
+                               lba_max=global_lba_max,
+                               heatmap_vmax_log=global_heatmap_vmax_log))
 
     output = results_dir / "visualizations" / "nvme-dashboard.png"
     build_dashboard(
         rows=rows,
         col_titles=(["Type Distribution", "Inflight", "IOPS", "Cumul. MB",
-                     "IO Size CDF", "Latency CDF", "Gap CDF", "LBA Density"]
-                    + [f"Heatmap ({op})" for op in global_ops]),
+                     "IO Size CDF", "Latency CDF", "Gap CDF",
+                     "LBA Density (global)", "LBA Density (local, p1–p99)"]
+                    + [f"LBA Heatmap ({op})" for op in global_ops]),
         col_ylims=col_ylims,
         title="NVMe Layer Dashboard",
         output_path=output,

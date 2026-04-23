@@ -277,6 +277,26 @@ def plot_gap_cdf(ax, df, type_col, sector_or_offset_col, bytes_col, types,
     ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
 
+def _set_lba_yticks(ax, lba_min, lba_max):
+    """Ensure lba_min and lba_max appear as explicit y-axis ticks.
+
+    Keeps matplotlib's auto-generated interior ticks that fall within the range,
+    then forces the exact endpoints to be present so the reader can see where the
+    data window starts and stops.
+    """
+    lba_range = lba_max - lba_min
+    tol = lba_range * 0.02  # within 2% of range counts as "already there"
+    auto = [t for t in ax.get_yticks() if lba_min <= t <= lba_max]
+    ticks = []
+    if not any(abs(lba_min - t) < tol for t in auto):
+        ticks.append(lba_min)
+    ticks.extend(auto)
+    if not any(abs(lba_max - t) < tol for t in auto):
+        ticks.append(lba_max)
+    ax.set_yticks(sorted(set(ticks)))
+    ax.set_ylim(lba_min, lba_max)
+
+
 def plot_lba_density(ax, density_df, type_col, lba_bin_col, count_col,
                      lba_min, lba_max, types, n_bins=512):
     """Plot LBA density histogram from pre-binned data.
@@ -300,36 +320,41 @@ def plot_lba_density(ax, density_df, type_col, lba_bin_col, count_col,
     ax.set_xlabel("IO Count")
     ax.set_ylabel("LBA")
     ax.set_ylim(lba_min, lba_max)
+    _set_lba_yticks(ax, lba_min, lba_max)
     ax.set_title("LBA Density")
     ax.legend(fontsize="small", loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
 
 def plot_lba_heatmap_2d(ax, heatmap_df, op, n_lba_bins, n_time_bins,
-                         lba_min, lba_max, duration_s):
+                         lba_min, lba_max, duration_s, vmax_log=None):
     """Plot 2D time×LBA heatmap for a single op type.
 
     heatmap_df: DataFrame with columns ["time_bin", "lba_bin", "count"] for this op.
+    vmax_log: if provided, fixes the colour scale at this log1p(count) value so that
+              multiple rows sharing the same op column are comparable.
     """
     mat = np.zeros((n_lba_bins, n_time_bins), dtype=np.float32)
     for row in heatmap_df.iter_rows(named=True):
         mat[row["lba_bin"], row["time_bin"]] = row["count"]
 
     mat_log = np.log1p(mat)
-    vmax_log = float(mat_log.max())
+    local_vmax_log = float(mat_log.max())
+    effective_vmax_log = max(vmax_log if vmax_log is not None else local_vmax_log, 1e-6)
     im = ax.imshow(mat_log, aspect="auto", origin="lower", cmap="inferno",
                    extent=[0, duration_s, lba_min, lba_max],
-                   vmin=0, vmax=max(vmax_log, 1e-6))
+                   vmin=0, vmax=effective_vmax_log)
     cb = ax.figure.colorbar(im, ax=ax, label="IO count")
-    # Tick labels show actual IO counts (inverse of log1p)
-    if vmax_log > 0:
-        actual_max = float(mat.max())
+    # Tick labels show actual IO counts (inverse of log1p), anchored to the shared scale.
+    if effective_vmax_log > 0:
+        actual_max = float(np.expm1(effective_vmax_log))
         magnitude = max(0, int(np.log10(max(actual_max, 1))))
         raw_ticks = sorted({0} | {10**i for i in range(magnitude + 1)} | {int(actual_max)})
-        log_ticks = [np.log1p(v) for v in raw_ticks if np.log1p(v) <= vmax_log * 1.001]
+        log_ticks = [np.log1p(v) for v in raw_ticks if np.log1p(v) <= effective_vmax_log * 1.001]
         cb.set_ticks(log_ticks)
         cb.set_ticklabels([str(int(np.expm1(t))) for t in log_ticks])
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("LBA")
+    _set_lba_yticks(ax, lba_min, lba_max)
     ax.set_title(f"LBA Heatmap ({op})")
 
 
@@ -357,8 +382,11 @@ def build_dashboard(rows, col_titles, title, output_path, col_ylims=None):
             ax = axes[r, c]
             plot_fn(ax)
 
-    # Unify y-axes per column, starting at 0 for non-negative data
+    # Unify y-axes per column, starting at 0 for non-negative data.
+    # col_ylims[c] == "per_row" means skip unification and let each row auto-scale.
     for c in range(ncols):
+        if col_ylims and col_ylims[c] == "per_row":
+            continue
         if col_ylims and col_ylims[c] is not None:
             y_min, y_max = col_ylims[c]
         else:

@@ -166,7 +166,7 @@ def resolve_env(args):
         sys.exit(1)
 
     if not args.tmp_dir:
-        args.tmp_dir = os.environ.get("FUSTIP_TMP_DIR") or None
+        args.tmp_dir = os.environ.get("FUSTIP_TMP_DIR") or args.results_dir
 
     if args.action == "test":
         fio_file = os.environ.get("FIO_FILE")
@@ -176,7 +176,15 @@ def resolve_env(args):
         args.fio_file = fio_file
 
 
-def build_layer_vars(layer, args):
+def build_layer_vars(layer, args, data_dir=None):
+    """Build make variable list for a layer target.
+
+    data_dir: directory passed as RESULTS_DIR to the layer Makefile.
+    Defaults to _data_dir(args) (tmp_dir when set, else results_dir).
+    Pass args.results_dir explicitly for generate-stats and visualize targets
+    so that stats and visualizations are written directly to the experiment dir.
+    """
+    target_dir = data_dir if data_dir is not None else _data_dir(args)
     vs = []
     if args.debug:
         vs.append("DEBUG=1")
@@ -185,7 +193,7 @@ def build_layer_vars(layer, args):
             vs.append(f"COMM_FILTER={args.comm_filter}")
         if args.container_filter:
             vs.append(f"CONTAINER_FILTER={args.container_filter}")
-        vs.append(f"RESULTS_DIR={_data_dir(args)}")
+        vs.append(f"RESULTS_DIR={target_dir}")
         return vs
 
     if args.container_filter:
@@ -202,7 +210,7 @@ def build_layer_vars(layer, args):
         if args.comm_filter:
             vs.append(f"COMM_FILTER={args.comm_filter}")
 
-    vs.append(f"RESULTS_DIR={_data_dir(args)}")
+    vs.append(f"RESULTS_DIR={target_dir}")
     return vs
 
 
@@ -256,7 +264,7 @@ def generate_profile_commands(args):
         # Keep container-map detached from shell wait; otherwise profile start hangs.
         return cmds + _concurrent_isolated(layer_cmds)
 
-    # stop: parallel stop-profiling, then sequential csv-to-parquet + generate-stats
+    # stop: parallel stop-profiling, then sequential csv-to-parquet, then generate-stats
     stop_cmds = [_container_map_stop_cmd()] if args.container_filter else []
     for layer in PROFILE_STOP_ORDER:
         if layer in args.layers:
@@ -264,10 +272,31 @@ def generate_profile_commands(args):
             stop_cmds.append(f"make -C layers/{layer} stop-profiling {' '.join(vs)}")
 
     seq_cmds = []
-    for target in ("csv-to-parquet", "generate-stats"):
+
+    # csv-to-parquet: raw CSV lives in tmp_dir, parquet stays there
+    for layer in args.layers:
+        vs = build_layer_vars(layer, args)  # RESULTS_DIR = tmp_dir
+        seq_cmds.append(f"make -C layers/{layer} csv-to-parquet {' '.join(vs)}")
+
+    # If tmp_dir differs from results_dir: copy processed data (parquet/csv/json) to
+    # results_dir so generate-stats and visualize run directly in the experiment dir.
+    if args.tmp_dir and args.tmp_dir != args.results_dir:
+        td = args.tmp_dir
+        rd = args.results_dir
+        # container_map.json lives at the top level of tmp_dir alongside layer dirs.
+        seq_cmds.append(f'cp "{td}/container_map.json" "{rd}/" 2>/dev/null || true')
         for layer in args.layers:
-            vs = build_layer_vars(layer, args)
-            seq_cmds.append(f"make -C layers/{layer} {target} {' '.join(vs)}")
+            seq_cmds.append(
+                f'mkdir -p "{rd}/{layer}" && '
+                f'cp "{td}/{layer}"/*.json "{rd}/{layer}/" 2>/dev/null || true && '
+                f'cp "{td}/{layer}"/*.parquet "{rd}/{layer}/" 2>/dev/null || true && '
+                f'cp "{td}/{layer}"/*.csv "{rd}/{layer}/" 2>/dev/null || true'
+            )
+
+    # generate-stats: reads processed data from results_dir, writes stats JSON there
+    for layer in args.layers:
+        vs = build_layer_vars(layer, args, data_dir=args.results_dir)
+        seq_cmds.append(f"make -C layers/{layer} generate-stats {' '.join(vs)}")
 
     return _concurrent(stop_cmds) + seq_cmds
 
@@ -332,38 +361,10 @@ def generate_test_commands(args):
 def generate_visualize_commands(args):
     cmds = []
     for layer in args.layers:
-        vs = build_layer_vars(layer, args)
+        vs = build_layer_vars(layer, args, data_dir=args.results_dir)
         cmds.append(f"make -C layers/{layer} visualize {' '.join(vs)}")
     return cmds
 
-
-def generate_tmp_finalize_commands(args):
-    """Copy stats/visualizations from tmp_dir to results_dir.
-
-    Called after profile stop (and optional visualize) when --tmp-dir differs from --results-dir.
-    For each layer: copies *.json and *.png files to results_dir/{layer}/.
-    Raw trace data in tmp_dir is left in place — overwritten by the next run.
-    Also handles a top-level visualizations/ subdirectory if present.
-    """
-    td = args.tmp_dir
-    rd = args.results_dir
-    cmds = []
-    for layer in args.layers:
-        cmds.append(
-            f'mkdir -p "{rd}/{layer}" && '
-            f'cp "{td}/{layer}"/*.json "{rd}/{layer}/" 2>/dev/null || true && '
-            f'cp "{td}/{layer}"/*.parquet "{rd}/{layer}/" 2>/dev/null || true && '
-            f'cp "{td}/{layer}"/*.csv "{rd}/{layer}/" 2>/dev/null || true && '
-            f'cp "{td}/{layer}"/*.png "{rd}/{layer}/" 2>/dev/null || true'
-        )
-    # Handle shared visualizations/ directory written by some visualize targets
-    cmds.append(
-        f'if [ -d "{td}/visualizations" ]; then '
-        f'mkdir -p "{rd}/visualizations" && '
-        f'cp -r "{td}/visualizations/." "{rd}/visualizations/"; '
-        f'fi'
-    )
-    return cmds
 
 
 def main(argv=None):
@@ -384,11 +385,6 @@ def main(argv=None):
 
     if args.visualize:
         cmds.extend(generate_visualize_commands(args))
-
-    # After stop+visualize: copy stats to results_dir and clean up raw trace data from tmp_dir
-    if (args.action == "profile" and args.sub_action == "stop"
-            and args.tmp_dir and args.tmp_dir != args.results_dir):
-        cmds.extend(generate_tmp_finalize_commands(args))
 
     for cmd in cmds:
         print(cmd)
