@@ -278,20 +278,58 @@ def generate_profile_commands(args):
         vs = build_layer_vars(layer, args)  # RESULTS_DIR = tmp_dir
         seq_cmds.append(f"make -C layers/{layer} csv-to-parquet {' '.join(vs)}")
 
-    # If tmp_dir differs from results_dir: copy processed data (parquet/csv/json) to
-    # results_dir so generate-stats and visualize run directly in the experiment dir.
+    # If tmp_dir differs from results_dir: copy the specific expected output files
+    # for each layer to results_dir, then clean up tmp_dir to prevent contamination
+    # of subsequent runs.
     if args.tmp_dir and args.tmp_dir != args.results_dir:
         td = args.tmp_dir
         rd = args.results_dir
+        is_detailed = bool(args.container_filter) or args.mode == "detailed"
+
         # container_map.json lives at the top level of tmp_dir alongside layer dirs.
         seq_cmds.append(f'cp "{td}/container_map.json" "{rd}/" 2>/dev/null || true')
+
         for layer in args.layers:
-            seq_cmds.append(
-                f'mkdir -p "{rd}/{layer}" && '
-                f'cp "{td}/{layer}"/*.json "{rd}/{layer}/" 2>/dev/null || true && '
-                f'cp "{td}/{layer}"/*.parquet "{rd}/{layer}/" 2>/dev/null || true && '
-                f'cp "{td}/{layer}"/*.csv "{rd}/{layer}/" 2>/dev/null || true'
-            )
+            seq_cmds.append(f'mkdir -p "{rd}/{layer}"')
+            if layer == "sysstat":
+                # parse_output.py emits cpu.csv/mem.csv/dev.csv as final output.
+                for fname in ("cpu.csv", "mem.csv", "dev.csv"):
+                    seq_cmds.append(
+                        f'cp "{td}/{layer}/{fname}" "{rd}/{layer}/" 2>/dev/null || true'
+                    )
+            elif is_detailed:
+                # detailed mode: parquet (converted from CSV) + per-layer json artifacts
+                seq_cmds.append(
+                    f'cp "{td}/{layer}/detailed.parquet" "{rd}/{layer}/" 2>/dev/null || true'
+                )
+                seq_cmds.append(
+                    f'cp "{td}/{layer}/counters.json" "{rd}/{layer}/" 2>/dev/null || true'
+                )
+                if layer == "nvme":
+                    seq_cmds.append(
+                        f'cp "{td}/{layer}/device-info.json" "{rd}/{layer}/" 2>/dev/null || true'
+                    )
+            else:
+                # summary mode: bpftrace output
+                seq_cmds.append(
+                    f'cp "{td}/{layer}/trace.out" "{rd}/{layer}/" 2>/dev/null || true'
+                )
+
+        # Remove layer subdirs from tmp_dir — data is now in results_dir.
+        for layer in args.layers:
+            seq_cmds.append(f'rm -rf "{td}/{layer}"')
+        seq_cmds.append(f'rm -f "{td}/container_map.json" 2>/dev/null || true')
+
+    else:
+        # tmp_dir == results_dir: csv-to-parquet already deletes the CSV on success,
+        # but if conversion failed the CSV would silently linger. Explicitly remove
+        # detailed.csv from block/nvme/fs layer dirs so it can never persist there.
+        if bool(args.container_filter) or args.mode == "detailed":
+            for layer in args.layers:
+                if layer != "sysstat":
+                    seq_cmds.append(
+                        f'rm -f "{args.results_dir}/{layer}/detailed.csv" 2>/dev/null || true'
+                    )
 
     # generate-stats: reads processed data from results_dir, writes stats JSON there
     for layer in args.layers:

@@ -23,6 +23,37 @@ INT_COLS = {"latency_ns", "timestamp_ns", "bytes", "sector",
             "q_inflight", "d_inflight", "offset", "count", "mntns_id"}
 
 
+def _trim_incomplete_last_line(csv_path: Path) -> bool:
+    """If the file doesn't end with '\\n', drop the partial last line.
+
+    Guards against the BPF collector being killed without flushing its stdio
+    buffers (e.g. SIGKILL or crash). Under normal SIGTERM shutdown all loaders
+    call fclose() so the file is always clean — this is a defensive fallback.
+    Returns True if a partial line was removed.
+    """
+    with open(csv_path, "rb+") as f:
+        size = f.seek(0, 2)  # seek to end; returns new position == file size
+        if size == 0:
+            return False
+        f.seek(-1, 2)
+        if f.read(1) == b"\n":
+            return False  # clean termination — nothing to do
+        # Scan backwards (up to 64 KB) for the last complete newline.
+        search_back = min(size, 1 << 16)
+        f.seek(size - search_back)
+        chunk = f.read(search_back)
+        nl_pos = chunk.rfind(b"\n")
+        if nl_pos >= 0:
+            f.truncate(size - search_back + nl_pos + 1)
+        else:
+            # No newline anywhere in the tail — retain only the header line.
+            f.seek(0)
+            data = f.read()
+            header_end = data.find(b"\n")
+            f.truncate(header_end + 1 if header_end >= 0 else 0)
+    return True
+
+
 def convert(csv_path):
     csv_path = Path(csv_path)
     if not csv_path.exists():
@@ -35,6 +66,9 @@ def convert(csv_path):
             print(f"Parquet up-to-date: {parquet_path.name}")
             return
         parquet_path.unlink()
+
+    if _trim_incomplete_last_line(csv_path):
+        print(f"  Warning: trimmed incomplete last line from {csv_path.name}")
 
     # Read header to build schema overrides: strings stay Utf8, numeric cols
     # that can be empty are forced to Int64 so Polars doesn't infer Utf8.
