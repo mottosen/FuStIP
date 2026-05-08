@@ -9,7 +9,8 @@ import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from container.labeling import get_comm_label, load_comm_label_map, load_mntns_label_map
-from visualization.shared import (build_dashboard, plot_cumulated_mb_over_time,
+from visualization.shared import (build_dashboard, experiment_label,
+                                   plot_cumulated_mb_over_time,
                                    plot_gap_cdf, plot_inflight_from_column,
                                    plot_io_latency_cdf, plot_io_size_cdf,
                                    plot_lba_density, plot_lba_heatmap_2d,
@@ -374,7 +375,7 @@ def main():
                      "LBA Density (global)", "LBA Density (local, p1–p99)"]
                     + [f"LBA Heatmap ({op})" for op in global_ops]),
         col_ylims=col_ylims,
-        title="NVMe Layer Dashboard",
+        title=f"NVMe Layer Dashboard\n{experiment_label(results_dir)}",
         output_path=output,
     )
 

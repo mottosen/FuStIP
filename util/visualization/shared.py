@@ -358,6 +358,31 @@ def plot_lba_heatmap_2d(ax, heatmap_df, op, n_lba_bins, n_time_bins,
     ax.set_title(f"LBA Heatmap ({op})")
 
 
+def experiment_label(results_dir: Path) -> str:
+    """Derive 'experiment_name — phase' label from a results sub-directory path.
+
+    Expected structure: .../{leaf}/results/{phase}
+    Looks for a known anchor ('phase1', 'experiments') to trim the path prefix.
+    Falls back to the last 4 components of the leaf dir.
+    """
+    phase = results_dir.name
+    # If the parent is named 'results', the leaf experiment dir is two levels up.
+    # Otherwise (flat / non-standard structure) use the immediate parent.
+    if results_dir.parent.name == "results":
+        leaf = results_dir.parent.parent
+    else:
+        leaf = results_dir.parent
+    parts = leaf.parts
+    for anchor in ("phase1", "experiments"):
+        if anchor in parts:
+            idx = max(i for i, p in enumerate(parts) if p == anchor)
+            exp_name = "/".join(parts[idx + 1:])
+            return f"{exp_name} — {phase}"
+    # Fallback: last 4 components
+    exp_name = "/".join(parts[max(0, len(parts) - 4):])
+    return f"{exp_name} — {phase}"
+
+
 def build_dashboard(rows, col_titles, title, output_path, col_ylims=None):
     """Build a multi-row dashboard.
 

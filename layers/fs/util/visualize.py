@@ -11,7 +11,8 @@ import numpy as np
 
 from container.labeling import get_comm_label, load_comm_label_map, load_mntns_label_map
 from visualization.shared import (_color_for, _linestyle_for, _subsample_cdf,
-                                     build_dashboard, plot_cumulated_mb_over_time,
+                                     build_dashboard, experiment_label,
+                                     plot_cumulated_mb_over_time,
                                      plot_inflight_from_column, plot_io_latency_cdf,
                                      plot_io_size_cdf, plot_type_distribution,
                                      sort_types)
@@ -361,7 +362,7 @@ def main():
     build_dashboard(
         rows=rows,
         col_titles=["Type Distribution", "Inflight", "IOPS", "Cumul. MB", "IO Size CDF", "Latency CDF", "Gap CDF"],
-        title="Filesystem Layer Dashboard",
+        title=f"Filesystem Layer Dashboard\n{experiment_label(results_dir)}",
         output_path=output,
     )
 

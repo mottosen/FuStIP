@@ -8,7 +8,7 @@ import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from container.labeling import get_comm_label, load_comm_label_map, load_mntns_label_map
-from visualization.shared import (build_dashboard, plot_cumulated_mb_over_time,
+from visualization.shared import (build_dashboard, experiment_label, plot_cumulated_mb_over_time,
                                    plot_gap_cdf, plot_inflight_from_column,
                                    plot_io_latency_cdf, plot_io_size_cdf,
                                    plot_type_distribution, sort_types)
@@ -144,7 +144,7 @@ def main():
     build_dashboard(
         rows=rows,
         col_titles=["Type Distribution", "Queue Inflight", "Driver Inflight", "IOPS", "Cumul. MB", "IO Size CDF", "Latency CDF", "Gap CDF"],
-        title="Block Layer Dashboard",
+        title=f"Block Layer Dashboard\n{experiment_label(results_dir)}",
         output_path=output,
     )
 

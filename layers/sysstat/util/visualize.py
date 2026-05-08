@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import matplotlib
 matplotlib.use("Agg")
 
-from visualization.shared import build_dashboard, _color_for, DEFAULT_COLOR_CYCLE
+from visualization.shared import build_dashboard, experiment_label, _color_for, DEFAULT_COLOR_CYCLE
 from container_map import build_label_maps, get_label_order, remap_rows
 
 MAX_ROWS = 5
@@ -142,7 +142,12 @@ def main():
 
     # Group by command
     cpu_by_cmd = _group_timeseries(cpu_rows, "cpu_pct", cpu_times) if cpu_rows else {}
-    mem_by_cmd = _group_timeseries(mem_rows, "mem_pct", mem_times) if mem_rows else {}
+    # Use RSS in MB (rss_kb / 1024) — mem_pct is ~1% on large-RAM hosts and
+    # invisible on a 0–100% y-axis. RSS in MB is also directly comparable to
+    # future container memory limits (Docker deploy.resources.limits.memory).
+    mem_by_cmd = {cmd: [v / 1024 for v in vals]
+                  for cmd, vals in _group_timeseries(mem_rows, "rss_kb", mem_times).items()
+                  } if mem_rows else {}
     dev_rd_by_cmd = _group_timeseries(dev_rows, "kb_rd_s", dev_times) if dev_rows else {}
     dev_wr_by_cmd = _group_timeseries(dev_rows, "kb_wr_s", dev_times) if dev_rows else {}
 
@@ -194,10 +199,10 @@ def main():
             if pts:
                 ax.plot(range(len(pts)), pts, linewidth=0.8)
                 ax.set_xlabel("Time (s)")
-                ax.set_ylabel("Memory %")
-                ax.set_title("Memory Usage")
+                ax.set_ylabel("RSS (MB)")
+                ax.set_title("Memory RSS")
             else:
-                ax.set_title("Memory Usage")
+                ax.set_title("Memory RSS")
                 ax.text(0.5, 0.5, "No data", ha="center", va="center",
                         transform=ax.transAxes)
 
@@ -232,9 +237,9 @@ def main():
     output = args.results_dir / "visualizations" / "sysstat-dashboard.png"
     build_dashboard(
         rows=rows,
-        col_titles=["CPU %", "Memory %", "Disk IO (KB/s)"],
-        col_ylims=[(0, 100), (0, 100), None],
-        title="Sysstat Dashboard",
+        col_titles=["CPU %", "Memory RSS (MB)", "Disk IO (KB/s)"],
+        col_ylims=[(0, 100), None, None],
+        title=f"Sysstat Dashboard\n{experiment_label(args.results_dir)}",
         output_path=output,
     )
 
