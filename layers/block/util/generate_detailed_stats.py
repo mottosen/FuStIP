@@ -192,11 +192,15 @@ def generate_stats(parquet_path):
                    .collect()["op"].to_list())
 
     for op in issue_ops:
+        # latency_ns == 0 on issue events means the request was direct-dispatched
+        # (no block_rq_insert occurred — common with the 'none' I/O scheduler).
+        # Drop those so the queue-latency distribution reflects only requests
+        # that actually waited in the queue.
         raw_qlat_op = (pl.scan_parquet(parquet_path)
                          .select([*id_keys, "event", "op", "latency_ns"])
                          .filter(pl.col("event") == "issue")
                          .filter(pl.col("op") == op)
-                         .filter(pl.col("latency_ns").is_not_null())
+                         .filter(pl.col("latency_ns") > 0)
                          .group_by(*id_keys)
                          .agg(_series_stats_exprs("latency_ns"))
                          .collect(engine="streaming"))
