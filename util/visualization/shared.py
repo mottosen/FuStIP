@@ -3,19 +3,46 @@
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
+from cycler import cycler
 from matplotlib.ticker import FixedLocator, FuncFormatter, NullFormatter, NullLocator
 
+# Accessibility-friendly categorical palette (shared with the parent
+# milvus_experiments comparison dashboards).
+#  - Indices 0-7: primary palette.
+#  - Indices 8-13: colorblind-safe extensions from Paul Tol's "vibrant" and
+#    "muted" sets, for high-cardinality plots (per-core lines, etc.).
+ACCESSIBLE_PALETTE = [
+    "#003a7d",  # 0: dark navy
+    "#008dff",  # 1: bright blue
+    "#ff73b6",  # 2: pink
+    "#c701ff",  # 3: purple
+    "#4ecb8d",  # 4: green
+    "#ff9d3a",  # 5: orange
+    "#f9e858",  # 6: yellow
+    "#d83034",  # 7: red
+    "#117733",  # 8: dark green
+    "#88ccee",  # 9: sky blue
+    "#ddaa33",  # 10: gold
+    "#882255",  # 11: wine
+    "#44aaaa",  # 12: teal
+    "#aa4499",  # 13: mauve
+]
+
+# Apply globally so unspecified series colors draw from the palette too.
+mpl.rcParams["axes.prop_cycle"] = cycler(color=ACCESSIBLE_PALETTE)
+
 TYPE_COLORS = {
-    "read": "#007191",
-    "write": "#62c8d3",
-    "pread64": "#f47a00",
-    "pwrite64": "#d31f11",
-    "flush": "#e02b35",
-    "discard": "#082a54",
-    "write_zeros": "#d47264",
+    "read":        ACCESSIBLE_PALETTE[5],  # orange
+    "write":       ACCESSIBLE_PALETTE[1],  # bright blue
+    "pread64":     ACCESSIBLE_PALETTE[3],  # purple
+    "pwrite64":    ACCESSIBLE_PALETTE[4],  # green
+    "flush":       ACCESSIBLE_PALETTE[7],  # red
+    "discard":     ACCESSIBLE_PALETTE[0],  # dark navy
+    "write_zeros": ACCESSIBLE_PALETTE[2],  # pink
 }
 
 TYPE_LINESTYLES = {
@@ -31,7 +58,7 @@ TYPE_ORDER = {
     "flush": 4, "discard": 5, "write_zeros": 6,
 }
 
-DEFAULT_COLOR_CYCLE = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+DEFAULT_COLOR_CYCLE = ACCESSIBLE_PALETTE
 
 MAX_CDF_POINTS = 10_000
 

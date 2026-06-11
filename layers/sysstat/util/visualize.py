@@ -18,7 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import matplotlib
 matplotlib.use("Agg")
 
-from visualization.shared import build_dashboard, experiment_label, _color_for, DEFAULT_COLOR_CYCLE
+from visualization.shared import (
+    build_dashboard, experiment_label, _color_for, DEFAULT_COLOR_CYCLE, TYPE_COLORS,
+)
 from container_map import build_label_maps, get_label_order, remap_rows
 
 MAX_ROWS = 5
@@ -213,10 +215,10 @@ def main():
             if rd or wr:
                 if rd:
                     ax.plot(range(len(rd)), rd,
-                            label="read", color="#1f77b4", linewidth=0.8)
+                            label="read", color=TYPE_COLORS["read"], linewidth=0.8)
                 if wr:
                     ax.plot(range(len(wr)), wr,
-                            label="write", color="#ff7f0e", linewidth=0.8)
+                            label="write", color=TYPE_COLORS["write"], linewidth=0.8)
                 ax.set_yscale("symlog", linthresh=1)
                 ax.set_xlabel("Time (s)")
                 ax.set_ylabel("KB/s")
