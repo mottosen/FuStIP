@@ -23,18 +23,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from container_map import build_label_maps, get_label_order, remap_rows
 
 
-def parse_csv(path, label_maps=None, processes=None):
+def parse_csv(path, label_maps=None, processes=None, pids=None):
     """Read a CSV file and return list of row dicts.
 
     If label_maps is provided, remap using tgid-first then comm map (unmapped → "other").
-    If processes is provided (legacy), remap command names not in the list to "other".
+    Otherwise, when processes and/or pids are set, keep rows matching the command list
+    (comm) or the tgid list (pid) — the union of both — and remap the rest to "other".
     """
     rows = []
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if processes is not None:
-                if row["command"] not in processes:
+            if processes is not None or pids is not None:
+                in_proc = processes is not None and row["command"] in processes
+                in_pid = pids is not None and row["tgid"] in pids
+                if not (in_proc or in_pid):
                     row["command"] = "other"
             rows.append(row)
     remap_rows(rows, label_maps)
@@ -204,6 +207,13 @@ def main():
              "All others are grouped as 'other'.",
     )
     parser.add_argument(
+        "--pid", "-P",
+        type=str.split,
+        default=None,
+        help="Space-separated process IDs (tgid) to track individually. "
+             "Unioned with --process; all others grouped as 'other'.",
+    )
+    parser.add_argument(
         "--container", "-c",
         type=str.split,
         default=None,
@@ -212,6 +222,7 @@ def main():
     args = parser.parse_args()
 
     processes = args.process
+    pids = set(args.pid) if args.pid else None
     containers = args.container
     sysstat_dir = args.results_dir / "sysstat"
     if not sysstat_dir.is_dir():
@@ -228,7 +239,12 @@ def main():
                        ("mem", sysstat_dir / "mem.csv"),
                        ("dev", sysstat_dir / "dev.csv")]:
         if path.exists():
-            csv_data[name] = parse_csv(path, label_maps=label_maps, processes=processes if label_maps is None else None)
+            csv_data[name] = parse_csv(
+                path,
+                label_maps=label_maps,
+                processes=processes if label_maps is None else None,
+                pids=pids if label_maps is None else None,
+            )
             print(f"  Processed {path.name}: {len(csv_data[name])} rows")
 
     if not csv_data:

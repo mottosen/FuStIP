@@ -16,7 +16,9 @@
 static volatile sig_atomic_t running = 1;
 static FILE *output;
 #define MAX_CONTAINER_FILTERS 32
+#define MAX_DEV_FILTERS 8
 #define MAX_COMM_FILTERS 8
+#define MAX_PID_FILTERS 8
 
 static const char *op_name(__u8 op)
 {
@@ -73,19 +75,58 @@ static void write_counters(struct standalone_bpf *skel, const char *csv_path)
 	else
 		strcpy(path, "counters.json");
 
+	/* Untracked completions (per disk+op): completions whose request was never
+	 * tracked at issue — excluded by the device/proc/container filter, or an
+	 * issue-probe miss. Build a JSON object from the hash map. */
+	struct untracked_key {
+		char disk_name[32];
+		__u8 op;
+	};
+	char untracked_json[4096];
+	size_t uoff = 0;
+	untracked_json[uoff++] = '{';
+	__u64 untracked_total = 0;
+	int ufd = bpf_map__fd(skel->maps.untracked_completes);
+	if (ufd >= 0) {
+		struct untracked_key key, next_key;
+		void *prev = NULL;
+		int first = 1;
+		while (bpf_map_get_next_key(ufd, prev, &next_key) == 0) {
+			__u64 uval = 0;
+			if (bpf_map_lookup_elem(ufd, &next_key, &uval) == 0 && uval > 0) {
+				char disk[33] = {};
+				memcpy(disk, next_key.disk_name, 32);
+				untracked_total += uval;
+				if (uoff < sizeof(untracked_json))
+					uoff += snprintf(untracked_json + uoff,
+							 sizeof(untracked_json) - uoff,
+							 "%s\"%s, %s\": %llu", first ? "" : ", ",
+							 disk, op_name(next_key.op), uval);
+				first = 0;
+			}
+			key = next_key;
+			prev = &key;
+		}
+	}
+	if (uoff < sizeof(untracked_json))
+		snprintf(untracked_json + uoff, sizeof(untracked_json) - uoff, "}");
+	else
+		strcpy(untracked_json + sizeof(untracked_json) - 2, "}");
+
 	FILE *f = fopen(path, "w");
 	if (!f)
 		return;
 	fprintf(f, "{\"insert\": {\"generated\": %llu, \"dropped\": %llu}, "
 		   "\"issue\": {\"generated\": %llu, \"dropped\": %llu}, "
-		   "\"complete\": {\"generated\": %llu, \"dropped\": %llu}}\n",
+		   "\"complete\": {\"generated\": %llu, \"dropped\": %llu}, "
+		   "\"untracked\": %s}\n",
 		totals[0], totals[1], totals[2], totals[3],
-		totals[4], totals[5]);
+		totals[4], totals[5], untracked_json);
 	fclose(f);
 	fprintf(stderr, "Counters: insert(gen=%llu drop=%llu) issue(gen=%llu drop=%llu) "
-		"complete(gen=%llu drop=%llu) -> %s\n",
+		"complete(gen=%llu drop=%llu) untracked=%llu -> %s\n",
 		totals[0], totals[1], totals[2], totals[3],
-		totals[4], totals[5], path);
+		totals[4], totals[5], untracked_total, path);
 }
 
 static int handle_event(void *ctx, void *data, size_t data_sz)
@@ -114,9 +155,51 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 
 static void usage(const char *prog)
 {
-	fprintf(stderr, "Usage: %s -o <output_csv> [-f <comm_filter[,comm2,...]>] [-c <container_name[,container2,...]>]\n", prog);
-	fprintf(stderr, "  -f (comm) or -c (container) required; both enables OR mode\n");
+	fprintf(stderr, "Usage: %s -o <output_csv> [-c <container[,...]>] [-f <dev_filter[,...]>] "
+		"[-p <comm_filter[,...]>] [-P <pid_filter[,...]>]\n", prog);
+	fprintf(stderr, "  Filter hierarchy (nested AND): -c container > -f device > {-p comm, -P pid}.\n");
+	fprintf(stderr, "  comm and pid are unioned; at least one filter required.\n");
 	exit(1);
+}
+
+static int parse_dev_filters(struct standalone_bpf *skel, const char *filter)
+{
+	char buf[256];
+	strncpy(buf, filter, sizeof(buf) - 1);
+	buf[sizeof(buf) - 1] = '\0';
+
+	int count = 0;
+	char *saveptr = NULL;
+	char *token = strtok_r(buf, ",", &saveptr);
+	while (token && count < MAX_DEV_FILTERS) {
+		strncpy((char *)skel->rodata->dev_filters[count], token, 31);
+		count++;
+		token = strtok_r(NULL, ",", &saveptr);
+	}
+	if (token)
+		fprintf(stderr, "Warning: only first %d device filters are used\n", MAX_DEV_FILTERS);
+	skel->rodata->num_dev_filters = count;
+	return count;
+}
+
+static int parse_pid_filters(struct standalone_bpf *skel, const char *filter)
+{
+	char buf[256];
+	strncpy(buf, filter, sizeof(buf) - 1);
+	buf[sizeof(buf) - 1] = '\0';
+
+	int count = 0;
+	char *saveptr = NULL;
+	char *token = strtok_r(buf, ",", &saveptr);
+	while (token && count < MAX_PID_FILTERS) {
+		skel->rodata->pid_filters[count] = (__u32)strtoul(token, NULL, 10);
+		count++;
+		token = strtok_r(NULL, ",", &saveptr);
+	}
+	if (token)
+		fprintf(stderr, "Warning: only first %d pid filters are used\n", MAX_PID_FILTERS);
+	skel->rodata->num_pid_filters = count;
+	return count;
 }
 
 static int parse_comm_filters(struct standalone_bpf *skel, const char *filter)
@@ -171,7 +254,7 @@ static int try_resolve_container(struct standalone_bpf *skel,
 {
 	char cmd[256];
 	snprintf(cmd, sizeof(cmd),
-		 "docker inspect --format '{{.State.Pid}}' %s 2>/dev/null",
+		 "docker inspect --format '{{.State.Pid}}' %.200s 2>/dev/null",
 		 container_name);
 
 	FILE *fp = popen(cmd, "r");
@@ -225,20 +308,28 @@ static int try_resolve_container(struct standalone_bpf *skel,
 int main(int argc, char **argv)
 {
 	char *output_path = NULL;
-	char *filter = NULL;
+	char *dev_filter = NULL;
+	char *comm_filter = NULL;
+	char *pid_filter = NULL;
 	char *container_filter = NULL;
 	char container_names[MAX_CONTAINER_FILTERS][128] = {};
 	int container_count = 0;
 	int container_resolved[MAX_CONTAINER_FILTERS] = {};
 	int opt;
 
-	while ((opt = getopt(argc, argv, "o:f:c:")) != -1) {
+	while ((opt = getopt(argc, argv, "o:f:p:P:c:")) != -1) {
 		switch (opt) {
 		case 'o':
 			output_path = optarg;
 			break;
 		case 'f':
-			filter = optarg;
+			dev_filter = optarg;
+			break;
+		case 'p':
+			comm_filter = optarg;
+			break;
+		case 'P':
+			pid_filter = optarg;
 			break;
 		case 'c':
 			container_filter = optarg;
@@ -248,7 +339,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (!output_path || (!filter && !container_filter))
+	if (!output_path || (!dev_filter && !comm_filter && !pid_filter && !container_filter))
 		usage(argv[0]);
 
 	if (container_filter) {
@@ -271,12 +362,14 @@ int main(int argc, char **argv)
 	}
 
 	// Set filters in rodata
-	if (filter)
-		parse_comm_filters(skel, filter);
+	if (dev_filter)
+		parse_dev_filters(skel, dev_filter);
+	if (comm_filter)
+		parse_comm_filters(skel, comm_filter);
+	if (pid_filter)
+		parse_pid_filters(skel, pid_filter);
 	if (container_count > 0)
 		skel->rodata->filter_by_mntns = true;
-	if (filter && container_count > 0)
-		skel->rodata->filter_or_mode = true;
 
 	int err = standalone_bpf__load(skel);
 	if (err) {
@@ -311,15 +404,11 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (filter && container_count > 0)
-		fprintf(stderr, "Block layer detailed tracing started (comm: %s, containers: %s, OR mode)...\n",
-			filter, container_filter);
-	else if (filter)
-		fprintf(stderr, "Block layer detailed tracing started (filter: %s)...\n",
-			filter);
-	else
-		fprintf(stderr, "Block layer detailed tracing started (containers: %s)...\n",
-			container_filter);
+	fprintf(stderr, "Block layer detailed tracing started (container: %s, dev: %s, comm: %s, pid: %s)...\n",
+		container_filter ? container_filter : "none",
+		dev_filter ? dev_filter : "none",
+		comm_filter ? comm_filter : "none",
+		pid_filter ? pid_filter : "none");
 
 	// Event loop
 	int num_resolved = 0;

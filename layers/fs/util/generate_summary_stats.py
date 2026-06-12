@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
-from stats_generation.shared import (compute_duration_from_tseries,
+from stats_generation.shared import (compute_active_duration,
                                      derive_throughput,
                                      histogram_stats_only,
                                      parse_counters, parse_histograms,
@@ -36,7 +36,7 @@ def generate_stats(input_path):
     histograms = parse_histograms(input_path)
     tseries = parse_tseries(input_path)
 
-    duration_s = compute_duration_from_tseries(tseries)
+    duration_s = compute_active_duration(counters, tseries)
 
     result = {
         "counters": {},

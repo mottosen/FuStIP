@@ -76,21 +76,27 @@ def _score_commands(cpu_rows, mem_rows, dev_rows):
     return {cmd: scores[cmd] / max(counts[cmd], 1) for cmd in scores}
 
 
-def _select_and_remap(cpu_rows, mem_rows, dev_rows, process_filter):
+def _select_and_remap(cpu_rows, mem_rows, dev_rows, process_filter, pid_filter=None):
     """Select commands to display and remap the rest to 'other'.
 
-    If process_filter is set, use those. Otherwise, pick top N by usage.
+    If process_filter and/or pid_filter is set, keep rows matching the command list
+    (comm) or the tgid list (pid) — the union of both. Otherwise, pick top N by usage.
     """
-    if process_filter:
-        keep = process_filter
-    else:
-        all_cmds = set()
+    if process_filter or pid_filter:
+        keep = process_filter or set()
         for rows in (cpu_rows, mem_rows, dev_rows):
             for row in rows:
-                all_cmds.add(row["command"])
-        scores = _score_commands(cpu_rows, mem_rows, dev_rows)
-        ranked = sorted(all_cmds, key=lambda c: scores.get(c, 0), reverse=True)
-        keep = set(ranked[:MAX_ROWS - 1])
+                if row["command"] not in keep and not (pid_filter and row["tgid"] in pid_filter):
+                    row["command"] = "other"
+        return
+
+    all_cmds = set()
+    for rows in (cpu_rows, mem_rows, dev_rows):
+        for row in rows:
+            all_cmds.add(row["command"])
+    scores = _score_commands(cpu_rows, mem_rows, dev_rows)
+    ranked = sorted(all_cmds, key=lambda c: scores.get(c, 0), reverse=True)
+    keep = set(ranked[:MAX_ROWS - 1])
 
     for rows in (cpu_rows, mem_rows, dev_rows):
         _remap_commands(rows, keep)
@@ -111,12 +117,15 @@ def main():
     parser.add_argument("results_dir", type=Path)
     parser.add_argument("--process", "-p", type=str.split, default=None,
                         help="Process names to show individually (rest grouped as 'other')")
+    parser.add_argument("--pid", "-P", type=str.split, default=None,
+                        help="Process IDs (tgid) to show individually, unioned with --process")
     parser.add_argument("--container", "-c", type=str.split, default=None,
                         help="Container names for container-based grouping")
     args = parser.parse_args()
 
     sysstat_dir = args.results_dir / "sysstat"
     process_filter = set(args.process) if args.process else None
+    pid_filter = set(args.pid) if args.pid else None
 
     # Read raw CSVs
     cpu_rows = _read_csv(sysstat_dir / "cpu.csv") if (sysstat_dir / "cpu.csv").exists() else []
@@ -135,7 +144,7 @@ def main():
         for rows in (cpu_rows, mem_rows, dev_rows):
             remap_rows(rows, label_maps)
     else:
-        _select_and_remap(cpu_rows, mem_rows, dev_rows, process_filter)
+        _select_and_remap(cpu_rows, mem_rows, dev_rows, process_filter, pid_filter)
 
     # Build time indices
     cpu_times = _unique_times(cpu_rows)

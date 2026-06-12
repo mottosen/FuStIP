@@ -326,6 +326,27 @@ def compute_duration_from_tseries(tseries_data):
     return max(secs) - min(secs)
 
 
+def compute_active_duration(counters, tseries_data):
+    """Duration of the active-I/O window in seconds.
+
+    Prefers the `io_span_start`/`io_span_end` counter maps emitted by the
+    bpftrace scripts (min/max I/O-event timestamps in ns — separate maps because
+    bpftrace types a map by its aggregation, so min and max can't share one),
+    giving the span from the first to the last *data* I/O event — the same
+    definition detailed mode derives from event timestamps. This is what
+    iops/throughput should be divided by, so the result matches FIO's average
+    over its runtime rather than being diluted by warm-up/teardown padding.
+
+    Falls back to `compute_duration_from_tseries` (full sample span) for traces
+    produced before io_span existed.
+    """
+    start = next(iter(counters.get("io_span_start", {}).values()), None)
+    end = next(iter(counters.get("io_span_end", {}).values()), None)
+    if start is not None and end is not None and end > start:
+        return round((end - start) / 1e9, 2)
+    return compute_duration_from_tseries(tseries_data)
+
+
 def derive_throughput(counters, duration_s, count_map, bytes_map):
     """Compute IOPS and throughput from counters.
 

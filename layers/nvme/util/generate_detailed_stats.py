@@ -29,7 +29,7 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from stats_generation.shared import (compute_access_pattern,
                                      compute_lba_distribution,
-                                     tseries_stats)
+                                     derive_throughput, tseries_stats)
 from container.labeling import bind_containers, load_comm_label_map, load_mntns_label_map
 
 LAYER_PREFIX = "nvme"
@@ -184,6 +184,11 @@ def generate_stats(parquet_path):
             ))
 
         entry["counters"] = comm_counters
+        # Trustworthy iops/throughput = completed ÷ active duration (the
+        # first→last I/O-event span), matching FIO's average over its runtime.
+        # tseries.iops.max remains the corroborating peak second.
+        entry["derived"] = derive_throughput(
+            comm_counters, duration_s, "cmd_completed", "cmd_total_bytes")
 
     del comm_agg_raw
 
@@ -306,7 +311,9 @@ def generate_stats(parquet_path):
                     )
             del setup_df
 
-    return bind_containers(_entries, mntns_map, comm_map), event_counts
+    result = bind_containers(_entries, mntns_map, comm_map)
+    result["derived"] = {"duration_s": round(duration_s, 2)}
+    return result, event_counts
 
 
 def load_data_quality(layer_dir, event_counts):
@@ -337,13 +344,25 @@ def load_data_quality(layer_dir, event_counts):
             }
 
         total_received = total_generated - total_dropped
-        return {
+        result = {
             "total_generated": total_generated,
             "total_dropped": total_dropped,
             "total_received": total_received,
             "drop_pct": round(100 * total_dropped / total_generated, 4) if total_generated > 0 else 0.0,
             "per_event_type": per_event_type,
         }
+
+        # Untracked completions: completions whose command was never tracked at
+        # setup — excluded by the device/proc/container filter (e.g. other-disk
+        # traffic) or, rarely, a setup-probe miss. Informational only; NOT folded
+        # into drop_pct, since excluded traffic is correct behavior, not loss.
+        untracked = counters.get("untracked", {})
+        if untracked:
+            result["untracked_completions"] = {
+                "per_disk_op": untracked,
+                "total": sum(untracked.values()),
+            }
+        return result
     except (json.JSONDecodeError, OSError):
         return None
 

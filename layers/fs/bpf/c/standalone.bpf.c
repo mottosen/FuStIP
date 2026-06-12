@@ -8,8 +8,10 @@
 #define MAX_COMM_FILTERS 8
 const volatile char comm_filters[MAX_COMM_FILTERS][16] = {};
 const volatile __u8 num_comm_filters = 0;
+#define MAX_PID_FILTERS 8
+const volatile __u32 pid_filters[MAX_PID_FILTERS] = {};
+const volatile __u8 num_pid_filters = 0;
 const volatile bool filter_by_mntns = false;
-const volatile bool filter_or_mode = false;
 
 #include "../bpf_core.h"
 
@@ -63,11 +65,43 @@ static __always_inline bool comm_matches(void)
 	return false;
 }
 
+// ── PID filter helper ──
+// Returns true if current task's tgid matches any filter pid
+static __always_inline bool pid_matches(void)
+{
+	if (num_pid_filters == 0)
+		return true;
+
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+
+	for (int f = 0; f < MAX_PID_FILTERS; f++) {
+		if (f >= num_pid_filters)
+			break;
+		if (pid_filters[f] == tgid)
+			return true;
+	}
+	return false;
+}
+
+// ── Process tier (comm OR pid, union) ──
+// Pass-through when neither filter is set; otherwise match if the task matches
+// any *active* filter (each consulted only when non-empty).
+static __always_inline bool proc_matches(void)
+{
+	if (num_comm_filters == 0 && num_pid_filters == 0)
+		return true;
+	if (num_comm_filters > 0 && comm_matches())
+		return true;
+	if (num_pid_filters > 0 && pid_matches())
+		return true;
+	return false;
+}
+
+// Nested-AND hierarchy: container ⊇ {comm, pid} (fs has no device tier).
+// Each unset tier is a pass-through; the process tier is comm OR pid (union).
 static __always_inline bool should_trace(void)
 {
-	if (filter_or_mode)
-		return comm_matches() || mntns_matches();
-	return comm_matches() && mntns_matches();
+	return mntns_matches() && proc_matches();
 }
 
 // ── read() ──

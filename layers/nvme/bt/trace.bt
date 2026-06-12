@@ -7,8 +7,22 @@ BEGIN
 {
     print("bpftrace - NVMe Layer\n");
 
+    // Filter hierarchy (no container in summary mode): device > {comm, pid}.
+    // comm uses substring match (sentinel "_" = unset); pid uses exact membership
+    // via @pid_allow, populated from positional args $3.. (comma list split by the
+    // Makefile). @has_pid distinguishes "no pid filter" from "pid not in set".
     @dev_filter = $1;
     @comm_filter = $2;
+
+    @has_pid = 0;
+    if ((int64)$3 > 0) { @pid_allow[(uint64)$3] = 1; @has_pid = 1; }
+    if ((int64)$4 > 0) { @pid_allow[(uint64)$4] = 1; @has_pid = 1; }
+    if ((int64)$5 > 0) { @pid_allow[(uint64)$5] = 1; @has_pid = 1; }
+    if ((int64)$6 > 0) { @pid_allow[(uint64)$6] = 1; @has_pid = 1; }
+    if ((int64)$7 > 0) { @pid_allow[(uint64)$7] = 1; @has_pid = 1; }
+    if ((int64)$8 > 0) { @pid_allow[(uint64)$8] = 1; @has_pid = 1; }
+    if ((int64)$9 > 0) { @pid_allow[(uint64)$9] = 1; @has_pid = 1; }
+    if ((int64)$10 > 0) { @pid_allow[(uint64)$10] = 1; @has_pid = 1; }
 
     @nvme_op[(uint64)0] = "read";
     @nvme_op[(uint64)1] = "write";
@@ -19,7 +33,7 @@ BEGIN
 
 fentry:nvme_core:nvme_setup_cmd
 / ((@dev_filter == "_" || strcontains(@dev_filter, args.req->q->disk->disk_name)) &&
-   (@comm_filter == "_" || strcontains(@comm_filter, comm))) /
+   ((@comm_filter == "_" && @has_pid == 0) || strcontains(@comm_filter, comm) || @pid_allow[(uint64)pid])) /
 {
     $rq = (uint64)args.req;
     $op = (uint64)(args.req->cmd_flags & 0xFF);
@@ -38,6 +52,9 @@ rawtracepoint:nvme_setup_cmd
     if ($rq)
     {
         @cmd_time[$rq] = nsecs;
+        // Active-I/O span: first setup → last completion. Used to derive
+        // iops/throughput over the active window (not the whole trace lifetime).
+        @io_span_start["ns"] = min(nsecs);
         delete(@fentry_rq[tid]);
     }
 }
@@ -59,6 +76,7 @@ rawtracepoint:nvme_complete_rq
         @cmd_latencies[@nvme_op[$cmd_op]] = hist($lat_ns);
         @cmd_sizes[@nvme_op[$cmd_op]] = hist($cmd_size);
         @cmd_total_bytes[@nvme_op[$cmd_op]] = sum($cmd_size);
+        @io_span_end["ns"] = max($now);
 
         delete(@cmd_time[$rq]);
         delete(@cmd_ops[$rq]);
@@ -87,6 +105,8 @@ END
     print("");
 
     print(@cmd_total_bytes);
+    print(@io_span_start);
+    print(@io_span_end);
     print("");
 
     print(@cmd_sizes);
@@ -97,6 +117,8 @@ END
     clear(@cmd_latencies);
     clear(@cmd_sizes);
     clear(@cmd_total_bytes);
+    clear(@io_span_start);
+    clear(@io_span_end);
 
     clear(@cmd_time);
     clear(@cmd_ops);
@@ -114,4 +136,6 @@ END
 
     delete(@dev_filter);
     delete(@comm_filter);
+    delete(@has_pid);
+    clear(@pid_allow);
 }
