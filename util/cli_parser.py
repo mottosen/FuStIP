@@ -363,6 +363,12 @@ def generate_profile_commands(args):
         vs = build_layer_vars(layer, args, data_dir=args.results_dir)
         seq_cmds.append(f"make -C layers/{layer} generate-stats {' '.join(vs)}")
 
+    # Detailed/container mode: write a consolidated human-readable overview of the
+    # per-layer stats JSON. Summary mode produces different stats files and is
+    # intentionally not summarized here.
+    if bool(args.container_filter) or args.mode == "detailed":
+        seq_cmds.append(f'python util/generate_overview.py "{args.results_dir}"')
+
     return _concurrent(stop_cmds) + seq_cmds
 
 
@@ -394,11 +400,15 @@ def generate_test_commands(args):
             vs.append(f"CONTAINER_FILTER={args.container_filter}")
         else:
             vs.append(f"MODE={args.mode}")
-            vs.append("COMM_FILTER=fio")
-            if args.dev_filter:
-                vs.append(f"DEV_FILTER={args.dev_filter}")
-            if args.pid_filter:
-                vs.append(f"PID_FILTER={args.pid_filter}")
+        # comm is always forced to fio (the test workload), regardless of any -p
+        # the user passed. Device/pid filters from the test command are honored in
+        # every mode — including container — so container runs scope by
+        # container ∩ device ∩ comm like the other modes, not container-only.
+        vs.append("COMM_FILTER=fio")
+        if args.dev_filter:
+            vs.append(f"DEV_FILTER={args.dev_filter}")
+        if args.pid_filter:
+            vs.append(f"PID_FILTER={args.pid_filter}")
         if block_nvme_layers != sorted(TEST_SUITES["block_nvme"]):
             vs.append(f"LAYERS={' '.join(block_nvme_layers)}")
         vs.append(f"FIO_FILE={args.fio_file}")
@@ -413,9 +423,12 @@ def generate_test_commands(args):
             vs.append(f"CONTAINER_FILTER={args.container_filter}")
         else:
             vs.append(f"MODE={args.mode}")
-            vs.append("COMM_FILTER=fio")
-            if args.pid_filter:
-                vs.append(f"PID_FILTER={args.pid_filter}")
+        # comm is always forced to fio, regardless of any -p the user passed; pid
+        # from the test command is honored in every mode. (fs has no device tier,
+        # so no DEV_FILTER here.)
+        vs.append("COMM_FILTER=fio")
+        if args.pid_filter:
+            vs.append(f"PID_FILTER={args.pid_filter}")
         if filesystem_layers != sorted(TEST_SUITES["filesystem"]):
             vs.append(f"LAYERS={' '.join(filesystem_layers)}")
         vs.append(f"FIO_FILE={args.fio_file}")
@@ -424,6 +437,12 @@ def generate_test_commands(args):
 
     if args.container_filter:
         cmds.append(_container_map_stop_cmd())
+
+    # Detailed/container mode: write a consolidated overview of the final
+    # per-layer stats left in the results dir (same as profile stop). Summary
+    # mode produces different stats files and is intentionally not summarized.
+    if bool(args.container_filter) or args.mode == "detailed":
+        cmds.append(f'python util/generate_overview.py "{args.results_dir}"')
     return cmds
 
 
