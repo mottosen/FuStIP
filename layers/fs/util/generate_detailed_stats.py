@@ -29,7 +29,7 @@ import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from stats_generation.shared import (compute_fs_access_pattern,
-                                     tseries_stats)
+                                     derive_throughput, tseries_stats)
 from container.labeling import bind_containers, load_comm_label_map, load_mntns_label_map
 
 LAYER_PREFIX = "fs"
@@ -218,6 +218,14 @@ def generate_stats(parquet_path):
     ts_min = comm_agg_raw["ts_min"].min()
     ts_max = comm_agg_raw["ts_max"].max()
     duration_s = (ts_max - ts_min) / 1e9 if ts_min and ts_max and ts_max > ts_min else 0
+    # Active-I/O duration for throughput: span of DATA syscalls only (read/write/
+    # pread64/pwrite64), excluding the openat→close bracket around the run that
+    # would inflate duration and under-report iops/throughput. (Block/nvme don't
+    # need this — every event there is already data I/O.)
+    io_rows = comm_agg_raw.filter(pl.col("syscall").is_in(io_syscalls_list))
+    io_min = io_rows["ts_min"].min() if len(io_rows) else None
+    io_max = io_rows["ts_max"].max() if len(io_rows) else None
+    active_duration_s = (io_max - io_min) / 1e9 if io_min and io_max and io_max > io_min else duration_s
     event_agg = comm_agg_raw.group_by("event").agg(pl.col("count").sum())
     event_counts = dict(zip(event_agg["event"].to_list(), event_agg["count"].to_list()))
 
@@ -257,6 +265,10 @@ def generate_stats(parquet_path):
             ))
 
         entry["counters"] = comm_counters
+        # Trustworthy iops/throughput = completed ÷ active duration (the first→last
+        # data-syscall span), matching FIO's average over its runtime, per op.
+        entry["derived"] = derive_throughput(
+            comm_counters, active_duration_s, "sc_completed", "sc_total_bytes")
 
     del comm_agg_raw
 
@@ -411,7 +423,9 @@ def generate_stats(parquet_path):
                     entry["access_pattern"]["sc_offsets"][sc] = pat
     del rw_df
 
-    return bind_containers(_entries, mntns_map, comm_map), event_counts
+    result = bind_containers(_entries, mntns_map, comm_map)
+    result["derived"] = {"duration_s": round(active_duration_s, 2)}
+    return result, event_counts
 
 
 def load_data_quality(layer_dir, event_counts):

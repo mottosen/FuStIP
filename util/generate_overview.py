@@ -74,6 +74,12 @@ def _peak_iops(node, op):
     return iops.get("max")
 
 
+def _derived(node, op):
+    """(avg_iops, throughput_mb_s) for an op from the derived scalar, or (None, None)."""
+    d = node.get("derived") or {}
+    return (d.get("iops") or {}).get(op), (d.get("throughput_mb_s") or {}).get(op)
+
+
 def _io_layer_lines(stats):
     """Lines for a block/nvme/fs layer (counts, bytes, peak IOPS, pattern)."""
     lines = []
@@ -90,8 +96,18 @@ def _io_layer_lines(stats):
                 continue
             parts = [f"{_human_count(cnt)} completed",
                      _human_bytes(total_bytes.get(op, 0))]
+            # Lead with the trustworthy avg (total ÷ active duration ≈ FIO),
+            # corroborated by the peak second from the tseries.
+            avg_iops, tput = _derived(node, op)
             peak = _peak_iops(node, op)
-            if peak:
+            if avg_iops is not None:
+                seg = f"{_human_count(avg_iops)} IOPS"
+                if tput is not None:
+                    seg += f" / {tput:.0f} MiB/s"
+                if peak:
+                    seg += f" (peak {_human_count(peak)})"
+                parts.append(seg)
+            elif peak:
                 parts.append(f"peak {_human_count(peak)} IOPS")
             ap = _access_pct(node, op)
             if ap and ap[1] is not None:
