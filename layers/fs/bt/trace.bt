@@ -31,6 +31,11 @@ tracepoint:syscalls:sys_enter_read
 {
     @sc_entered["read"] = count();
     @read_start[tid] = nsecs;
+    // Active-I/O span: first data-syscall entry → last data-syscall exit. Used to
+    // derive iops/throughput over the active window (not the whole trace lifetime).
+    // Only data syscalls (read/write/pread64/pwrite64) — never metadata (openat,
+    // close, …), which bracket the entire process and would re-inflate the window.
+    @io_span_start["ns"] = min(nsecs);
 }
 
 tracepoint:syscalls:sys_exit_read
@@ -42,6 +47,7 @@ tracepoint:syscalls:sys_exit_read
     if (@read_start[tid])
     {
         @sc_completed["read"] = count();
+        @io_span_end["ns"] = max($now);
 
         if ($ret >= 0)
         {
@@ -65,6 +71,7 @@ tracepoint:syscalls:sys_enter_write
 {
     @sc_entered["write"] = count();
     @write_start[tid] = nsecs;
+    @io_span_start["ns"] = min(nsecs);
 }
 
 tracepoint:syscalls:sys_exit_write
@@ -76,6 +83,7 @@ tracepoint:syscalls:sys_exit_write
     if (@write_start[tid])
     {
         @sc_completed["write"] = count();
+        @io_span_end["ns"] = max($now);
 
         if ($ret >= 0)
         {
@@ -99,6 +107,7 @@ tracepoint:syscalls:sys_enter_pread64
 {
     @sc_entered["pread64"] = count();
     @pread_start[tid] = nsecs;
+    @io_span_start["ns"] = min(nsecs);
 }
 
 tracepoint:syscalls:sys_exit_pread64
@@ -110,6 +119,7 @@ tracepoint:syscalls:sys_exit_pread64
     if (@pread_start[tid])
     {
         @sc_completed["pread64"] = count();
+        @io_span_end["ns"] = max($now);
 
         if ($ret >= 0)
         {
@@ -133,6 +143,7 @@ tracepoint:syscalls:sys_enter_pwrite64
 {
     @sc_entered["pwrite64"] = count();
     @pwrite_start[tid] = nsecs;
+    @io_span_start["ns"] = min(nsecs);
 }
 
 tracepoint:syscalls:sys_exit_pwrite64
@@ -144,6 +155,7 @@ tracepoint:syscalls:sys_exit_pwrite64
     if (@pwrite_start[tid])
     {
         @sc_completed["pwrite64"] = count();
+        @io_span_end["ns"] = max($now);
 
         if ($ret >= 0)
         {
@@ -237,6 +249,8 @@ END
     print("");
 
     print(@sc_total_bytes);
+    print(@io_span_start);
+    print(@io_span_end);
     print("");
 
     print(@sc_sizes);
@@ -247,6 +261,8 @@ END
     clear(@sc_latencies);
     clear(@sc_sizes);
     clear(@sc_total_bytes);
+    clear(@io_span_start);
+    clear(@io_span_end);
 
     clear(@read_start);
     clear(@write_start);

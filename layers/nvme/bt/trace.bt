@@ -52,6 +52,9 @@ rawtracepoint:nvme_setup_cmd
     if ($rq)
     {
         @cmd_time[$rq] = nsecs;
+        // Active-I/O span: first setup → last completion. Used to derive
+        // iops/throughput over the active window (not the whole trace lifetime).
+        @io_span_start["ns"] = min(nsecs);
         delete(@fentry_rq[tid]);
     }
 }
@@ -73,6 +76,7 @@ rawtracepoint:nvme_complete_rq
         @cmd_latencies[@nvme_op[$cmd_op]] = hist($lat_ns);
         @cmd_sizes[@nvme_op[$cmd_op]] = hist($cmd_size);
         @cmd_total_bytes[@nvme_op[$cmd_op]] = sum($cmd_size);
+        @io_span_end["ns"] = max($now);
 
         delete(@cmd_time[$rq]);
         delete(@cmd_ops[$rq]);
@@ -101,6 +105,8 @@ END
     print("");
 
     print(@cmd_total_bytes);
+    print(@io_span_start);
+    print(@io_span_end);
     print("");
 
     print(@cmd_sizes);
@@ -111,6 +117,8 @@ END
     clear(@cmd_latencies);
     clear(@cmd_sizes);
     clear(@cmd_total_bytes);
+    clear(@io_span_start);
+    clear(@io_span_end);
 
     clear(@cmd_time);
     clear(@cmd_ops);

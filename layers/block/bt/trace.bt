@@ -53,6 +53,10 @@ rawtracepoint:block_rq_issue
     @rq_issued[@blk_op[$op]] = count();
     @rq_issue_time[(uint64)$rq] = $now;
 
+    // Active-I/O span: first issue → last completion. Used to derive
+    // iops/throughput over the active window (not the whole trace lifetime).
+    @io_span_start["ns"] = min($now);
+
     $t_insert = @rq_insert_time[(uint64)$rq];
     if ($t_insert)
     {
@@ -83,6 +87,7 @@ rawtracepoint:block_rq_complete
         @driver_latencies[@blk_op[$op]] = hist($now - $t_issue);
         @rq_sizes[@blk_op[$op]] = hist($bytes);
         @rq_total_bytes[@blk_op[$op]] = sum($bytes);
+        @io_span_end["ns"] = max($now);
 
         delete(@rq_issue_time[(uint64)$rq]);
     }
@@ -117,6 +122,8 @@ END
     print("");
 
     print(@rq_total_bytes);
+    print(@io_span_start);
+    print(@io_span_end);
     print("");
 
     print(@rq_sizes);
@@ -130,6 +137,8 @@ END
     clear(@driver_latencies);
     clear(@rq_sizes);
     clear(@rq_total_bytes);
+    clear(@io_span_start);
+    clear(@io_span_end);
 
     clear(@rq_insert_time);
     clear(@rq_issue_time);
