@@ -40,6 +40,8 @@ def _apply_config_defaults(args, cfg):
         args.mode = cfg["mode"]
     if args.comm_filter is None and "comm_filter" in cfg:
         args.comm_filter = _as_csv(cfg["comm_filter"])
+    if args.pid_filter is None and "pid_filter" in cfg:
+        args.pid_filter = _as_csv(cfg["pid_filter"])
     if args.container_filter is None and "container_filter" in cfg:
         args.container_filter = _as_csv(cfg["container_filter"])
     if args.dev_filter is None and "dev_filter" in cfg:
@@ -55,10 +57,16 @@ def parse_args(argv=None):
         help="Layers to target, comma-separated and/or repeatable (default: all) [config: layers]",
     )
     parent.add_argument("-m", "--mode", choices=["summary", "detailed"], default=None,
-                        help="Profiling mode: summary or detailed (default: summary) [config: mode]")
-    parent.add_argument("-p", "--comm-filter", help="Process/command name filter, comma-separated for multiple (block, fs) [config: comm_filter]")
-    parent.add_argument("-c", "--container-filter", help="Container name filter, comma-separated for multiple (forces detailed) [config: container_filter]")
-    parent.add_argument("-d", "--dev-filter", help="NVMe device filter, comma-separated for multiple (e.g. nvme0n1,nvme1n1) [config: dev_filter]")
+                        help="Profiling mode: summary or detailed (default: summary). "
+                             "container_filter requires detailed (summary errors out) [config: mode]")
+    parent.add_argument("-c", "--container-filter", help="Container name filter, comma-separated for multiple. "
+                             "Top of the filter hierarchy: restricts to these containers, forces detailed [config: container_filter]")
+    parent.add_argument("-d", "--dev-filter", help="Device filter, comma-separated for multiple (e.g. nvme0n1,nvme1n1). "
+                             "Narrows within any container (nvme, block) [config: dev_filter]")
+    parent.add_argument("-p", "--comm-filter", help="Process/command name filter, comma-separated for multiple. "
+                             "Narrows within any container/device; system-wide if it is the only filter [config: comm_filter]")
+    parent.add_argument("-P", "--pid-filter", help="Process ID (tgid) filter, comma-separated for multiple. "
+                             "Peer of comm-filter (union); system-wide if no container/device set [config: pid_filter]")
     parent.add_argument("--config", metavar="FILE", help="YAML config file; CLI flags override file values [CLI only]")
     parent.add_argument("--results-dir", dest="results_dir", help="Results directory for stats and visualizations (overrides RESULTS_DIR env var) [CLI only]")
     parent.add_argument("--tmp-dir", "--data-dir", dest="tmp_dir", default=None,
@@ -95,9 +103,9 @@ def parse_args(argv=None):
     if args.config:
         _apply_config_defaults(args, _load_config(args.config))
 
-    # Apply built-in default for mode (after config, before layer processing)
-    if args.mode is None:
-        args.mode = "summary"
+    # NOTE: the mode default ("summary") is resolved in validate(), after the
+    # container_filter conflict check, so an explicit `mode: summary` alongside a
+    # container_filter can be distinguished from an unset mode and rejected.
 
     # Flatten comma-separated values from repeated -l flags
     if args.layers is None:
@@ -134,8 +142,18 @@ def _data_dir(args):
 
 
 def validate(args):
+    # container_filter forces detailed mode. Reject an explicit `mode: summary`
+    # instead of silently overriding it (mode is still None when never set).
     if args.container_filter:
+        if args.mode == "summary":
+            print("Error: container_filter requires detailed mode; remove 'mode: summary' "
+                  "(container filtering is only available in detailed mode)", file=sys.stderr)
+            sys.exit(1)
         args.mode = "detailed"
+
+    # Resolve the built-in default now that the conflict check has run.
+    if args.mode is None:
+        args.mode = "summary"
 
     if args.visualize and args.mode != "detailed":
         print("Error: --visualize requires detailed mode (-m detailed)", file=sys.stderr)
@@ -143,16 +161,23 @@ def validate(args):
 
     is_test = args.action == "test"
 
+    # Filter hierarchy: container > device > {comm, pid}. Without a container,
+    # each eBPF layer still needs at least one filter to avoid tracing the whole
+    # system. comm/pid are peers (union); device applies to nvme and block.
     if not args.container_filter:
-        if "nvme" in args.layers:
-            if not args.dev_filter and not args.comm_filter:
-                print("Error: nvme layer requires -d/--dev-filter or -p/--comm-filter", file=sys.stderr)
+        has_proc = bool(args.comm_filter or args.pid_filter)
+        if "nvme" in args.layers and not (args.dev_filter or has_proc):
+            print("Error: nvme layer requires -d/--dev-filter, -p/--comm-filter, or "
+                  "-P/--pid-filter (or -c/--container-filter)", file=sys.stderr)
+            sys.exit(1)
+        if not is_test:
+            if "block" in args.layers and not (args.dev_filter or has_proc):
+                print("Error: block layer requires -d/--dev-filter, -p/--comm-filter, or "
+                      "-P/--pid-filter (or -c/--container-filter)", file=sys.stderr)
                 sys.exit(1)
-
-        if not is_test and ("block" in args.layers or "fs" in args.layers):
-            if not args.comm_filter:
-                needed = [l for l in args.layers if l in ("block", "fs")]
-                print(f"Error: {', '.join(needed)} layer(s) require -p/--comm-filter", file=sys.stderr)
+            if "fs" in args.layers and not has_proc:
+                print("Error: fs layer requires -p/--comm-filter or -P/--pid-filter "
+                      "(or -c/--container-filter)", file=sys.stderr)
                 sys.exit(1)
 
 
@@ -191,6 +216,8 @@ def build_layer_vars(layer, args, data_dir=None):
     if layer == "sysstat":
         if args.comm_filter:
             vs.append(f"COMM_FILTER={args.comm_filter}")
+        if args.pid_filter:
+            vs.append(f"PID_FILTER={args.pid_filter}")
         if args.container_filter:
             vs.append(f"CONTAINER_FILTER={args.container_filter}")
         vs.append(f"RESULTS_DIR={target_dir}")
@@ -201,14 +228,14 @@ def build_layer_vars(layer, args, data_dir=None):
     if not args.container_filter:
         vs.append(f"MODE={args.mode}")
 
-    if layer == "nvme":
-        if args.dev_filter:
-            vs.append(f"DEV_FILTER={args.dev_filter}")
-        if args.comm_filter:
-            vs.append(f"COMM_FILTER={args.comm_filter}")
-    elif layer in ("block", "fs"):
-        if args.comm_filter:
-            vs.append(f"COMM_FILTER={args.comm_filter}")
+    # Device filter applies to the disk-aware layers (nvme, block).
+    if layer in ("nvme", "block") and args.dev_filter:
+        vs.append(f"DEV_FILTER={args.dev_filter}")
+    # Process tier (comm/pid) applies to every eBPF layer.
+    if args.comm_filter:
+        vs.append(f"COMM_FILTER={args.comm_filter}")
+    if args.pid_filter:
+        vs.append(f"PID_FILTER={args.pid_filter}")
 
     vs.append(f"RESULTS_DIR={target_dir}")
     return vs
@@ -370,6 +397,8 @@ def generate_test_commands(args):
             vs.append("COMM_FILTER=fio")
             if args.dev_filter:
                 vs.append(f"DEV_FILTER={args.dev_filter}")
+            if args.pid_filter:
+                vs.append(f"PID_FILTER={args.pid_filter}")
         if block_nvme_layers != sorted(TEST_SUITES["block_nvme"]):
             vs.append(f"LAYERS={' '.join(block_nvme_layers)}")
         vs.append(f"FIO_FILE={args.fio_file}")
@@ -385,6 +414,8 @@ def generate_test_commands(args):
         else:
             vs.append(f"MODE={args.mode}")
             vs.append("COMM_FILTER=fio")
+            if args.pid_filter:
+                vs.append(f"PID_FILTER={args.pid_filter}")
         if filesystem_layers != sorted(TEST_SUITES["filesystem"]):
             vs.append(f"LAYERS={' '.join(filesystem_layers)}")
         vs.append(f"FIO_FILE={args.fio_file}")
