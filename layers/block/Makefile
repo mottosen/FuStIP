@@ -47,8 +47,12 @@ ensure-results-exists:
 .PHONY: start-collection
 start-collection: ensure-results-exists ensure-sudo
 ifndef CONTAINER_FILTER
+ifndef DEV_FILTER
 ifndef COMM_FILTER
-	$(error COMM_FILTER is not set (set COMM_FILTER or CONTAINER_FILTER))
+ifndef PID_FILTER
+	$(error no filter set (set DEV_FILTER, COMM_FILTER, PID_FILTER, or CONTAINER_FILTER))
+endif
+endif
 endif
 endif
 
@@ -63,7 +67,9 @@ ifeq ($(MODE),detailed)
 	$(Q)touch "$(RESULTS_DIR)/block/detailed.csv" "$(RESULTS_DIR)/block/counters.json"
 	$(Q)sudo ./bpf/c/standalone \
 		-o "$(RESULTS_DIR)/block/detailed.csv" \
-		$(if $(COMM_FILTER),-f $(COMM_FILTER)) \
+		$(if $(DEV_FILTER),-f $(DEV_FILTER)) \
+		$(if $(COMM_FILTER),-p $(COMM_FILTER)) \
+		$(if $(PID_FILTER),-P $(PID_FILTER)) \
 		$(if $(CONTAINER_FILTER),-c $(CONTAINER_FILTER)) \
 		$(ERR_REDIRECT) 1>&2 & echo $$! > "$(PIDS_DIR)/detailed.pid"
 
@@ -71,7 +77,7 @@ ifeq ($(MODE),detailed)
 else
 	$(Q)echo -e "\nStarting bpftrace collection.."
 
-	$(Q)sudo $(BPFTRACE) ./bt/trace.bt $(COMM_FILTER) \
+	$(Q)sudo $(BPFTRACE) ./bt/trace.bt "$(if $(DEV_FILTER),$(DEV_FILTER),_)" "$(if $(COMM_FILTER),$(COMM_FILTER),_)" $$(echo '$(PID_FILTER)' | tr ',' ' ') \
 		--no-warnings \
 		-o "$(RESULTS_DIR)/block/trace.out" \
 		$(ERR_REDIRECT) 1>&2 & echo $$! > "$(PIDS_DIR)/trace.pid"

@@ -11,8 +11,10 @@ const volatile __u8 num_dev_filters = 0;
 #define MAX_COMM_FILTERS 8
 const volatile char comm_filters[MAX_COMM_FILTERS][16] = {};
 const volatile __u8 num_comm_filters = 0;
+#define MAX_PID_FILTERS 8
+const volatile __u32 pid_filters[MAX_PID_FILTERS] = {};
+const volatile __u8 num_pid_filters = 0;
 const volatile bool filter_by_mntns = false;
-const volatile bool filter_or_mode = false;
 
 #include "../bpf_core.h"
 
@@ -63,6 +65,37 @@ static __always_inline bool comm_matches(void) {
   return false;
 }
 
+// ── PID filter helper ──
+// Returns true if current task's tgid matches any filter pid
+static __always_inline bool pid_matches(void) {
+  if (num_pid_filters == 0)
+    return true;
+
+  __u32 tgid = bpf_get_current_pid_tgid() >> 32;
+
+  for (int f = 0; f < MAX_PID_FILTERS; f++) {
+    if (f >= num_pid_filters)
+      break;
+    if (pid_filters[f] == tgid)
+      return true;
+  }
+  return false;
+}
+
+// ── Process tier (comm OR pid, union) ──
+// Pass-through when neither filter is set; otherwise match if the task matches
+// any *active* filter. Each active filter is consulted only when non-empty so
+// the empty→true short-circuit in the helpers never decides the union.
+static __always_inline bool proc_matches(void) {
+  if (num_comm_filters == 0 && num_pid_filters == 0)
+    return true;
+  if (num_comm_filters > 0 && comm_matches())
+    return true;
+  if (num_pid_filters > 0 && pid_matches())
+    return true;
+  return false;
+}
+
 // ── Device filter helper ──
 // Returns true if the request's disk name contains any filter substring
 static __always_inline bool dev_matches(struct request *req) {
@@ -100,16 +133,10 @@ static __always_inline bool dev_matches(struct request *req) {
 
 SEC("fentry/nvme_setup_cmd")
 int BPF_PROG(nvme_setup_cmd, void *ns, struct request *req) {
-  if (filter_or_mode) {
-    // OR between host identification (dev AND comm) and container (mntns)
-    bool host_match = dev_matches(req) && comm_matches();
-    if (!host_match && !mntns_matches())
-      return 0;
-  } else {
-    // AND: all active filters must independently match
-    if (!dev_matches(req) || !comm_matches() || !mntns_matches())
-      return 0;
-  }
+  // Nested-AND hierarchy: container ⊇ device ⊇ {comm, pid}.
+  // Each unset tier is a pass-through; the process tier is comm OR pid (union).
+  if (!mntns_matches() || !dev_matches(req) || !proc_matches())
+    return 0;
   return handle_nvme_fentry_setup(req);
 }
 

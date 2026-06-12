@@ -7,8 +7,22 @@ BEGIN
 {
     print("bpftrace - NVMe Layer\n");
 
+    // Filter hierarchy (no container in summary mode): device > {comm, pid}.
+    // comm uses substring match (sentinel "_" = unset); pid uses exact membership
+    // via @pid_allow, populated from positional args $3.. (comma list split by the
+    // Makefile). @has_pid distinguishes "no pid filter" from "pid not in set".
     @dev_filter = $1;
     @comm_filter = $2;
+
+    @has_pid = 0;
+    if ((int64)$3 > 0) { @pid_allow[(uint64)$3] = 1; @has_pid = 1; }
+    if ((int64)$4 > 0) { @pid_allow[(uint64)$4] = 1; @has_pid = 1; }
+    if ((int64)$5 > 0) { @pid_allow[(uint64)$5] = 1; @has_pid = 1; }
+    if ((int64)$6 > 0) { @pid_allow[(uint64)$6] = 1; @has_pid = 1; }
+    if ((int64)$7 > 0) { @pid_allow[(uint64)$7] = 1; @has_pid = 1; }
+    if ((int64)$8 > 0) { @pid_allow[(uint64)$8] = 1; @has_pid = 1; }
+    if ((int64)$9 > 0) { @pid_allow[(uint64)$9] = 1; @has_pid = 1; }
+    if ((int64)$10 > 0) { @pid_allow[(uint64)$10] = 1; @has_pid = 1; }
 
     @nvme_op[(uint64)0] = "read";
     @nvme_op[(uint64)1] = "write";
@@ -19,7 +33,7 @@ BEGIN
 
 fentry:nvme_core:nvme_setup_cmd
 / ((@dev_filter == "_" || strcontains(@dev_filter, args.req->q->disk->disk_name)) &&
-   (@comm_filter == "_" || strcontains(@comm_filter, comm))) /
+   ((@comm_filter == "_" && @has_pid == 0) || strcontains(@comm_filter, comm) || @pid_allow[(uint64)pid])) /
 {
     $rq = (uint64)args.req;
     $op = (uint64)(args.req->cmd_flags & 0xFF);
@@ -114,4 +128,6 @@ END
 
     delete(@dev_filter);
     delete(@comm_filter);
+    delete(@has_pid);
+    clear(@pid_allow);
 }

@@ -81,6 +81,7 @@ parse: ensure-results-exists
 generate-stats: ensure-results-exists
 	$(Q)python "./util/generate_stats.py" \
 		$(if $(COMM_FILTER),--process "$$(echo '$(COMM_FILTER)' | tr ',' ' ')") \
+		$(if $(PID_FILTER),--pid "$$(echo '$(PID_FILTER)' | tr ',' ' ')") \
 		$(if $(CONTAINER_FILTER),--container "$$(echo '$(CONTAINER_FILTER)' | tr ',' ' ')") \
 		"$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
 	@echo "sysstat stats generated"
@@ -89,6 +90,7 @@ generate-stats: ensure-results-exists
 visualize: ensure-results-exists
 	$(Q)python "./util/visualize.py" \
 		$(if $(COMM_FILTER),--process "$$(echo '$(COMM_FILTER)' | tr ',' ' ')") \
+		$(if $(PID_FILTER),--pid "$$(echo '$(PID_FILTER)' | tr ',' ' ')") \
 		$(if $(CONTAINER_FILTER),--container "$$(echo '$(CONTAINER_FILTER)' | tr ',' ' ')") \
 		"$(RESULTS_DIR)" $(ERR_REDIRECT) $(OUT_REDIRECT)
 	$(Q)echo -e "sysstat visualization generated"

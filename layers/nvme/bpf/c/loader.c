@@ -18,6 +18,7 @@ static FILE *output;
 #define MAX_CONTAINER_FILTERS 32
 #define MAX_DEV_FILTERS 8
 #define MAX_COMM_FILTERS 8
+#define MAX_PID_FILTERS 8
 
 static const char *op_name(__u8 op) {
   switch (op) {
@@ -145,6 +146,25 @@ static int parse_comm_filters(struct standalone_bpf *skel, const char *filter) {
   return count;
 }
 
+static int parse_pid_filters(struct standalone_bpf *skel, const char *filter) {
+  char buf[256];
+  strncpy(buf, filter, sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = '\0';
+
+  int count = 0;
+  char *saveptr = NULL;
+  char *token = strtok_r(buf, ",", &saveptr);
+  while (token && count < MAX_PID_FILTERS) {
+    skel->rodata->pid_filters[count] = (__u32)strtoul(token, NULL, 10);
+    count++;
+    token = strtok_r(NULL, ",", &saveptr);
+  }
+  if (token)
+    fprintf(stderr, "Warning: only first %d pid filters are used\n", MAX_PID_FILTERS);
+  skel->rodata->num_pid_filters = count;
+  return count;
+}
+
 static int parse_container_filters(const char *csv, char out[][128], int max_entries) {
   char buf[1024];
   strncpy(buf, csv, sizeof(buf) - 1);
@@ -173,9 +193,11 @@ static int parse_container_filters(const char *csv, char out[][128], int max_ent
 
 static void usage(const char *prog) {
   fprintf(stderr,
-          "Usage: %s -o <output_csv> [-f <dev_filter[,dev2,...]>] [-p <comm_filter[,comm2,...]>] [-c <container_name[,container2,...]>]\n",
+          "Usage: %s -o <output_csv> [-c <container[,...]>] [-f <dev_filter[,...]>] "
+          "[-p <comm_filter[,...]>] [-P <pid_filter[,...]>]\n",
           prog);
-  fprintf(stderr, "  -f (device), -p (comm), or -c (container); at least one required\n");
+  fprintf(stderr, "  Filter hierarchy (nested AND): -c container > -f device > {-p comm, -P pid}.\n");
+  fprintf(stderr, "  comm and pid are unioned; at least one filter required.\n");
   exit(1);
 }
 
@@ -183,7 +205,7 @@ static int try_resolve_container(struct standalone_bpf *skel,
                                  const char *container_name) {
   char cmd[256];
   snprintf(cmd, sizeof(cmd),
-           "docker inspect --format '{{.State.Pid}}' %s 2>/dev/null",
+           "docker inspect --format '{{.State.Pid}}' %.200s 2>/dev/null",
            container_name);
 
   FILE *fp = popen(cmd, "r");
@@ -237,13 +259,14 @@ int main(int argc, char **argv) {
   char *output_path = NULL;
   char *dev_filter = NULL;
   char *comm_filter = NULL;
+  char *pid_filter = NULL;
   char *container_filter = NULL;
   char container_names[MAX_CONTAINER_FILTERS][128] = {};
   int container_count = 0;
   int container_resolved[MAX_CONTAINER_FILTERS] = {};
   int opt;
 
-  while ((opt = getopt(argc, argv, "o:f:p:c:")) != -1) {
+  while ((opt = getopt(argc, argv, "o:f:p:P:c:")) != -1) {
     switch (opt) {
     case 'o':
       output_path = optarg;
@@ -254,6 +277,9 @@ int main(int argc, char **argv) {
     case 'p':
       comm_filter = optarg;
       break;
+    case 'P':
+      pid_filter = optarg;
+      break;
     case 'c':
       container_filter = optarg;
       break;
@@ -262,7 +288,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (!output_path || (!dev_filter && !comm_filter && !container_filter))
+  if (!output_path || (!dev_filter && !comm_filter && !pid_filter && !container_filter))
     usage(argv[0]);
 
   if (container_filter) {
@@ -286,10 +312,10 @@ int main(int argc, char **argv) {
     parse_dev_filters(skel, dev_filter);
   if (comm_filter)
     parse_comm_filters(skel, comm_filter);
+  if (pid_filter)
+    parse_pid_filters(skel, pid_filter);
   if (container_count > 0)
     skel->rodata->filter_by_mntns = true;
-  if ((dev_filter || comm_filter) && container_count > 0)
-    skel->rodata->filter_or_mode = true;
 
   int err = standalone_bpf__load(skel);
   if (err) {
@@ -323,19 +349,12 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if ((dev_filter || comm_filter) && container_count > 0)
-    fprintf(stderr, "NVMe layer detailed tracing started (dev: %s, comm: %s, containers: %s, OR mode)...\n",
-            dev_filter ? dev_filter : "none",
-            comm_filter ? comm_filter : "none",
-            container_filter);
-  else if (dev_filter || comm_filter)
-    fprintf(stderr, "NVMe layer detailed tracing started (dev: %s, comm: %s)...\n",
-            dev_filter ? dev_filter : "none",
-            comm_filter ? comm_filter : "none");
-  else
-    fprintf(stderr,
-            "NVMe layer detailed tracing started (containers: %s)...\n",
-            container_filter);
+  fprintf(stderr,
+          "NVMe layer detailed tracing started (container: %s, dev: %s, comm: %s, pid: %s)...\n",
+          container_filter ? container_filter : "none",
+          dev_filter ? dev_filter : "none",
+          comm_filter ? comm_filter : "none",
+          pid_filter ? pid_filter : "none");
 
   int num_resolved = 0;
   time_t last_attempt = 0;
