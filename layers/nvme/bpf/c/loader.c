@@ -78,15 +78,54 @@ static void write_counters(struct standalone_bpf *skel, const char *csv_path) {
   else
     strcpy(path, "counters.json");
 
+  /* Untracked completions (per disk+op): completions whose command was never
+   * tracked at setup — excluded by the device/proc/container filter, or a
+   * setup-probe miss. Build a JSON object from the hash map. */
+  struct untracked_key {
+    char disk_name[32];
+    __u8 op;
+  };
+  char untracked_json[4096];
+  size_t uoff = 0;
+  untracked_json[uoff++] = '{';
+  __u64 untracked_total = 0;
+  int ufd = bpf_map__fd(skel->maps.untracked_completes);
+  if (ufd >= 0) {
+    struct untracked_key key, next_key;
+    void *prev = NULL;
+    int first = 1;
+    while (bpf_map_get_next_key(ufd, prev, &next_key) == 0) {
+      __u64 uval = 0;
+      if (bpf_map_lookup_elem(ufd, &next_key, &uval) == 0 && uval > 0) {
+        char disk[33] = {};
+        memcpy(disk, next_key.disk_name, 32);
+        untracked_total += uval;
+        if (uoff < sizeof(untracked_json))
+          uoff += snprintf(untracked_json + uoff, sizeof(untracked_json) - uoff,
+                           "%s\"%s, %s\": %llu", first ? "" : ", ", disk,
+                           op_name(next_key.op), uval);
+        first = 0;
+      }
+      key = next_key;
+      prev = &key;
+    }
+  }
+  if (uoff < sizeof(untracked_json))
+    snprintf(untracked_json + uoff, sizeof(untracked_json) - uoff, "}");
+  else
+    strcpy(untracked_json + sizeof(untracked_json) - 2, "}");
+
   FILE *f = fopen(path, "w");
   if (!f)
     return;
   fprintf(f, "{\"setup\": {\"generated\": %llu, \"dropped\": %llu}, "
-             "\"complete\": {\"generated\": %llu, \"dropped\": %llu}}\n",
-          totals[0], totals[1], totals[2], totals[3]);
+             "\"complete\": {\"generated\": %llu, \"dropped\": %llu}, "
+             "\"untracked\": %s}\n",
+          totals[0], totals[1], totals[2], totals[3], untracked_json);
   fclose(f);
-  fprintf(stderr, "Counters: setup(gen=%llu drop=%llu) complete(gen=%llu drop=%llu) -> %s\n",
-          totals[0], totals[1], totals[2], totals[3], path);
+  fprintf(stderr, "Counters: setup(gen=%llu drop=%llu) complete(gen=%llu drop=%llu) "
+                  "untracked=%llu -> %s\n",
+          totals[0], totals[1], totals[2], totals[3], untracked_total, path);
 }
 
 static int handle_event(void *ctx, void *data, size_t data_sz) {

@@ -72,6 +72,22 @@ struct {
 	__type(value, __s64);
 } d_inflight_counts SEC(".maps");
 
+// ── Untracked completions ──
+// A completion whose request was never tracked at issue (filtered out by
+// device/proc/container at issue, or — rarely — the issue probe was missed).
+// Counted per (disk, op) so excluded other-disk traffic (filter working) can be
+// told apart from target-disk issue misses.
+struct untracked_key {
+	char disk_name[32];
+	__u8 op;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, struct untracked_key);
+	__type(value, __u64);
+} untracked_completes SEC(".maps");
+
 // ── Inline probe handlers ──
 
 static __always_inline int handle_block_rq_insert(struct request *rq)
@@ -232,8 +248,21 @@ static __always_inline int handle_block_rq_complete(struct request *rq)
 
 	// Lookup issue time — if missing, this request wasn't tracked
 	__u64 *t_issue = bpf_map_lookup_elem(&issue_time, &rq_key);
-	if (!t_issue)
+	if (!t_issue) {
+		// Untracked completion: count it per (disk, op). The request was never
+		// recorded at issue, so read disk + op fresh from it here.
+		struct untracked_key uk = {};
+		uk.op = BPF_CORE_READ(rq, cmd_flags) & 0xFF;
+		struct gendisk *disk = BPF_CORE_READ(rq, q, disk);
+		if (disk)
+			bpf_probe_read_kernel_str(&uk.disk_name, sizeof(uk.disk_name), &disk->disk_name);
+		__u64 zero = 0;
+		bpf_map_update_elem(&untracked_completes, &uk, &zero, BPF_NOEXIST);
+		__u64 *uc = bpf_map_lookup_elem(&untracked_completes, &uk);
+		if (uc)
+			__sync_fetch_and_add(uc, 1);
 		return 0;
+	}
 
 	__u64 now = bpf_ktime_get_ns();
 	__u64 driver_lat = now - *t_issue;

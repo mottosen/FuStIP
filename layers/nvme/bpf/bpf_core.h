@@ -68,6 +68,22 @@ struct {
   __type(value, __s64);
 } inflight_counts SEC(".maps");
 
+// ── Untracked completions ──
+// A completion whose command was never tracked at setup (filtered out by
+// device/proc/container at nvme_setup_cmd, or — rarely — the setup probe was
+// missed). Counted per (disk, op) so excluded other-disk traffic (filter
+// working) can be told apart from target-disk setup misses.
+struct untracked_key {
+  char disk_name[32];
+  __u8 op;
+};
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 64);
+  __type(key, struct untracked_key);
+  __type(value, __u64);
+} untracked_completes SEC(".maps");
+
 // ── Inline probe handlers ──
 
 // Called from fentry:nvme_setup_cmd — captures metadata and bridges to
@@ -167,8 +183,21 @@ static __always_inline int handle_nvme_complete(struct request *req) {
 
   // Lookup setup timestamp — if missing, this command wasn't tracked
   __u64 *t_setup = bpf_map_lookup_elem(&cmd_time, &rq_key);
-  if (!t_setup)
+  if (!t_setup) {
+    // Untracked completion: count it per (disk, op). The request was never
+    // recorded at setup, so read disk + op fresh from it here.
+    struct untracked_key uk = {};
+    uk.op = BPF_CORE_READ(req, cmd_flags) & 0xFF;
+    struct gendisk *disk = BPF_CORE_READ(req, q, disk);
+    if (disk)
+      bpf_probe_read_kernel_str(&uk.disk_name, sizeof(uk.disk_name), &disk->disk_name);
+    __u64 zero = 0;
+    bpf_map_update_elem(&untracked_completes, &uk, &zero, BPF_NOEXIST);
+    __u64 *uc = bpf_map_lookup_elem(&untracked_completes, &uk);
+    if (uc)
+      __sync_fetch_and_add(uc, 1);
     return 0;
+  }
 
   __u64 now = bpf_ktime_get_ns();
   __u64 latency = now - *t_setup;
