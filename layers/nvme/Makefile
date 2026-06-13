@@ -58,6 +58,12 @@ endif
 
 	$(Q)mkdir -p "$(PIDS_DIR)"
 
+# Device fingerprint (nvme-cli + sysfs) — independent of mode; captured
+# whenever a device filter names the target device(s).
+	$(Q)if [ -n "$(DEV_FILTER)" ]; then \
+		python "./util/collect_device_info.py" "$(RESULTS_DIR)" "$(DEV_FILTER)" $(ERR_REDIRECT) || true; \
+	fi
+
 ifeq ($(MODE),detailed)
 	$(Q)echo -e "\nStarting detailed collection.."
 
@@ -65,9 +71,6 @@ ifeq ($(MODE),detailed)
 
 	$(Q)sudo rm -f "$(RESULTS_DIR)/nvme/detailed.csv" "$(RESULTS_DIR)/nvme/counters.json" $(ERR_REDIRECT) || true
 	$(Q)touch "$(RESULTS_DIR)/nvme/detailed.csv" "$(RESULTS_DIR)/nvme/counters.json"
-	$(Q)if [ -n "$(DEV_FILTER)" ]; then \
-		printf '{"device": "%s"}\n' "$(DEV_FILTER)" > "$(RESULTS_DIR)/nvme/device-info.json"; \
-	fi
 	$(Q)sudo ./bpf/c/standalone \
 		-o "$(RESULTS_DIR)/nvme/detailed.csv" \
 		$(if $(DEV_FILTER),-f $(DEV_FILTER)) \

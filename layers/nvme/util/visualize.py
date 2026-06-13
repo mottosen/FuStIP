@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Generate NVMe layer visualization dashboard from detailed CSV."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -23,35 +24,51 @@ N_HEATMAP_TIME_BINS = 256
 
 
 def load_device_sectors(parquet_path, schema):
-    """Infer total device sector count from disk_name column via sysfs.
+    """Total device sector count (512-byte units) for LBA-distribution normalisation.
 
-    Reads the most common disk_name from setup events in the Parquet, then
-    looks up /sys/block/<disk_name>/size.  Returns None if the column is
-    absent (old Parquet without disk_name) or the device is not found.
+    Prefers the capture-time `device-info.json` (written by collect_device_info.py
+    next to the Parquet), so the value is correct even when analysis runs off the
+    capture host. Falls back to the live `/sys/block/<dev>/size` lookup, which is
+    only valid on the capture machine. Returns None if neither is available.
     """
-    if "disk_name" not in schema:
-        return None
-    result = (pl.scan_parquet(parquet_path)
-              .filter(pl.col("event") == "setup")
-              .filter(pl.col("disk_name").is_not_null())
-              .filter(pl.col("disk_name") != "")
-              .select("disk_name")
-              .group_by("disk_name")
-              .agg(pl.len().alias("count"))
-              .sort("count", descending=True)
-              .limit(1)
-              .collect(engine="streaming"))
-    if len(result) == 0:
-        return None
-    dev = result["disk_name"][0]
-    if not dev:
-        return None
-    size_path = Path(f"/sys/block/{dev}/size")
-    if size_path.exists():
+    # Device name from the trace (most-common disk_name at setup), if present.
+    dev = None
+    if "disk_name" in schema:
+        result = (pl.scan_parquet(parquet_path)
+                  .filter(pl.col("event") == "setup")
+                  .filter(pl.col("disk_name").is_not_null())
+                  .filter(pl.col("disk_name") != "")
+                  .select("disk_name")
+                  .group_by("disk_name")
+                  .agg(pl.len().alias("count"))
+                  .sort("count", descending=True)
+                  .limit(1)
+                  .collect(engine="streaming"))
+        if len(result) > 0:
+            dev = result["disk_name"][0] or None
+
+    # 1) Capture-time device-info.json (offline-safe), keyed by device name.
+    info_path = Path(parquet_path).parent / "device-info.json"
+    if info_path.exists():
         try:
-            return int(size_path.read_text().strip())
-        except ValueError:
+            info = json.loads(info_path.read_text())
+            entry = info.get(dev) if dev else None
+            if entry is None and len(info) == 1:
+                entry = next(iter(info.values()))
+            sectors = entry.get("sectors_512b") if isinstance(entry, dict) else None
+            if sectors:
+                return int(sectors)
+        except (OSError, ValueError, TypeError):
             pass
+
+    # 2) Fallback: live sysfs (valid only on the capture host).
+    if dev:
+        size_path = Path(f"/sys/block/{dev}/size")
+        if size_path.exists():
+            try:
+                return int(size_path.read_text().strip())
+            except ValueError:
+                pass
     return None
 
 

@@ -4,6 +4,7 @@
     "python314Packages.pip": {"version": "25.3"},
     "fio": {"version": "3.41"},
     "sysstat": {"version": "12.7.7"},
+    "nvme-cli": {"version": "2.16"},
     "bpftrace": {"version": "0.24.2"},
     "clang_18": {"version": "18.1.8"},
     "bpftools": {"version": "6.18.7"},

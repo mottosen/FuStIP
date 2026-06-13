@@ -332,14 +332,15 @@ def generate_profile_commands(args):
                 seq_cmds.append(
                     f'cp "{td}/{layer}/counters.json" "{rd}/{layer}/" 2>/dev/null || true'
                 )
-                if layer == "nvme":
-                    seq_cmds.append(
-                        f'cp "{td}/{layer}/device-info.json" "{rd}/{layer}/" 2>/dev/null || true'
-                    )
             else:
                 # summary mode: bpftrace output
                 seq_cmds.append(
                     f'cp "{td}/{layer}/trace.out" "{rd}/{layer}/" 2>/dev/null || true'
+                )
+            # nvme device-info.json is device-filter-gated and mode-independent.
+            if layer == "nvme":
+                seq_cmds.append(
+                    f'cp "{td}/{layer}/device-info.json" "{rd}/{layer}/" 2>/dev/null || true'
                 )
 
         # Remove layer subdirs from tmp_dir — data is now in results_dir.
