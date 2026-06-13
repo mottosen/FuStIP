@@ -84,7 +84,12 @@ rawtracepoint:nvme_complete_rq
     }
     else
     {
-        @cmd_untracked[((struct request *)arg0)->q->disk->disk_name, @nvme_op[$cmd_op]] = count();
+        // Per-disk only: untracked completions have no recorded setup, so the op
+        // can't be determined here (reading it fresh from the request fails the
+        // BPF verifier on recent kernels). The disk split + count are the
+        // diagnostic that matters — excluded other-disk traffic vs target-disk
+        // setup misses; detailed mode reports the full per-(disk, op) breakdown.
+        @cmd_untracked[((struct request *)arg0)->q->disk->disk_name] = count();
     }
 }
 
