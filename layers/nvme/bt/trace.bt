@@ -9,13 +9,25 @@ BEGIN
 
     // Filter hierarchy (no container in summary mode): device > {comm, pid}.
     // comm uses substring match (sentinel "_" = unset); pid uses exact membership
-    // via @pid_allow, populated from positional args $3.. (comma list split by the
-    // Makefile). @has_pid distinguishes "no pid filter" from "pid not in set".
+    // via @pid_allow. Positional args: $1=dev filter, $2=comm filter, $3=device
+    // capacity in logical blocks / NVMe nsze (for LBA normalization), $4.. = pids
+    // (comma list split by the Makefile). @has_pid distinguishes "no pid filter"
+    // from "pid not in set".
     @dev_filter = $1;
     @comm_filter = $2;
 
+    // Device capacity in logical blocks (NVMe nsze). Used ONLY to normalize SLBA
+    // (itself in logical-block units) into a device-space percentage for the
+    // LBA-distribution histogram, keeping the lhist bounds literal constants as
+    // bpftrace requires. A single scalar is sufficient because summary mode is
+    // single-device by construction: the CLI (cli_parser.validate) rejects a
+    // multi-device -d in summary mode, since every map here is keyed by op (not
+    // disk) and would otherwise merge devices and mis-normalize this histogram.
+    // Per-device breakdown is detailed mode's job. 0 = unknown (no device filter /
+    // no device-info.json) → the LBA distribution is skipped.
+    @dev_lbas = (uint64)$3;
+
     @has_pid = 0;
-    if ((int64)$3 > 0) { @pid_allow[(uint64)$3] = 1; @has_pid = 1; }
     if ((int64)$4 > 0) { @pid_allow[(uint64)$4] = 1; @has_pid = 1; }
     if ((int64)$5 > 0) { @pid_allow[(uint64)$5] = 1; @has_pid = 1; }
     if ((int64)$6 > 0) { @pid_allow[(uint64)$6] = 1; @has_pid = 1; }
@@ -23,12 +35,18 @@ BEGIN
     if ((int64)$8 > 0) { @pid_allow[(uint64)$8] = 1; @has_pid = 1; }
     if ((int64)$9 > 0) { @pid_allow[(uint64)$9] = 1; @has_pid = 1; }
     if ((int64)$10 > 0) { @pid_allow[(uint64)$10] = 1; @has_pid = 1; }
+    if ((int64)$11 > 0) { @pid_allow[(uint64)$11] = 1; @has_pid = 1; }
 
-    @nvme_op[(uint64)0] = "read";
-    @nvme_op[(uint64)1] = "write";
-    @nvme_op[(uint64)2] = "flush";
-    @nvme_op[(uint64)3] = "discard";
-    @nvme_op[(uint64)9] = "write_zeros";
+    // NVMe NVM-command-set opcode -> name. The opcode is the NVMe command's own
+    // opcode (args.opcode at the setup tracepoint, not block-layer req->cmd_flags),
+    // so it is correct for both normal block IO and io_uring_cmd passthrough. Admin
+    // commands (qid 0) use a different opcode space; the dev/comm filter excludes
+    // nearly all of them, and any stray one falls into the empty/"unknown" bucket.
+    @nvme_op[(uint64)0x00] = "flush";
+    @nvme_op[(uint64)0x01] = "write";
+    @nvme_op[(uint64)0x02] = "read";
+    @nvme_op[(uint64)0x08] = "write_zeros";
+    @nvme_op[(uint64)0x09] = "discard";
 }
 
 fentry:nvme_core:nvme_setup_cmd
@@ -36,17 +54,23 @@ fentry:nvme_core:nvme_setup_cmd
    ((@comm_filter == "_" && @has_pid == 0) || strcontains(@comm_filter, comm) || @pid_allow[(uint64)pid])) /
 {
     $rq = (uint64)args.req;
-    $op = (uint64)(args.req->cmd_flags & 0xFF);
-    $size = (uint64)args.req->__data_len;
-
-    @cmd_setup[@nvme_op[$op]] = count();
-
-    @cmd_ops[$rq] = $op;
-    @cmd_size[$rq] = $size;
     @fentry_rq[tid] = $rq;
+
+    // Transfer length: __data_len is set correctly on the request even for
+    // io_uring_cmd passthrough, and reads reliably here (struct request BTF is
+    // available at the fentry). Only the *op* is wrong on the request for
+    // passthrough — that one field is taken from the NVMe command at the setup
+    // rawtracepoint below.
+    @cmd_size[$rq] = (uint64)args.req->__data_len;
 }
 
-rawtracepoint:nvme_setup_cmd
+// Single setup probe (formatted tracepoint). The fentry above already applied the
+// dev/comm/pid filter and bridged the request pointer via @fentry_rq[tid]; this probe
+// fires later in the *same* nvme_setup_cmd call (same tid), so it just reads the
+// now-built command's fields natively and keys everything by that request pointer —
+// no duplicate filter. Replaces both the old rawtracepoint opcode read (which could
+// only reach offset 0 of the raw command pointer) and the separate LBA probe.
+tracepoint:nvme:nvme_setup_cmd
 {
     $rq = @fentry_rq[tid];
     if ($rq)
@@ -55,6 +79,35 @@ rawtracepoint:nvme_setup_cmd
         // Active-I/O span: first setup → last completion. Used to derive
         // iops/throughput over the active window (not the whole trace lifetime).
         @io_span_start["ns"] = min(nsecs);
+
+        // op straight from the kernel-decoded NVMe opcode — correct for both normal
+        // block IO and io_uring_cmd passthrough. Size came from req->__data_len at
+        // the fentry (byte-exact for any block size, including passthrough).
+        $opname = @nvme_op[(uint64)args.opcode];
+        @cmd_opname[$rq] = $opname;
+        @cmd_setup[$opname] = count();
+
+        // LBA-space distribution — summary's equivalent of detailed mode's per-IO
+        // sector histogram. SLBA comes from cdw10[0..7] (a copy of the command dwords
+        // in the trace record, little-endian __le64), normalized to 0..99 % of device
+        // capacity so the lhist bounds stay literal constants (a bpftrace requirement)
+        // and the histogram is device-size-independent. Read/write only (others carry
+        // no meaningful data LBA); qid!=0 drops admin commands (different opcode space).
+        // The stats generator rescales the percent buckets to absolute logical-block
+        // offsets using device-info.json.
+        if (@dev_lbas > 0 && args.qid != 0 && (args.opcode == 1 || args.opcode == 2))
+        {
+            $slba = (uint64)args.cdw10[0]
+                  | ((uint64)args.cdw10[1] << 8)
+                  | ((uint64)args.cdw10[2] << 16)
+                  | ((uint64)args.cdw10[3] << 24)
+                  | ((uint64)args.cdw10[4] << 32)
+                  | ((uint64)args.cdw10[5] << 40)
+                  | ((uint64)args.cdw10[6] << 48)
+                  | ((uint64)args.cdw10[7] << 56);
+            @cmd_lba_dist[$opname] = lhist($slba * 100 / @dev_lbas, 0, 100, 1);
+        }
+
         delete(@fentry_rq[tid]);
     }
 }
@@ -62,24 +115,24 @@ rawtracepoint:nvme_setup_cmd
 rawtracepoint:nvme_complete_rq
 {
     $rq = (uint64)arg0;
-    $cmd_op = @cmd_ops[$rq];
 
     $t_ref = @cmd_time[$rq];
     if ($t_ref)
     {
         $now = nsecs;
+        $opname = @cmd_opname[$rq];
         $cmd_size = @cmd_size[$rq];
 
-        @cmd_completed[@nvme_op[$cmd_op]] = count();
+        @cmd_completed[$opname] = count();
 
         $lat_ns = $now - $t_ref;
-        @cmd_latencies[@nvme_op[$cmd_op]] = hist($lat_ns);
-        @cmd_sizes[@nvme_op[$cmd_op]] = hist($cmd_size);
-        @cmd_total_bytes[@nvme_op[$cmd_op]] = sum($cmd_size);
+        @cmd_latencies[$opname] = hist($lat_ns);
+        @cmd_sizes[$opname] = hist($cmd_size);
+        @cmd_total_bytes[$opname] = sum($cmd_size);
         @io_span_end["ns"] = max($now);
 
         delete(@cmd_time[$rq]);
-        delete(@cmd_ops[$rq]);
+        delete(@cmd_opname[$rq]);
         delete(@cmd_size[$rq]);
     }
     else
@@ -117,6 +170,7 @@ END
     print(@cmd_sizes);
     print(@cmd_latencies);
     print(@cmd_inflight);
+    print(@cmd_lba_dist);
 
 
     clear(@cmd_latencies);
@@ -126,7 +180,7 @@ END
     clear(@io_span_end);
 
     clear(@cmd_time);
-    clear(@cmd_ops);
+    clear(@cmd_opname);
     clear(@cmd_size);
 
     clear(@cmd_setup);
@@ -134,6 +188,7 @@ END
     clear(@cmd_untracked);
 
     clear(@cmd_inflight);
+    clear(@cmd_lba_dist);
 
     clear(@fentry_rq);
     clear(@nvme_op);
@@ -141,6 +196,7 @@ END
 
     delete(@dev_filter);
     delete(@comm_filter);
+    delete(@dev_lbas);
     delete(@has_pid);
     clear(@pid_allow);
 }

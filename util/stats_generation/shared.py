@@ -40,6 +40,8 @@ _COUNTER_RE = re.compile(r"^@(\w+)\[([^\]]+)\]:\s+(-?\d+)\s*$")
 _KEYED_HEADER_RE = re.compile(r"^@(\w+)\[([^\]]+)\]:\s*$")
 _UNKEYED_HEADER_RE = re.compile(r"^@(\w+):\s*$")
 _HIST_BUCKET_RE = re.compile(r"^\[(\S+),\s+(\S+)\)\s+(\d+)\s+\|")
+# lhist() renders unit-width buckets (step 1) as "[N]" rather than "[N, N+1)".
+_HIST_SINGLE_RE = re.compile(r"^\[(\S+)\]\s+(\d+)\s+\|")
 _TSERIES_DATA_RE = re.compile(r"^(\d{2}:\d{2}:\d{2})\s+.*[|*]\s*(-?\d+)\s*$")
 
 
@@ -88,11 +90,30 @@ def parse_histograms(path):
 
             bucket = _HIST_BUCKET_RE.match(stripped)
             if bucket and current_map is not None:
-                lo = parse_value_with_suffix(bucket.group(1))
-                hi = parse_value_with_suffix(bucket.group(2))
+                # lhist() prints an open-ended overflow bucket "[N, ...)" for values
+                # at/above its max; its non-numeric upper bound would crash the parse,
+                # so skip it (it is empty for in-range data and carries no signal).
+                try:
+                    lo = parse_value_with_suffix(bucket.group(1))
+                    hi = parse_value_with_suffix(bucket.group(2))
+                except ValueError:
+                    continue
                 count = int(bucket.group(3))
                 data.setdefault(current_map, {}).setdefault(current_key, []).append(
                     {"lo": lo, "hi": hi, "count": count}
+                )
+                continue
+
+            single = _HIST_SINGLE_RE.match(stripped)
+            if single and current_map is not None:
+                # "[N]" is the unit bucket [N, N+1) (lhist with step 1).
+                try:
+                    lo = parse_value_with_suffix(single.group(1))
+                except ValueError:
+                    continue
+                count = int(single.group(2))
+                data.setdefault(current_map, {}).setdefault(current_key, []).append(
+                    {"lo": lo, "hi": lo + 1, "count": count}
                 )
                 continue
 
@@ -377,13 +398,26 @@ def derive_throughput(counters, duration_s, count_map, bytes_map):
     return {"iops": iops, "throughput_mb_s": throughput}
 
 
-def histogram_stats_only(buckets):
-    """Compute stats from histogram buckets without preserving bucket data.
+def histogram_buckets_only(buckets):
+    """Summary-mode distribution: exact bucket data + total count only.
 
-    Input: [{"lo": int, "hi": int, "count": int}, ...]
-    Output: {"count", "min", "max", "mean", "p1", "p5", "p50", "p95", "p99"}
+    bpftrace's hist() produces log2 (power-of-2) buckets. The only value that is
+    *exact* from such buckets is the total count. Every scalar aggregate derived
+    from them is an estimate: the mean is geometric-midpoint weighted (biased for
+    skewed distributions), the percentiles are interpolated within a bucket
+    (accurate only to the enclosing 2x range), and min/max are bracketed to a
+    bucket rather than the true extremes. Summary mode therefore emits the raw
+    buckets (the genuine, exact artifact) plus the count, and omits the estimated
+    aggregates. Detailed mode computes the full accurate set from raw per-event
+    values.
+
+    Input:  [{"lo": int, "hi": int, "count": int}, ...]
+    Output: {"count": int, "buckets": [{"lo", "hi", "count"}, ...]}
     """
-    return histogram_stats({"points": [], "ranges": buckets})
+    return {
+        "count": sum(b["count"] for b in buckets),
+        "buckets": buckets,
+    }
 
 
 def raw_values_to_hist(values):
