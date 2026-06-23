@@ -155,6 +155,7 @@ def generate_stats(parquet_path):
                 "counters": {},
                 "distributions": {},
                 "tseries": {},
+                "access_pattern": {},
             }
         return _entries[key]
 
@@ -296,37 +297,47 @@ def generate_stats(parquet_path):
                     entry["tseries"].setdefault("iops", {})[op] = tseries_stats(iops_points)
         del per_comm_snap
 
-    # --- Scan 4: Access pattern (merged per device, timestamp-ordered) ---
-    # seq/rnd is an inter-command property of the stream the *device* receives, so it is
-    # computed per device merged across all issuers (no comm/mntns filter), in submission
-    # order. The gap test needs issue order, but the parquet is not strictly timestamp-
-    # sorted (multi-CPU ring-buffer batching) and the streaming scan does not preserve row
-    # order, so sort by timestamp_ns after collecting. Scan per (disk, op) with only the
-    # 3 narrow numeric columns and no partition_by, processing ops one at a time, to keep
-    # peak RSS low on large (stress-test) captures.
+    # --- Scan 4: Access pattern (per process, per device, timestamp-ordered) ---
+    # seq/rnd is an inter-command property: does command i+1 start where command i ended?
+    # The relevant question is what each *process* sends to a given *device*, so it is
+    # computed per (comm, mntns_id, disk) — device-scoped (SLBAs are a per-device address
+    # space, never compared across devices) and process-scoped (attribution; co-located
+    # streams from different processes are not conflated into false randomness).
+    # The gap test needs the commands in the order the device received them from the
+    # process, but the parquet is not strictly timestamp-sorted (multi-CPU ring-buffer
+    # batching) and the streaming scan does not preserve row order, so sort by
+    # timestamp_ns after collecting (on the small reduced frame, so streaming stands).
+    # Scan per (entry, op) with only the 3 narrow numeric columns and no partition_by,
+    # processing ops one at a time, to keep peak RSS low on large (stress-test) captures.
     # `sector` is the NVMe SLBA in logical-block units, so the gap/distribution math uses
     # the disk's own lba_size (sector_bytes) and capacity (capacity_lba).
     geom_for = load_device_geometry(parquet_path)
-    per_device: dict = {}
     if has_sector:
         has_ts = "timestamp_ns" in schema
-        disks = {disk for (_c, _m, disk) in _entries.keys()}
-        for disk in disks:
+        cols = (["timestamp_ns"] if has_ts else []) + ["sector", "bytes"]
+        for key in list(_entries.keys()):
+            comm, mntns_id_str, disk = key
             # Skip the null/unresolved disk_name pseudo-key when a real disk_name column
             # exists — it is not a device, and an empty filter would scan every disk.
             if has_disk and not disk:
                 continue
+            cond = (pl.col("comm") == comm)
+            if has_mntns and mntns_id_str:
+                cond = cond & (pl.col("mntns_id") == int(mntns_id_str))
+            if has_disk:
+                cond = cond & (pl.col("disk_name") == disk)
             base = (pl.scan_parquet(parquet_path)
+                      .filter(cond)
                       .filter(pl.col("event") == "setup")
                       .filter(pl.col("sector").is_not_null())
                       .filter(pl.col("sector") != SECTOR_UNSET))
-            if has_disk:
-                base = base.filter(pl.col("disk_name") == disk)
             ops = base.select("op").unique().collect(engine="streaming")["op"].to_list()
+            if not ops:
+                continue
             capacity_lba, sector_bytes = geom_for(disk)
-            cmd_sectors: dict = {}
-            lba_distribution: dict = {}
-            cols = (["timestamp_ns"] if has_ts else []) + ["sector", "bytes"]
+            entry = ensure_entry(key)
+            cmd_sectors = entry["access_pattern"].setdefault("cmd_sectors", {})
+            lba_distribution = entry["access_pattern"].setdefault("lba_distribution", {})
             for op in ops:
                 op_df = (base.filter(pl.col("op") == op)
                              .select(cols)
@@ -347,18 +358,13 @@ def generate_stats(parquet_path):
                         sectors, bytes_list, capacity_lba, sector_bytes=sector_bytes
                     )
                 del op_df
-            if cmd_sectors or lba_distribution:
-                per_device[disk] = {"access_pattern": {
-                    "cmd_sectors": cmd_sectors,
-                    "lba_distribution": lba_distribution,
-                }}
 
     # --- Reshape: bind comm/container labels per disk, nest under per_disk ---
     by_disk: dict = {}
     for (comm, mntns_id_str, disk), entry in _entries.items():
         by_disk.setdefault(disk, {})[(comm, mntns_id_str)] = entry
 
-    result: dict = {"per_comm": {}, "per_container": {}, "per_device": per_device}
+    result: dict = {"per_comm": {}, "per_container": {}}
     for disk, sub_entries in by_disk.items():
         bound = bind_containers(sub_entries, mntns_map, comm_map)
         for bucket in ("per_comm", "per_container"):

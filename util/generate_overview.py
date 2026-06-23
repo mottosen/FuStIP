@@ -46,19 +46,19 @@ def _load(path):
 
 
 def _entities(stats):
-    """Yield (label, disk, node) for each per_comm / per_container entry.
+    """Yield (label, node) for each per_comm / per_container entry.
 
     nvme detailed mode nests per-disk nodes under each label
-    (per_comm[label].per_disk[disk]); expand those to (label@disk, disk, node) so each
-    device is reported separately. Labels without per_disk yield (label, None, node)."""
+    (per_comm[label].per_disk[disk]); expand those to (label@disk, node) so each
+    device is reported separately. Labels without per_disk yield as-is."""
     for bucket in ("per_comm", "per_container"):
         for label, node in (stats.get(bucket) or {}).items():
             per_disk = node.get("per_disk") if isinstance(node, dict) else None
             if per_disk:
                 for disk, disk_node in per_disk.items():
-                    yield f"{label} @ {disk}", disk, disk_node
+                    yield f"{label} @ {disk}", disk_node
             else:
-                yield label, None, node
+                yield label, node
 
 
 def _find_map(counters, suffix):
@@ -69,9 +69,9 @@ def _find_map(counters, suffix):
     return {}
 
 
-def _access_pct(access_pattern, op):
-    """Return (seq_pct, rnd_pct) for an op from an access_pattern dict, or None."""
-    for sect in (access_pattern or {}).values():
+def _access_pct(node, op):
+    """Return (seq_pct, rnd_pct) for an op from a node's access_pattern, or None."""
+    for sect in (node.get("access_pattern") or {}).values():
         ap = sect.get(op)
         if ap:
             return ap.get("sequential_pct"), ap.get("random_pct")
@@ -92,19 +92,12 @@ def _derived(node, op):
 def _io_layer_lines(stats):
     """Lines for a block/nvme/fs layer (counts, bytes, peak IOPS, pattern)."""
     lines = []
-    # nvme detailed keeps access_pattern at top-level per_device[disk] (device-merged
-    # across issuers); other layers keep it per-comm on the node itself.
-    per_device = stats.get("per_device") or {}
-    for label, disk, node in _entities(stats):
+    for label, node in _entities(stats):
         counters = node.get("counters") or {}
         completed = _find_map(counters, "_completed")
         total_bytes = _find_map(counters, "_total_bytes")
         if not completed:
             continue
-        if disk is not None and disk in per_device:
-            access_pattern = per_device[disk].get("access_pattern") or {}
-        else:
-            access_pattern = node.get("access_pattern") or {}
         lines.append(f"  [{label}]")
         for op in sorted(completed):
             cnt = completed[op]
@@ -125,7 +118,7 @@ def _io_layer_lines(stats):
                 parts.append(seg)
             elif peak:
                 parts.append(f"peak {_human_count(peak)} IOPS")
-            ap = _access_pct(access_pattern, op)
+            ap = _access_pct(node, op)
             if ap and ap[1] is not None:
                 parts.append(f"{ap[1]:.0f}% random")
             lines.append(f"    {op:8} {', '.join(parts)}")

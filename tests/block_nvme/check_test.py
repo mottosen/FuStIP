@@ -66,17 +66,14 @@ def parse_detailed_stats(path):
 def parse_access_pattern(path):
     """Extract access_pattern section from detailed-stats.json.
 
-    nvme detailed mode emits access_pattern at top-level per_device[disk] (the seq/rnd
-    pattern is a per-device property, merged across all issuers). Other layers (block)
-    keep it under per-comm/per-container label entries. Merge from both so this works for
-    every layer; in tests there is typically one device/label, so last-write-wins is fine.
+    Access pattern is per (process, device): nvme detailed nests it under
+    per_comm[label].per_disk[disk].access_pattern (block keeps it under the per-comm
+    label entry). Merge across all label/disk entries; in tests there is typically one
+    process and device, so last-write-wins is fine.
     """
     with open(path) as f:
         stats = json.load(f)
     merged = {}
-    for dev in stats.get("per_device", {}).values():
-        for key, val in dev.get("access_pattern", {}).items():
-            merged.setdefault(key, {}).update(val)
     for entry in _iter_label_entries(stats):
         for key, val in entry.get("access_pattern", {}).items():
             merged.setdefault(key, {}).update(val)
