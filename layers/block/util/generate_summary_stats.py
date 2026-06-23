@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from stats_generation.shared import (compute_active_duration,
                                      derive_throughput,
-                                     histogram_stats_only,
+                                     histogram_buckets_only,
                                      parse_counters, parse_histograms,
                                      parse_tseries, tseries_stats)
 
@@ -54,12 +54,15 @@ def generate_stats(input_path):
     throughput = derive_throughput(counters, duration_s, "rq_completed", "rq_total_bytes")
     result["derived"].update(throughput)
 
-    # Distribution stats (aggregate only, no histogram bucket data)
+    # Distributions: raw bpftrace log2 buckets + exact count only. Estimated
+    # aggregates (mean/percentiles/min/max) are omitted in summary mode because
+    # they are not reliably derivable from power-of-2 buckets; detailed mode
+    # computes those accurately from raw per-event values.
     for m in HISTOGRAM_MAPS:
         if m in histograms:
             result["distributions"][m] = {}
             for key, buckets in histograms[m].items():
-                result["distributions"][m][key] = histogram_stats_only(buckets)
+                result["distributions"][m][key] = histogram_buckets_only(buckets)
 
     # Time-series stats
     for m in TSERIES_MAPS:
