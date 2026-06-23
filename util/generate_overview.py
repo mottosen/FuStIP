@@ -46,10 +46,19 @@ def _load(path):
 
 
 def _entities(stats):
-    """Yield (label, node) for each per_comm / per_container entry."""
+    """Yield (label, node) for each per_comm / per_container entry.
+
+    nvme detailed mode nests per-disk nodes under each label
+    (per_comm[label].per_disk[disk]); expand those to (label@disk, node) so each
+    device is reported separately. Labels without per_disk yield as-is."""
     for bucket in ("per_comm", "per_container"):
         for label, node in (stats.get(bucket) or {}).items():
-            yield label, node
+            per_disk = node.get("per_disk") if isinstance(node, dict) else None
+            if per_disk:
+                for disk, disk_node in per_disk.items():
+                    yield f"{label} @ {disk}", disk_node
+            else:
+                yield label, node
 
 
 def _find_map(counters, suffix):

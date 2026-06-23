@@ -34,11 +34,19 @@ def parse_fio_json(path):
 
 
 def _iter_label_entries(stats):
-    """Yield all per-comm and per-container label entries from stats JSON."""
-    for label_entry in stats.get("per_comm", {}).values():
-        yield label_entry
-    for label_entry in stats.get("per_container", {}).values():
-        yield label_entry
+    """Yield all stat entries (counters/access_pattern/...) from the stats JSON.
+
+    nvme detailed mode nests per-disk entries under each label
+    (per_comm[label].per_disk[disk]); descend into those so counts sum across
+    all disks. Labels without per_disk (other layers) are yielded directly.
+    """
+    for bucket in ("per_comm", "per_container"):
+        for label_entry in stats.get(bucket, {}).values():
+            per_disk = label_entry.get("per_disk") if isinstance(label_entry, dict) else None
+            if per_disk:
+                yield from per_disk.values()
+            else:
+                yield label_entry
 
 
 def parse_detailed_stats(path):
