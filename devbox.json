@@ -1,5 +1,6 @@
 {
   "packages": {
+    "docker": {"version": "29.3.0"},
     "python": {"version": "3.14"},
     "python314Packages.pip": {"version": "25.3"},
     "fio": {"version": "3.41"},
