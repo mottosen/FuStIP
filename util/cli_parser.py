@@ -117,9 +117,14 @@ def parse_args(argv=None):
     # container_filter conflict check, so an explicit `mode: summary` alongside a
     # container_filter can be distinguished from an unset mode and rejected.
 
+    # --nvme-direct routes through the io_uring_cmd / NVMe passthrough suite, which
+    # bypasses the block layer and profiles only nvme. Default to nvme alone when
+    # -l is omitted, and reject any other layer if -l is given explicitly.
+    nvme_direct = getattr(args, "nvme_direct", False)
+
     # Flatten comma-separated values from repeated -l flags
     if args.layers is None:
-        args.layers = list(ALL_LAYERS)
+        args.layers = ["nvme"] if nvme_direct else list(ALL_LAYERS)
         return args
 
     raw = []
@@ -142,6 +147,12 @@ def parse_args(argv=None):
                 seen.add(l)
                 unique.append(l)
         args.layers = unique
+
+    if nvme_direct and set(args.layers) != {"nvme"}:
+        parser.error(
+            "--nvme-direct profiles only the nvme layer (passthrough bypasses the "
+            "block layer); pass -l nvme or omit -l"
+        )
 
     return args
 
