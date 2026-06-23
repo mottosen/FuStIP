@@ -4,6 +4,48 @@
 
 #include "event.h"
 
+// SLBA sentinel for commands with no logical block address (flush, or an
+// unclassified opcode). Mirrors SECTOR_UNSET in generate_detailed_stats.py and
+// matches the (u64)-1 the block layer leaves in rq->__sector for passthrough.
+#define SECTOR_UNSET 0xFFFFFFFFFFFFFFFFULL
+
+// NVMe command wire layout (UAPI-stable; the nvme_setup_cmd tracepoint's 2nd arg
+// points at one of these). `struct nvme_command` lives only in nvme_core module
+// BTF, not vmlinux.h, so we mirror just the rw prefix we read: opcode at byte 0,
+// slba (__le64) at byte 40. All NVMe command types share opcode at byte 0.
+struct nvme_cmd_wire {
+  __u8  opcode;
+  __u8  flags;
+  __u16 command_id;
+  __u32 nsid;
+  __u32 cdw2;
+  __u32 cdw3;
+  __u64 metadata;
+  __u64 prp1;
+  __u64 prp2;
+  __u64 slba;
+} __attribute__((packed));
+
+// NVMe NVM-command-set wire opcodes (drivers/nvme: read=0x02, write=0x01, …).
+#define NVME_CMD_FLUSH 0x00
+#define NVME_CMD_WRITE 0x01
+#define NVME_CMD_READ 0x02
+#define NVME_CMD_WRITE_ZEROES 0x08
+#define NVME_CMD_DSM 0x09
+
+// Normalize the NVMe wire opcode into the stable NVME_OP_* enum used downstream.
+// Unmapped opcodes → 0xFF ("unknown"); must NOT fall through to 0 (= read).
+static __always_inline __u8 nvme_opcode_to_op(__u8 opcode) {
+  switch (opcode) {
+  case NVME_CMD_FLUSH:         return NVME_OP_FLUSH;
+  case NVME_CMD_WRITE:         return NVME_OP_WRITE;
+  case NVME_CMD_READ:          return NVME_OP_READ;
+  case NVME_CMD_WRITE_ZEROES:  return NVME_OP_WRITE_ZEROS;
+  case NVME_CMD_DSM:           return NVME_OP_DISCARD;
+  default:                     return 0xFF;
+  }
+}
+
 // ── Per-command metadata stored between setup and complete ──
 struct cmd_data {
   __u8 op;
@@ -91,15 +133,15 @@ struct {
 static __always_inline int handle_nvme_fentry_setup(struct request *req) {
   __u64 rq_key = (__u64)req;
   __u64 tid = bpf_get_current_pid_tgid();
-  __u8 op = BPF_CORE_READ(req, cmd_flags) & 0xFF;
   __u32 bytes = BPF_CORE_READ(req, __data_len);
-  __u64 sector = BPF_CORE_READ(req, __sector);
 
-  // Store metadata for complete probe
+  // op/sector are NOT read from the request here: passthrough (io_uring_cmd)
+  // never populates rq->cmd_flags / rq->__sector. They are filled from the NVMe
+  // command at the nvme_setup_cmd rawtracepoint below. Seed as "unknown"/unset.
   struct cmd_data data = {
-      .op = op,
+      .op = 0xFF,
       .bytes = bytes,
-      .sector = sector,
+      .sector = SECTOR_UNSET,
   };
   struct task_struct *task = (struct task_struct *)bpf_get_current_task();
   data.mntns_id = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
@@ -115,9 +157,11 @@ static __always_inline int handle_nvme_fentry_setup(struct request *req) {
   return 0;
 }
 
-// Called from rawtracepoint:nvme_setup_cmd — records accurate timestamp and
-// emits setup event
-static __always_inline int handle_nvme_rawtp_setup(void) {
+// Called from rawtracepoint:nvme_setup_cmd — records accurate timestamp, reads
+// the real op/SLBA from the NVMe command, and emits the setup event. `cmd` is
+// the tracepoint's 2nd arg (struct nvme_command *), typed void* since that
+// struct is module-BTF-only.
+static __always_inline int handle_nvme_rawtp_setup(void *cmd) {
   __u64 tid = bpf_get_current_pid_tgid();
 
   // Pick up rq pointer from fentry bridge
@@ -136,6 +180,17 @@ static __always_inline int handle_nvme_rawtp_setup(void) {
   struct cmd_data *data = bpf_map_lookup_elem(&cmd_metadata, &rq_key);
   if (!data)
     return 0;
+
+  // op/SLBA come from the actual NVMe command (correct for normal block IO and
+  // io_uring_cmd passthrough alike). slba is __le64 — read natively on the
+  // little-endian host. SLBA only meaningful for read/write.
+  if (cmd) {
+    struct nvme_cmd_wire c = {};
+    bpf_probe_read_kernel(&c, sizeof(c), cmd);
+    __u8 op = nvme_opcode_to_op(c.opcode);
+    data->op = op;
+    data->sector = (op == NVME_OP_READ || op == NVME_OP_WRITE) ? c.slba : SECTOR_UNSET;
+  }
 
   // Atomically increment inflight counter (outside ringbuf reserve so
   // counter stays accurate even when ring buffer drops events)
@@ -191,6 +246,12 @@ static __always_inline int handle_nvme_complete(struct request *req) {
     struct gendisk *disk = BPF_CORE_READ(req, q, disk);
     if (disk)
       bpf_probe_read_kernel_str(&uk.disk_name, sizeof(uk.disk_name), &disk->disk_name);
+    // Fall back to "?" when the gendisk/name is unreadable, so the untracked map
+    // has no blank-keyed entry (e.g. a passthrough completion with no gendisk).
+    if (uk.disk_name[0] == '\0') {
+      uk.disk_name[0] = '?';
+      uk.disk_name[1] = '\0';
+    }
     __u64 zero = 0;
     bpf_map_update_elem(&untracked_completes, &uk, &zero, BPF_NOEXIST);
     __u64 *uc = bpf_map_lookup_elem(&untracked_completes, &uk);

@@ -34,6 +34,11 @@ from container.labeling import bind_containers, load_comm_label_map, load_mntns_
 
 LAYER_PREFIX = "nvme"
 
+# rq->__sector for commands with no block-layer LBA (NVMe passthrough via
+# io_uring_cmd) reads back as (u64)-1. Treat it as "unset" so it never feeds
+# the access-pattern / LBA-distribution analysis as a real sector.
+SECTOR_UNSET = (1 << 64) - 1
+
 
 def _sec_to_time(s):
     h, m, ss = s // 3600, (s % 3600) // 60, s % 60
@@ -73,63 +78,63 @@ def _row_to_stats(row):
     }
 
 
-def _comm_key(row, has_mntns):
-    """Extract (comm, mntns_id_str) key from a row dict."""
+def _entry_key(row, has_mntns, has_disk):
+    """Extract (comm, mntns_id_str, disk) key from a row dict."""
     mntns_id = row.get("mntns_id") if has_mntns else None
-    return row["comm"], (str(mntns_id) if mntns_id is not None else "")
+    mntns_str = str(mntns_id) if mntns_id is not None else ""
+    disk = (row.get("disk_name") or "") if has_disk else ""
+    return row["comm"], mntns_str, disk
 
 
-def load_device_sectors(parquet_path, schema):
-    """Total device sector count (512-byte units) for LBA-distribution normalisation.
+def load_device_geometry(parquet_path):
+    """Return geom_for(disk) -> (capacity_lba | None, sector_bytes).
 
-    Prefers the capture-time `device-info.json` (written by collect_device_info.py
-    next to the Parquet), so the value is correct even when analysis runs off the
-    capture host. Falls back to the live `/sys/block/<dev>/size` lookup, which is
-    only valid on the capture machine. Returns None if neither is available.
+    `capacity_lba` (device size in logical blocks) normalises the LBA distribution;
+    `sector_bytes` (logical-block size) converts transfer bytes to logical blocks for
+    the access-pattern gap test. Detailed-mode `sector` is now the NVMe SLBA in
+    logical-block units, so both come from the device's own geometry.
+
+    Prefers the capture-time `device-info.json` (offline-safe: `nsze_lbas` +
+    `lba_size_bytes`), falling back to live `/sys/block/<dev>/size` (512-byte sectors,
+    valid only on the capture host). Multi-device safe — geometry is resolved per disk.
     """
-    # Device name from the trace (most-common disk_name at setup), if present.
-    dev = None
-    if "disk_name" in schema:
-        result = (pl.scan_parquet(parquet_path)
-                  .filter(pl.col("event") == "setup")
-                  .filter(pl.col("disk_name").is_not_null())
-                  .filter(pl.col("disk_name") != "")
-                  .select("disk_name")
-                  .group_by("disk_name")
-                  .agg(pl.len().alias("count"))
-                  .sort("count", descending=True)
-                  .limit(1)
-                  .collect(engine="streaming"))
-        if len(result) > 0:
-            dev = result["disk_name"][0] or None
-
-    # 1) Capture-time device-info.json (offline-safe), keyed by device name.
     info_path = Path(parquet_path).parent / "device-info.json"
+    info = {}
     if info_path.exists():
         try:
             info = json.loads(info_path.read_text())
-            entry = info.get(dev) if dev else None
-            if entry is None and len(info) == 1:
-                entry = next(iter(info.values()))
-            sectors = entry.get("sectors_512b") if isinstance(entry, dict) else None
-            if sectors:
-                return int(sectors)
-        except (OSError, ValueError, TypeError):
-            pass
+        except (OSError, ValueError):
+            info = {}
 
-    # 2) Fallback: live sysfs (valid only on the capture host).
-    if dev:
-        size_path = Path(f"/sys/block/{dev}/size")
-        if size_path.exists():
-            try:
-                return int(size_path.read_text().strip())
-            except ValueError:
-                pass
-    return None
+    def geom_for(disk):
+        entry = info.get(disk) if disk else None
+        if entry is None and len(info) == 1:
+            entry = next(iter(info.values()))
+        if isinstance(entry, dict):
+            cap = int(entry.get("nsze_lbas") or entry.get("sectors_512b") or 0) or None
+            sector_bytes = int(entry.get("lba_size_bytes") or 512)
+            if cap:
+                return cap, sector_bytes
+        if disk:
+            size_path = Path(f"/sys/block/{disk}/size")
+            if size_path.exists():
+                try:
+                    return int(size_path.read_text().strip()), 512
+                except ValueError:
+                    pass
+        return None, 512
+
+    return geom_for
 
 
 def generate_stats(parquet_path):
-    """Parse an NVMe layer detailed Parquet and compute stats."""
+    """Parse an NVMe layer detailed Parquet and compute per-disk stats.
+
+    Events are grouped by (comm, mntns_id, disk_name) throughout; at the end the
+    comm/container label binding runs once per disk and results are nested as
+    per_comm[label].per_disk[disk] (and per_container[label].per_disk[disk]).
+    The BPF program emits disk_name per event, so multi-device is handled here.
+    """
 
     results_dir = parquet_path.parent.parent
     mntns_map = load_mntns_label_map(results_dir)
@@ -137,13 +142,14 @@ def generate_stats(parquet_path):
     schema = pl.scan_parquet(parquet_path).collect_schema()
     has_sector = "sector" in schema
     has_mntns = "mntns_id" in schema
-    id_keys = ["comm", "mntns_id"] if has_mntns else ["comm"]
+    has_disk = "disk_name" in schema
+    base_keys = ["comm"] + (["mntns_id"] if has_mntns else [])
+    group_keys = base_keys + (["disk_name"] if has_disk else [])
 
-    # Entries keyed by (comm, mntns_id_str) — bind_containers maps to labels at the end.
+    # Entries keyed by (comm, mntns_id_str, disk); reshaped per-disk at the end.
     _entries: dict = {}
 
-    def ensure_comm_entry(comm, mntns_id_str):
-        key = (comm, mntns_id_str)
+    def ensure_entry(key):
         if key not in _entries:
             _entries[key] = {
                 "counters": {},
@@ -154,13 +160,13 @@ def generate_stats(parquet_path):
         return _entries[key]
 
     # --- Scan 1: Counters, duration, event counts ---
-    # Group by raw (comm, mntns_id) to keep streaming engine effective.
+    # Group by raw (comm, mntns_id, disk) to keep streaming engine effective.
     # ts_min/ts_max and event_counts derived from this result (no separate scan).
     # Explicit select avoids loading 'rq' (~5 GB) and other unreferenced columns.
     comm_agg_raw = (pl.scan_parquet(parquet_path)
-                      .select([*id_keys, "event", "op", "bytes", "timestamp_ns"])
+                      .select([*group_keys, "event", "op", "bytes", "timestamp_ns"])
                       .filter(pl.col("event").is_in(["setup", "complete"]))
-                      .group_by(*id_keys, "event", "op")
+                      .group_by(*group_keys, "event", "op")
                       .agg(
                           pl.len().alias("count"),
                           pl.col("bytes").sum().alias("total_bytes"),
@@ -175,10 +181,10 @@ def generate_stats(parquet_path):
     event_agg = comm_agg_raw.group_by("event").agg(pl.col("count").sum())
     event_counts = dict(zip(event_agg["event"].to_list(), event_agg["count"].to_list()))
 
-    for part in comm_agg_raw.partition_by(id_keys, maintain_order=False):
+    for part in comm_agg_raw.partition_by(group_keys, maintain_order=False):
         row0 = part.row(0, named=True)
-        comm, mntns_id_str = _comm_key(row0, has_mntns)
-        entry = ensure_comm_entry(comm, mntns_id_str)
+        key = _entry_key(row0, has_mntns, has_disk)
+        entry = ensure_entry(key)
         comm_counters = {}
 
         complete_rows = part.filter(pl.col("event") == "complete")
@@ -208,7 +214,7 @@ def generate_stats(parquet_path):
 
     del comm_agg_raw
 
-    # --- Scan 2: Distributions (per comm, per op) ---
+    # --- Scan 2: Distributions (per entry, per op) ---
     # Process one op at a time: quantile on ~60M rows uses ~11 GB RSS.
     # Per-op scans reuse allocator memory (~12 GB total vs ~22 GB simultaneous).
     ops = (pl.scan_parquet(parquet_path)
@@ -219,43 +225,43 @@ def generate_stats(parquet_path):
 
     for op in ops:
         raw_lat_op = (pl.scan_parquet(parquet_path)
-                        .select([*id_keys, "event", "op", "latency_ns"])
+                        .select([*group_keys, "event", "op", "latency_ns"])
                         .filter(pl.col("event") == "complete")
                         .filter(pl.col("op") == op)
                         .filter(pl.col("latency_ns").is_not_null())
-                        .group_by(*id_keys)
+                        .group_by(*group_keys)
                         .agg(_series_stats_exprs("latency_ns"))
                         .collect(engine="streaming"))
         for row in raw_lat_op.iter_rows(named=True):
-            comm, mntns_id_str = _comm_key(row, has_mntns)
-            ensure_comm_entry(comm, mntns_id_str)["distributions"].setdefault("cmd_latencies", {})[op] = _row_to_stats(row)
+            key = _entry_key(row, has_mntns, has_disk)
+            ensure_entry(key)["distributions"].setdefault("cmd_latencies", {})[op] = _row_to_stats(row)
         del raw_lat_op
 
     for op in ops:
         raw_size_op = (pl.scan_parquet(parquet_path)
-                         .select([*id_keys, "event", "op", "bytes"])
+                         .select([*group_keys, "event", "op", "bytes"])
                          .filter(pl.col("event") == "complete")
                          .filter(pl.col("op") == op)
-                         .group_by(*id_keys)
+                         .group_by(*group_keys)
                          .agg(_series_stats_exprs("bytes"))
                          .collect(engine="streaming"))
         for row in raw_size_op.iter_rows(named=True):
-            comm, mntns_id_str = _comm_key(row, has_mntns)
-            ensure_comm_entry(comm, mntns_id_str)["distributions"].setdefault("cmd_sizes", {})[op] = _row_to_stats(row)
+            key = _entry_key(row, has_mntns, has_disk)
+            ensure_entry(key)["distributions"].setdefault("cmd_sizes", {})[op] = _row_to_stats(row)
         del raw_size_op
 
-    # --- Scan 3: Inflight time-series (per comm) ---
+    # --- Scan 3: Inflight time-series (per entry) ---
     # No add_label_column in the scan — explicit select for projection pushdown.
-    # tseries computed per comm; bind_containers keeps dominant comm's for container labels.
+    # tseries computed per entry; bind_containers keeps dominant comm's per disk.
     if duration_s > 0:
         window_ns = 1_000_000_000
         per_comm_snap = (pl.scan_parquet(parquet_path)
-                           .select([*id_keys, "event", "op", "timestamp_ns", "inflight"])
+                           .select([*group_keys, "event", "op", "timestamp_ns", "inflight"])
                            .filter(pl.col("event").is_in(["setup", "complete"]))
                            .with_columns(
                                ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
                            )
-                           .group_by(*id_keys, "op", "sec")
+                           .group_by(*group_keys, "op", "sec")
                            .agg(
                                pl.col("inflight").last(),
                                pl.when(pl.col("event") == "complete")
@@ -264,10 +270,10 @@ def generate_stats(parquet_path):
                            .collect(engine="streaming"))
 
         total_secs = math.ceil(duration_s)
-        for part in per_comm_snap.partition_by(id_keys, maintain_order=False):
+        for part in per_comm_snap.partition_by(group_keys, maintain_order=False):
             row0 = part.row(0, named=True)
-            comm, mntns_id_str = _comm_key(row0, has_mntns)
-            entry = ensure_comm_entry(comm, mntns_id_str)
+            key = _entry_key(row0, has_mntns, has_disk)
+            entry = ensure_entry(key)
             for op_part in part.partition_by("op", maintain_order=False):
                 op = op_part["op"][0]
                 points = [
@@ -291,26 +297,32 @@ def generate_stats(parquet_path):
                     entry["tseries"].setdefault("iops", {})[op] = tseries_stats(iops_points)
         del per_comm_snap
 
-    # --- Scan 4: Access pattern (per comm) ---
-    # Scan per-comm to avoid partition_by() on a 100M+ row DataFrame, which creates
+    # --- Scan 4: Access pattern (per entry) ---
+    # Scan per-entry to avoid partition_by() on a 100M+ row DataFrame, which creates
     # full copies of all partitions simultaneously and spikes RSS to 3× the frame size.
-    device_sectors = load_device_sectors(parquet_path, schema)
+    # `sector` is the NVMe SLBA in logical-block units, so the gap/distribution math
+    # uses the disk's own lba_size (sector_bytes) and capacity (capacity_lba).
+    geom_for = load_device_geometry(parquet_path)
     if has_sector:
-        for (comm, mntns_id_str) in list(_entries.keys()):
+        for key in list(_entries.keys()):
+            comm, mntns_id_str, disk = key
+            cond = (pl.col("comm") == comm)
             if has_mntns and mntns_id_str:
-                comm_filter = (pl.col("comm") == comm) & (pl.col("mntns_id") == int(mntns_id_str))
-            else:
-                comm_filter = (pl.col("comm") == comm)
+                cond = cond & (pl.col("mntns_id") == int(mntns_id_str))
+            if has_disk and disk:
+                cond = cond & (pl.col("disk_name") == disk)
             setup_df = (pl.scan_parquet(parquet_path)
-                          .filter(comm_filter)
+                          .filter(cond)
                           .filter(pl.col("event") == "setup")
                           .filter(pl.col("sector").is_not_null())
+                          .filter(pl.col("sector") != SECTOR_UNSET)
                           .select(["op", "sector", "bytes"])
                           .collect(engine="streaming"))
             if len(setup_df) == 0:
                 del setup_df
                 continue
-            entry = ensure_comm_entry(comm, mntns_id_str)
+            capacity_lba, sector_bytes = geom_for(disk)
+            entry = ensure_entry(key)
             entry["access_pattern"].setdefault("cmd_sectors", {})
             entry["access_pattern"].setdefault("lba_distribution", {})
             for op_part in setup_df.partition_by("op", maintain_order=False):
@@ -319,15 +331,26 @@ def generate_stats(parquet_path):
                 bytes_list = op_part["bytes"].cast(pl.Int64).to_numpy()
                 if len(sectors) >= 2:
                     entry["access_pattern"]["cmd_sectors"][op] = compute_access_pattern(
-                        sectors, bytes_list
+                        sectors, bytes_list, sector_bytes=sector_bytes
                     )
                 if len(sectors) >= 1:
                     entry["access_pattern"]["lba_distribution"][op] = compute_lba_distribution(
-                        sectors, bytes_list, device_sectors
+                        sectors, bytes_list, capacity_lba, sector_bytes=sector_bytes
                     )
             del setup_df
 
-    result = bind_containers(_entries, mntns_map, comm_map)
+    # --- Reshape: bind comm/container labels per disk, nest under per_disk ---
+    by_disk: dict = {}
+    for (comm, mntns_id_str, disk), entry in _entries.items():
+        by_disk.setdefault(disk, {})[(comm, mntns_id_str)] = entry
+
+    result: dict = {"per_comm": {}, "per_container": {}}
+    for disk, sub_entries in by_disk.items():
+        bound = bind_containers(sub_entries, mntns_map, comm_map)
+        for bucket in ("per_comm", "per_container"):
+            for label, entry in bound.get(bucket, {}).items():
+                result[bucket].setdefault(label, {}).setdefault("per_disk", {})[disk] = entry
+
     result["derived"] = {"duration_s": round(duration_s, 2)}
     return result, event_counts
 

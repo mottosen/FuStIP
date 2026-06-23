@@ -22,6 +22,11 @@ WINDOW_NS = 1_000_000_000
 N_HEATMAP_LBA_BINS = 256
 N_HEATMAP_TIME_BINS = 256
 
+# SLBA sentinel for commands with no logical block address (flush, or an
+# unclassified opcode). The BPF program emits (u64)-1 for these; exclude them
+# from LBA-space plots so they don't blow out the axis range.
+SECTOR_UNSET = (1 << 64) - 1
+
 
 def load_device_sectors(parquet_path, schema):
     """Total device sector count (512-byte units) for LBA-distribution normalisation.
@@ -141,7 +146,9 @@ def _build_row(label, parquet_path, comm_filter, ts_min, device_sectors=None,
         plot_inflight_from_column(ax, df, "op", t, inflight_col="iops", title="IOPS", ylabel="IOPS")
 
     def gap_fn(ax, t=types):
-        df = _scan(["op", "sector", "bytes", "timestamp_ns"], event_filter="setup").collect(engine="streaming")
+        df = (_scan(["op", "sector", "bytes", "timestamp_ns"], event_filter="setup")
+              .filter((pl.col("sector").is_not_null()) & (pl.col("sector") != SECTOR_UNSET))
+              .collect(engine="streaming"))
         plot_gap_cdf(ax, df, "op", "sector", "bytes", t)
 
     # LBA range — use caller-supplied global bounds when available (avoids a redundant
@@ -153,7 +160,7 @@ def _build_row(label, parquet_path, comm_filter, ts_min, device_sectors=None,
         _lba_max = lba_max
     else:
         _lba_df = (_scan(["sector", "bytes"], event_filter="setup")
-                   .filter(pl.col("sector").is_not_null())
+                   .filter((pl.col("sector").is_not_null()) & (pl.col("sector") != SECTOR_UNSET))
                    .select([
                        pl.col("sector").min().alias("lba_observed_min"),
                        (pl.col("sector") + pl.col("bytes") // 512).max().alias("lba_observed_max"),
@@ -171,7 +178,7 @@ def _build_row(label, parquet_path, comm_filter, ts_min, device_sectors=None,
     _local_lba_max = _lba_max
     if _has_lba:
         _local_bounds_df = (_scan(["sector"], event_filter="setup")
-                            .filter(pl.col("sector").is_not_null())
+                            .filter((pl.col("sector").is_not_null()) & (pl.col("sector") != SECTOR_UNSET))
                             .select([
                                 pl.col("sector").quantile(0.01).alias("lba_p1"),
                                 pl.col("sector").quantile(0.99).alias("lba_p99"),
@@ -190,7 +197,7 @@ def _build_row(label, parquet_path, comm_filter, ts_min, device_sectors=None,
             return
         n_bins = 512
         density_df = (_scan(["op", "sector"], event_filter="setup")
-                      .filter(pl.col("sector").is_not_null())
+                      .filter((pl.col("sector").is_not_null()) & (pl.col("sector") != SECTOR_UNSET))
                       .with_columns(
                           ((pl.col("sector") - lba_min) * n_bins // lba_range)
                           .clip(0, n_bins - 1).cast(pl.Int32).alias("lba_bin")
@@ -210,7 +217,7 @@ def _build_row(label, parquet_path, comm_filter, ts_min, device_sectors=None,
             return
         n_bins = 512
         density_df = (_scan(["op", "sector"], event_filter="setup")
-                      .filter(pl.col("sector").is_not_null())
+                      .filter((pl.col("sector").is_not_null()) & (pl.col("sector") != SECTOR_UNSET))
                       .with_columns(
                           ((pl.col("sector") - lba_min) * n_bins // lba_range)
                           .clip(0, n_bins - 1).cast(pl.Int32).alias("lba_bin")
@@ -235,7 +242,7 @@ def _build_row(label, parquet_path, comm_filter, ts_min, device_sectors=None,
             duration_s = (te - ts) / 1e9
             heatmap_df = (_scan(["op", "sector", "timestamp_ns"], event_filter="setup")
                           .filter(pl.col("op") == op)
-                          .filter(pl.col("sector").is_not_null())
+                          .filter((pl.col("sector").is_not_null()) & (pl.col("sector") != SECTOR_UNSET))
                           .with_columns([
                               ((pl.col("sector") - lba_min) * N_HEATMAP_LBA_BINS // lba_range)
                               .clip(0, N_HEATMAP_LBA_BINS - 1).cast(pl.Int32).alias("lba_bin"),
@@ -313,7 +320,7 @@ def main():
 
         lba_bounds_df = (pl.scan_parquet(parquet_path)
                          .filter(pl.col("event") == "setup")
-                         .filter(pl.col("sector").is_not_null())
+                         .filter((pl.col("sector").is_not_null()) & (pl.col("sector") != SECTOR_UNSET))
                          .select([
                              pl.col("sector").min().alias("lba_min"),
                              (pl.col("sector") + pl.col("bytes") // 512).max().alias("lba_observed_max"),
@@ -337,7 +344,7 @@ def main():
             b = (pl.scan_parquet(parquet_path)
                  .filter(cf)
                  .filter(pl.col("event") == "setup")
-                 .filter(pl.col("sector").is_not_null())
+                 .filter((pl.col("sector").is_not_null()) & (pl.col("sector") != SECTOR_UNSET))
                  .select([pl.col("sector").quantile(0.01).alias("p1"),
                           pl.col("sector").quantile(0.99).alias("p99")])
                  .collect(engine="streaming"))
@@ -358,7 +365,7 @@ def main():
                   .filter(cf)
                   .filter(pl.col("event") == "setup")
                   .filter(pl.col("op") == op)
-                  .filter(pl.col("sector").is_not_null())
+                  .filter((pl.col("sector").is_not_null()) & (pl.col("sector") != SECTOR_UNSET))
                   .with_columns([
                       ((pl.col("sector") - loc_min) * N_HEATMAP_LBA_BINS // loc_range)
                       .clip(0, N_HEATMAP_LBA_BINS - 1).cast(pl.Int32).alias("lba_bin"),

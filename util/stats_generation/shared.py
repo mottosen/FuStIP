@@ -587,12 +587,16 @@ def tseries_with_points(points):
 # ── Access pattern analysis ──
 
 
-def compute_access_pattern(sectors, bytes_list):
+def compute_access_pattern(sectors, bytes_list, sector_bytes=512):
     """Compute sequential/random access pattern from sector addresses.
 
     For consecutive IOs (already sorted by timestamp):
-      gap = abs(sector[i+1] - (sector[i] + bytes[i] // 512))
+      gap = abs(sector[i+1] - (sector[i] + bytes[i] // sector_bytes))
       gap == 0 → sequential, gap > 0 → random
+
+    `sector_bytes` is the unit of the sector addresses: 512 for block-layer
+    sectors (default), or the device logical-block size when `sectors` are NVMe
+    SLBAs in logical-block units (nvme detailed mode).
 
     Accepts lists or numpy arrays.
 
@@ -606,7 +610,7 @@ def compute_access_pattern(sectors, bytes_list):
         return {"total_ios": n, "sequential_count": 0, "random_count": 0,
                 "sequential_pct": 0, "random_pct": 0}
 
-    expected_next = s[:-1] + b[:-1] // 512
+    expected_next = s[:-1] + b[:-1] // sector_bytes
     gaps = np.abs(s[1:] - expected_next)
     seq_count = int((gaps == 0).sum())
     total_gaps = len(gaps)
@@ -621,12 +625,17 @@ def compute_access_pattern(sectors, bytes_list):
     }
 
 
-def compute_lba_distribution(sectors, bytes_list, device_sectors=None, n_bins=512):
+def compute_lba_distribution(sectors, bytes_list, device_sectors=None, n_bins=512,
+                             sector_bytes=512):
     """Compute LBA space distribution histogram.
 
     For each IO, the start LBA (sector) is binned into one of n_bins buckets
     spanning [lba_min, lba_max).  lba_max is the total device size in sectors
     when device_sectors is provided, otherwise the observed maximum end-LBA.
+
+    `sector_bytes` is the unit of the sector addresses (and of device_sectors):
+    512 for block-layer sectors (default), or the device logical-block size when
+    `sectors` are NVMe SLBAs in logical-block units (nvme detailed mode).
 
     Accepts lists or numpy arrays.
 
@@ -640,7 +649,7 @@ def compute_lba_distribution(sectors, bytes_list, device_sectors=None, n_bins=51
         return {"lba_min": 0, "lba_max": device_sectors or 0,
                 "device_sectors": device_sectors, "n_bins": n_bins, "bins": []}
     lba_min = int(s.min())
-    lba_observed_max = int((s + b // 512).max())
+    lba_observed_max = int((s + b // sector_bytes).max())
     lba_range = max(lba_observed_max - lba_min, 1)
 
     bin_idx = np.clip((s - lba_min) * n_bins // lba_range, 0, n_bins - 1).astype(np.int64)
