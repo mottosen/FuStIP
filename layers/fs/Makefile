@@ -2,10 +2,12 @@ ifdef DEBUG
     Q =
     ERR_REDIRECT =
     OUT_REDIRECT =
+    VERBOSE_FLAG = -v
 else
     Q = @
     ERR_REDIRECT = 2>/dev/null
     OUT_REDIRECT = 1>/dev/null
+    VERBOSE_FLAG =
     MAKEFLAGS += --no-print-directory
 endif
 
@@ -68,6 +70,7 @@ ifeq ($(MODE),detailed)
 		$(if $(COMM_FILTER),-p $(COMM_FILTER)) \
 		$(if $(PID_FILTER),-P $(PID_FILTER)) \
 		$(if $(CONTAINER_FILTER),-c $(CONTAINER_FILTER)) \
+		$(VERBOSE_FLAG) \
 		$(ERR_REDIRECT) 1>&2 & echo $$! > "$(PIDS_DIR)/detailed.pid"
 
 	$(Q)echo -e "Detailed collection is running!\n"

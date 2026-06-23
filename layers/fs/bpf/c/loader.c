@@ -269,8 +269,9 @@ int main(int argc, char **argv)
 	int container_count = 0;
 	int container_resolved[MAX_CONTAINER_FILTERS] = {};
 	int opt;
+	int verbose = 0;
 
-	while ((opt = getopt(argc, argv, "o:p:P:c:")) != -1) {
+	while ((opt = getopt(argc, argv, "o:p:P:c:v")) != -1) {
 		switch (opt) {
 		case 'o':
 			output_path = optarg;
@@ -283,6 +284,9 @@ int main(int argc, char **argv)
 			break;
 		case 'c':
 			container_filter = optarg;
+			break;
+		case 'v':
+			verbose = 1;
 			break;
 		default:
 			usage(argv[0]);
@@ -346,6 +350,15 @@ int main(int argc, char **argv)
 		fclose(output);
 		standalone_bpf__destroy(skel);
 		return 1;
+	}
+
+	// Past setup: silence the loader's informational runtime logs (tracing-started
+	// banner, container resolution, stop/counters) so they don't reach the terminal
+	// in normal runs. Done by reopening our own stderr — which a backgrounded sudo
+	// can't reconnect to the tty. The Makefile passes -v only in DEBUG mode; setup
+	// and attach errors above still surface.
+	if (!verbose && freopen("/dev/null", "w", stderr) == NULL) {
+		// best-effort: if the redirect fails, informational logs may still appear
 	}
 
 	fprintf(stderr, "FS layer detailed tracing started (container: %s, comm: %s, pid: %s)...\n",
