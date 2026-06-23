@@ -77,10 +77,25 @@ ifeq ($(MODE),detailed)
 else
 	$(Q)echo -e "\nStarting bpftrace collection.."
 
+# Remove any stale output first so the readiness poll below can't match a marker
+# left by a previous run (bpftrace also truncates on open, but this closes the race).
+	$(Q)sudo rm -f "$(RESULTS_DIR)/block/trace.out" $(ERR_REDIRECT) || true
+
 	$(Q)sudo $(BPFTRACE) ./bt/trace.bt "$(if $(DEV_FILTER),$(DEV_FILTER),_)" "$(if $(COMM_FILTER),$(COMM_FILTER),_)" $$(echo '$(PID_FILTER)' | tr ',' ' ') \
 		--no-warnings \
 		-o "$(RESULTS_DIR)/block/trace.out" \
 		$(ERR_REDIRECT) 1>&2 & echo $$! > "$(PIDS_DIR)/trace.pid"
+
+# Block until bpftrace has attached every probe: its BEGIN block prints the marker
+# below to trace.out only after attach completes. Waiting for it (instead of a blind
+# sleep in the caller) prevents losing the head of the workload to slow/variable probe
+# attach. Bail out if bpftrace dies first, or after a 10s timeout.
+	$(Q)pid=$$(cat "$(PIDS_DIR)/trace.pid"); i=0; \
+		until sudo grep -q "bpftrace - Block Layer" "$(RESULTS_DIR)/block/trace.out" 2>/dev/null; do \
+			if [ ! -d "/proc/$$pid" ]; then echo "bpftrace exited before becoming ready" >&2; break; fi; \
+			i=$$((i+1)); if [ $$i -ge 100 ]; then echo "timed out waiting for bpftrace attach" >&2; break; fi; \
+			sleep 0.1; \
+		done
 
 	$(Q)echo -e "bpftrace collection is running!\n"
 endif
