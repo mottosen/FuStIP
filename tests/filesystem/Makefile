@@ -27,6 +27,12 @@ SYSSTAT_DIR = ../../layers/sysstat
 FIO_OUT = $(RESULTS_DIR)/fio/fs-fio_out.json
 FIO_COMPOSE ?= $(ROOT_DIR)/util/container/fio-test/fio-test.yml
 
+# Docker Compose command, inferred from the environment (provided by devbox):
+# prefer the v2 plugin (`docker compose`), fall back to the standalone binary
+# (`docker-compose`). With the wrong/absent one, `docker` parses the `-f` as a
+# root flag → "unknown shorthand flag: 'f'" / exit 125.
+DOCKER_COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compose" || echo "docker-compose")
+
 VAL_JOBS = val_seqread val_seqwrite val_randread val_randwrite val_randrw
 WORK_JOBS = work_index_search work_bulk_insert work_compaction work_query_insert work_scan work_high_qd
 STRESS_JOBS = stress_2m stress_5m stress_10m
@@ -87,7 +93,7 @@ $(1): ensure-sudo
 	$(Q)mkdir -p $(RESULTS_DIR)/fio
 ifdef CONTAINER_FILTER
 	$(Q)FIO_DIR=$(dir $(FIO_FILE)) TEST_DIR=$(MAKEFILE_DIR) RESULTS_DIR=$(RESULTS_DIR) \
-		docker compose -f $(FIO_COMPOSE) run --rm --build --name $(CONTAINER_FILTER) \
+		$(DOCKER_COMPOSE) -f $(FIO_COMPOSE) run --rm --build --name $(CONTAINER_FILTER) \
 		fio-test ./jobs.fio \
 		--filename=$(FIO_FILE) --output-format=json \
 		--output=$(FIO_OUT) --section=$(1) \
