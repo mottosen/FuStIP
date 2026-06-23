@@ -247,7 +247,9 @@ It holds one sub-directory per profiled layer plus a top-level overview. The
   bytes), `derived` IOPS/throughput (total ÷ active-I/O window), latency/size
   distributions, inflight + IOPS time-series, and access pattern (sequential vs
   random). `fs` keys by syscall (`read`/`write`/`pread64`/`pwrite64`); block/nvme by
-  request op. When filtered by device, `nvme` additionally captures
+  request op. In _detailed_ mode `nvme` nests these per device under each label
+  (`per_comm[label].per_disk[<dev>]`), so multiple devices are reported separately.
+  When filtered by device, `nvme` additionally captures
   `device-info.json` — a fingerprint of the target device(s) (model, serial,
   firmware, LBA/sector size, capacity, sector count, MDTS) gathered at capture
   time via `nvme-cli` + sysfs.
