@@ -155,7 +155,6 @@ def generate_stats(parquet_path):
                 "counters": {},
                 "distributions": {},
                 "tseries": {},
-                "access_pattern": {},
             }
         return _entries[key]
 
@@ -297,54 +296,69 @@ def generate_stats(parquet_path):
                     entry["tseries"].setdefault("iops", {})[op] = tseries_stats(iops_points)
         del per_comm_snap
 
-    # --- Scan 4: Access pattern (per entry) ---
-    # Scan per-entry to avoid partition_by() on a 100M+ row DataFrame, which creates
-    # full copies of all partitions simultaneously and spikes RSS to 3× the frame size.
-    # `sector` is the NVMe SLBA in logical-block units, so the gap/distribution math
-    # uses the disk's own lba_size (sector_bytes) and capacity (capacity_lba).
+    # --- Scan 4: Access pattern (merged per device, timestamp-ordered) ---
+    # seq/rnd is an inter-command property of the stream the *device* receives, so it is
+    # computed per device merged across all issuers (no comm/mntns filter), in submission
+    # order. The gap test needs issue order, but the parquet is not strictly timestamp-
+    # sorted (multi-CPU ring-buffer batching) and the streaming scan does not preserve row
+    # order, so sort by timestamp_ns after collecting. Scan per (disk, op) with only the
+    # 3 narrow numeric columns and no partition_by, processing ops one at a time, to keep
+    # peak RSS low on large (stress-test) captures.
+    # `sector` is the NVMe SLBA in logical-block units, so the gap/distribution math uses
+    # the disk's own lba_size (sector_bytes) and capacity (capacity_lba).
     geom_for = load_device_geometry(parquet_path)
+    per_device: dict = {}
     if has_sector:
-        for key in list(_entries.keys()):
-            comm, mntns_id_str, disk = key
-            cond = (pl.col("comm") == comm)
-            if has_mntns and mntns_id_str:
-                cond = cond & (pl.col("mntns_id") == int(mntns_id_str))
-            if has_disk and disk:
-                cond = cond & (pl.col("disk_name") == disk)
-            setup_df = (pl.scan_parquet(parquet_path)
-                          .filter(cond)
-                          .filter(pl.col("event") == "setup")
-                          .filter(pl.col("sector").is_not_null())
-                          .filter(pl.col("sector") != SECTOR_UNSET)
-                          .select(["op", "sector", "bytes"])
-                          .collect(engine="streaming"))
-            if len(setup_df) == 0:
-                del setup_df
+        has_ts = "timestamp_ns" in schema
+        disks = {disk for (_c, _m, disk) in _entries.keys()}
+        for disk in disks:
+            # Skip the null/unresolved disk_name pseudo-key when a real disk_name column
+            # exists — it is not a device, and an empty filter would scan every disk.
+            if has_disk and not disk:
                 continue
+            base = (pl.scan_parquet(parquet_path)
+                      .filter(pl.col("event") == "setup")
+                      .filter(pl.col("sector").is_not_null())
+                      .filter(pl.col("sector") != SECTOR_UNSET))
+            if has_disk:
+                base = base.filter(pl.col("disk_name") == disk)
+            ops = base.select("op").unique().collect(engine="streaming")["op"].to_list()
             capacity_lba, sector_bytes = geom_for(disk)
-            entry = ensure_entry(key)
-            entry["access_pattern"].setdefault("cmd_sectors", {})
-            entry["access_pattern"].setdefault("lba_distribution", {})
-            for op_part in setup_df.partition_by("op", maintain_order=False):
-                op = op_part["op"][0]
-                sectors = op_part["sector"].cast(pl.Int64).to_numpy()
-                bytes_list = op_part["bytes"].cast(pl.Int64).to_numpy()
+            cmd_sectors: dict = {}
+            lba_distribution: dict = {}
+            cols = (["timestamp_ns"] if has_ts else []) + ["sector", "bytes"]
+            for op in ops:
+                op_df = (base.filter(pl.col("op") == op)
+                             .select(cols)
+                             .collect(engine="streaming"))
+                if len(op_df) == 0:
+                    del op_df
+                    continue
+                if has_ts:
+                    op_df = op_df.sort("timestamp_ns")
+                sectors = op_df["sector"].cast(pl.Int64).to_numpy()
+                bytes_list = op_df["bytes"].cast(pl.Int64).to_numpy()
                 if len(sectors) >= 2:
-                    entry["access_pattern"]["cmd_sectors"][op] = compute_access_pattern(
+                    cmd_sectors[op] = compute_access_pattern(
                         sectors, bytes_list, sector_bytes=sector_bytes
                     )
                 if len(sectors) >= 1:
-                    entry["access_pattern"]["lba_distribution"][op] = compute_lba_distribution(
+                    lba_distribution[op] = compute_lba_distribution(
                         sectors, bytes_list, capacity_lba, sector_bytes=sector_bytes
                     )
-            del setup_df
+                del op_df
+            if cmd_sectors or lba_distribution:
+                per_device[disk] = {"access_pattern": {
+                    "cmd_sectors": cmd_sectors,
+                    "lba_distribution": lba_distribution,
+                }}
 
     # --- Reshape: bind comm/container labels per disk, nest under per_disk ---
     by_disk: dict = {}
     for (comm, mntns_id_str, disk), entry in _entries.items():
         by_disk.setdefault(disk, {})[(comm, mntns_id_str)] = entry
 
-    result: dict = {"per_comm": {}, "per_container": {}}
+    result: dict = {"per_comm": {}, "per_container": {}, "per_device": per_device}
     for disk, sub_entries in by_disk.items():
         bound = bind_containers(sub_entries, mntns_map, comm_map)
         for bucket in ("per_comm", "per_container"):
