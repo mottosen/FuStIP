@@ -95,8 +95,12 @@ def load_device_geometry(parquet_path):
     logical-block units, so both come from the device's own geometry.
 
     Prefers the capture-time `device-info.json` (offline-safe: `nsze_lbas` +
-    `lba_size_bytes`), falling back to live `/sys/block/<dev>/size` (512-byte sectors,
-    valid only on the capture host). Multi-device safe — geometry is resolved per disk.
+    `lba_size_bytes`), falling back to live sysfs on the capture host. The fallback reads
+    the device's real logical-block size from `/sys/block/<dev>/queue/logical_block_size`
+    (NOT a hardcoded 512 — many NVMe namespaces are 4096-logical, and assuming 512 makes
+    the gap test off by a constant factor → sequential IO misreported as random); the
+    `/sys/block/<dev>/size` capacity is in 512-byte units and is converted to logical
+    blocks. Multi-device safe — geometry is resolved per disk.
     """
     info_path = Path(parquet_path).parent / "device-info.json"
     info = {}
@@ -111,17 +115,33 @@ def load_device_geometry(parquet_path):
         if entry is None and len(info) == 1:
             entry = next(iter(info.values()))
         if isinstance(entry, dict):
-            cap = int(entry.get("nsze_lbas") or entry.get("sectors_512b") or 0) or None
-            sector_bytes = int(entry.get("lba_size_bytes") or 512)
+            # sector_bytes: nvme-list SectorSize, else the sysfs logical block size the
+            # collector records — never silently 512 when the device says otherwise.
+            sector_bytes = int(entry.get("lba_size_bytes")
+                               or entry.get("logical_block_bytes") or 512)
+            # capacity in *logical blocks*: nsze_lbas is already in those units;
+            # sectors_512b is in 512-byte units, so convert it.
+            if entry.get("nsze_lbas"):
+                cap = int(entry["nsze_lbas"]) or None
+            elif entry.get("sectors_512b"):
+                cap = int(entry["sectors_512b"]) * 512 // sector_bytes or None
+            else:
+                cap = None
             if cap:
                 return cap, sector_bytes
         if disk:
-            size_path = Path(f"/sys/block/{disk}/size")
-            if size_path.exists():
-                try:
-                    return int(size_path.read_text().strip()), 512
-                except ValueError:
-                    pass
+            try:
+                lbs_path = Path(f"/sys/block/{disk}/queue/logical_block_size")
+                sector_bytes = int(lbs_path.read_text().strip()) if lbs_path.exists() else 512
+                size_path = Path(f"/sys/block/{disk}/size")
+                if size_path.exists():
+                    # /sys/block/*/size is always in 512-byte units; convert to the
+                    # device's own logical blocks (SLBAs are in logical-block units).
+                    cap_lba = int(size_path.read_text().strip()) * 512 // sector_bytes
+                    return cap_lba, sector_bytes
+                return None, sector_bytes
+            except (ValueError, OSError):
+                pass
         return None, 512
 
     return geom_for

@@ -48,6 +48,20 @@ def _run_json(cmd):
         return None
 
 
+def _all_nvme_namespaces():
+    """Every NVMe namespace block device on the host (e.g. nvme0n1, nvme1n1).
+
+    Used when no device filter is given (container/comm/pid-scoped runs) so the
+    fingerprint still covers whichever device the workload hits. Namespace devices
+    match nvmeXnY; partitions (nvmeXnYpZ) are excluded.
+    """
+    try:
+        names = [p.name for p in Path("/sys/block").glob("nvme*")]
+    except OSError:
+        return []
+    return sorted(n for n in names if re.match(r"^nvme\d+n\d+$", n))
+
+
 def _sysfs_int(dev, rel):
     try:
         return int(Path(f"/sys/block/{dev}/{rel}").read_text().strip())
@@ -128,6 +142,11 @@ def main():
         return
     results_dir = Path(sys.argv[1])
     devs = [d.strip() for d in sys.argv[2].split(",") if d.strip()]
+    if not devs:
+        # No device filter (container/comm/pid-scoped run): fingerprint every NVMe
+        # namespace so post-processing has geometry for whichever device the workload
+        # actually hit, regardless of -d.
+        devs = _all_nvme_namespaces()
     if not devs:
         return
 
