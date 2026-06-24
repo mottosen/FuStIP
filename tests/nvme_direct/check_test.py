@@ -71,16 +71,46 @@ def parse_access_pattern(path):
     """Extract access_pattern section from detailed-stats.json.
 
     Access pattern is per (process, device): nvme detailed nests it under
-    per_comm[label].per_disk[disk].access_pattern. Merge across all label/disk entries;
-    in tests there is typically one process and device, so last-write-wins is fine.
+    per_comm[label].per_disk[disk].access_pattern. A single job can touch more than one
+    device — e.g. a container run issues its data I/O to one device while paging its
+    binary/libraries in from the image overlay on another — so an op can appear under
+    several disk/label entries. Pool the raw sequential/random counts across them and
+    recompute the percentages (mirroring how counters are summed), so a small
+    cross-device entry can't overwrite the dominant data device's classification.
     """
     with open(path) as f:
         stats = json.load(f)
     merged = {}
     for entry in _iter_label_entries(stats):
-        for key, val in entry.get("access_pattern", {}).items():
-            merged.setdefault(key, {}).update(val)
+        for key, ops in entry.get("access_pattern", {}).items():
+            dst = merged.setdefault(key, {})
+            for op, ap in ops.items():
+                _pool_access_pattern(dst, op, ap)
     return merged
+
+
+def _pool_access_pattern(dst, op, ap):
+    """Accumulate one op's access-pattern entry into dst[op] by summing raw counts.
+
+    Falls back to keeping the existing (or first) entry when the raw
+    sequential/random counts are not both present to pool with.
+    """
+    cur = dst.get(op)
+    if cur is None:
+        dst[op] = dict(ap)
+        return
+    if "sequential_count" not in ap or "sequential_count" not in cur:
+        return  # counts unavailable on one side — keep the existing entry
+    seq = cur["sequential_count"] + ap["sequential_count"]
+    rnd = cur["random_count"] + ap["random_count"]
+    tot = seq + rnd
+    dst[op] = {
+        "total_ios": cur.get("total_ios", 0) + ap.get("total_ios", 0),
+        "sequential_count": seq,
+        "random_count": rnd,
+        "sequential_pct": round(100 * seq / tot, 2) if tot else 0,
+        "random_pct": round(100 * rnd / tot, 2) if tot else 0,
+    }
 
 
 SEQUENTIAL_JOBS = {"val_seqread", "val_seqwrite", "work_bulk_insert", "work_scan"}
