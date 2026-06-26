@@ -101,14 +101,22 @@ else
 endif
 
 .PHONY: stop-profiling
-stop-profiling:
+stop-profiling: ensure-sudo
+# The pidfile holds the backgrounded `sudo` wrapper's PID, not the loader's. The
+# loader runs as root (sudo's child), so signal it via -P as root: SIGTERM first so
+# it flushes counters and closes detailed.csv cleanly, wait for exit, then SIGKILL as
+# a backstop and reap the wrapper. A plain unprivileged `kill` of the wrapper PID is
+# EPERM (root process) and orphans the loader, which keeps its since-unlinked CSV
+# open and silently eats disk until reboot.
 	$(Q)for pidfile in $(PIDS_DIR)/*.pid; do \
 		if [ -f "$$pidfile" ]; then \
 			pid=$$(cat "$$pidfile"); \
-			kill $$pid $(ERR_REDIRECT) 1>&2 || true; \
-			i=0; while [ -d "/proc/$$pid" ] && [ $$i -lt 50 ]; do \
+			sudo pkill -TERM -P $$pid $(ERR_REDIRECT) 1>&2 || true; \
+			i=0; while sudo pgrep -P $$pid >/dev/null 2>&1 && [ $$i -lt 50 ]; do \
 				sleep 0.2; i=$$((i+1)); \
 			done; \
+			sudo pkill -KILL -P $$pid $(ERR_REDIRECT) 1>&2 || true; \
+			sudo kill $$pid $(ERR_REDIRECT) 1>&2 || true; \
 		fi; \
 	done
 	$(Q)rm -rf "$(PIDS_DIR)"
