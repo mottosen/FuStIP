@@ -56,6 +56,10 @@ fentry:nvme_core:nvme_setup_cmd
     $rq = (uint64)args.req;
     @fentry_rq[tid] = $rq;
 
+    // Actual disk name seen on the wire — used to key the per-disk inflight
+    // series below. Summary mode is single-device, so one global is sufficient.
+    @io_disk = args.req->q->disk->disk_name;
+
     // Transfer length: __data_len is set correctly on the request even for
     // io_uring_cmd passthrough, and reads reliably here (struct request BTF is
     // available at the fentry). Only the *op* is wrong on the request for
@@ -148,11 +152,15 @@ rawtracepoint:nvme_complete_rq
 
 interval:s:1
 {
-    @cmd_inflight["read"] = tseries(@cmd_setup["read"] - @cmd_completed["read"], 1s, 7200);
-    @cmd_inflight["write"] = tseries(@cmd_setup["write"] - @cmd_completed["write"], 1s, 7200);
-    @cmd_inflight["flush"] = tseries(@cmd_setup["flush"] - @cmd_completed["flush"], 1s, 7200);
-    @cmd_inflight["discard"] = tseries(@cmd_setup["discard"] - @cmd_completed["discard"], 1s, 7200);
-    @cmd_inflight["write_zeros"] = tseries(@cmd_setup["write_zeros"] - @cmd_completed["write_zeros"], 1s, 7200);
+    // Inflight keyed by (disk, op). The per-second value still comes from the
+    // op-keyed setup/completed counters (accurate because summary mode is
+    // single-device); the disk key just nests the series under its device for the
+    // stats generator (matching detailed mode's per_disk layout).
+    @cmd_inflight[@io_disk, "read"] = tseries(@cmd_setup["read"] - @cmd_completed["read"], 1s, 7200);
+    @cmd_inflight[@io_disk, "write"] = tseries(@cmd_setup["write"] - @cmd_completed["write"], 1s, 7200);
+    @cmd_inflight[@io_disk, "flush"] = tseries(@cmd_setup["flush"] - @cmd_completed["flush"], 1s, 7200);
+    @cmd_inflight[@io_disk, "discard"] = tseries(@cmd_setup["discard"] - @cmd_completed["discard"], 1s, 7200);
+    @cmd_inflight[@io_disk, "write_zeros"] = tseries(@cmd_setup["write_zeros"] - @cmd_completed["write_zeros"], 1s, 7200);
 }
 
 END
@@ -190,6 +198,7 @@ END
     clear(@cmd_inflight);
     clear(@cmd_lba_dist);
 
+    delete(@io_disk);
     clear(@fentry_rq);
     clear(@nvme_op);
 

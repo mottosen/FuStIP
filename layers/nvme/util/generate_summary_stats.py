@@ -110,12 +110,22 @@ def generate_stats(input_path):
     # SLBA so the lhist bounds stay literal); rescale to absolute logical blocks.
     _rescale_lba_dist(result, input_path)
 
-    # Time-series stats
+    # Time-series stats. cmd_inflight is keyed by "disk, op" in bpftrace; split it
+    # and nest under per-disk to match detailed mode's per_disk[disk][op] layout.
     for m in TSERIES_MAPS:
-        if m in tseries:
-            result["tseries"][m] = {}
-            for key, points in tseries[m].items():
+        if m not in tseries:
+            continue
+        result["tseries"][m] = {}
+        for key, points in tseries[m].items():
+            disk, sep, op = key.partition(", ")
+            if not sep or not disk:
+                # No disk dimension (older trace) or pre-first-IO empty-disk
+                # sample — skip the latter, keep the former flat.
+                if not disk:
+                    continue
                 result["tseries"][m][key] = tseries_stats(points)
+                continue
+            result["tseries"][m].setdefault(disk, {})[op] = tseries_stats(points)
 
     return result
 

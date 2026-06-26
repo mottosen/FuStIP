@@ -69,6 +69,14 @@ def _sysfs_int(dev, rel):
         return None
 
 
+def _sysfs_mq_count(dev):
+    """Number of hardware (I/O) queues: count numeric subdirs in /sys/block/<dev>/mq."""
+    try:
+        return sum(1 for p in Path(f"/sys/block/{dev}/mq").iterdir() if p.name.isdigit())
+    except OSError:
+        return None
+
+
 def _sysfs_str(dev, rel):
     try:
         return Path(f"/sys/block/{dev}/{rel}").read_text().strip() or None
@@ -99,6 +107,12 @@ def collect_device(dev, nvme_list):
         "physical_block_bytes": _sysfs_int(dev, "queue/physical_block_size"),
         "model": _sysfs_str(dev, "device/model"),
         "serial": _sysfs_str(dev, "device/serial"),
+        # Queue geometry for on-device queue-distribution analysis: hw_queues is
+        # the I/O queue count, hw_queue_depth the per-queue tag depth (NVMe SQ
+        # depth), block_nr_requests the block-layer scheduler queue depth.
+        "hw_queues": _sysfs_mq_count(dev),
+        "hw_queue_depth": _sysfs_int(dev, "mq/0/nr_tags"),
+        "block_nr_requests": _sysfs_int(dev, "queue/nr_requests"),
     }
 
     # nvme list (no root) — richer/cleaner identity + sizing.

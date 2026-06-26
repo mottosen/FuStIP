@@ -136,13 +136,13 @@ static int handle_event(void *ctx, void *data, size_t data_sz) {
   memcpy(disk_name, e->disk_name, 32);
 
   if (e->latency_ns > 0)
-    fprintf(output, "%llu,%llu,%s,%s,%u,%llu,%llu,0x%llx,%s,%d,%s\n", e->timestamp_ns,
+    fprintf(output, "%llu,%llu,%s,%s,%u,%llu,%llu,0x%llx,%s,%d,%s,%u\n", e->timestamp_ns,
             e->mntns_id, event_name(e->event_type), op_name(e->op), e->bytes, e->latency_ns,
-            e->sector, e->rq, comm, e->inflight, disk_name);
+            e->sector, e->rq, comm, e->inflight, disk_name, e->qid);
   else
-    fprintf(output, "%llu,%llu,%s,%s,%u,,%llu,0x%llx,%s,%d,%s\n", e->timestamp_ns,
+    fprintf(output, "%llu,%llu,%s,%s,%u,,%llu,0x%llx,%s,%d,%s,%u\n", e->timestamp_ns,
             e->mntns_id, event_name(e->event_type), op_name(e->op), e->bytes, e->sector,
-            e->rq, comm, e->inflight, disk_name);
+            e->rq, comm, e->inflight, disk_name, e->qid);
 
   return 0;
 }
@@ -381,7 +381,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   fprintf(output,
-          "timestamp_ns,mntns_id,event,op,bytes,latency_ns,sector,rq,comm,inflight,disk_name\n");
+          "timestamp_ns,mntns_id,event,op,bytes,latency_ns,sector,rq,comm,inflight,disk_name,qid\n");
 
   struct ring_buffer *rb = ring_buffer__new(bpf_map__fd(skel->maps.events),
                                             handle_event, NULL, NULL);

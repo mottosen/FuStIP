@@ -54,6 +54,7 @@ struct cmd_data {
   __u64 mntns_id;
   __u8 comm[16];
   char disk_name[32]; // kernel gendisk name, read once at fentry setup
+  __u16 qid;          // NVMe queue id, read once at fentry setup
 };
 
 // ── Per-(op, comm) key for inflight counters ──
@@ -149,6 +150,12 @@ static __always_inline int handle_nvme_fentry_setup(struct request *req) {
   struct gendisk *disk = BPF_CORE_READ(req, q, disk);
   if (disk)
     bpf_probe_read_kernel_str(&data.disk_name, sizeof(data.disk_name), &disk->disk_name);
+
+  // NVMe queue id, mirroring the kernel's nvme_req_qid(): admin commands (no
+  // queuedata) are qid 0; I/O commands are the hw queue index + 1.
+  void *qdata = BPF_CORE_READ(req, q, queuedata);
+  data.qid = qdata ? (BPF_CORE_READ(req, mq_hctx, queue_num) + 1) : 0;
+
   bpf_map_update_elem(&cmd_metadata, &rq_key, &data, BPF_ANY);
 
   // Bridge: store rq pointer for the rawtracepoint to pick up
@@ -221,6 +228,7 @@ static __always_inline int handle_nvme_rawtp_setup(void *cmd) {
     e->rq = rq_key;
     __builtin_memcpy(e->comm, data->comm, 16);
     e->inflight = cur_inflight;
+    e->qid = data->qid;
     __builtin_memcpy(e->disk_name, data->disk_name, 32);
     bpf_ringbuf_submit(e, 0);
   } else {
@@ -296,6 +304,7 @@ static __always_inline int handle_nvme_complete(struct request *req) {
     e->rq = rq_key;
     __builtin_memcpy(e->comm, data->comm, 16);
     e->inflight = cur_inflight;
+    e->qid = data->qid;
     __builtin_memcpy(e->disk_name, data->disk_name, 32);
     bpf_ringbuf_submit(e, 0);
   } else {

@@ -28,6 +28,7 @@ struct nvme_event {
   __u64 rq;            // request pointer (correlation ID)
   char  comm[16];      // process name
   __s32 inflight;      // current in-flight count for this op
+  __u16 qid;           // NVMe queue id (0 = admin, 1..N = I/O queues)
   char  disk_name[32]; // kernel gendisk name (e.g. "nvme0n1")
 } __attribute__((packed));
 
