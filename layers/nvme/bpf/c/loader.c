@@ -15,6 +15,10 @@
 
 static volatile sig_atomic_t running = 1;
 static FILE *output;
+// 4 MB fully-buffered stdio buffer for the CSV. Collapses per-event writes into
+// large write() syscalls so the single-threaded ring-buffer consumer drains fast
+// enough to avoid reserve drops under bursty, high-queue-depth workloads.
+static char output_buf[1 << 22];
 #define MAX_CONTAINER_FILTERS 32
 #define MAX_DEV_FILTERS 8
 #define MAX_COMM_FILTERS 8
@@ -135,15 +139,26 @@ static int handle_event(void *ctx, void *data, size_t data_sz) {
   char disk_name[33] = {};
   memcpy(disk_name, e->disk_name, 32);
 
+  // Build the CSV line in memory and emit with a single fwrite (no per-call FILE
+  // lock); paired with the large setvbuf this keeps the consumer ahead of the
+  // ring buffer under high event rates.
+  char line[256];
+  int n;
   if (e->latency_ns > 0)
-    fprintf(output, "%llu,%llu,%s,%s,%u,%llu,%llu,0x%llx,%s,%d,%s,%u\n", e->timestamp_ns,
-            e->mntns_id, event_name(e->event_type), op_name(e->op), e->bytes, e->latency_ns,
-            e->sector, e->rq, comm, e->inflight, disk_name, e->qid);
+    n = snprintf(line, sizeof(line), "%llu,%llu,%s,%s,%u,%llu,%llu,0x%llx,%s,%d,%s,%u\n",
+                 e->timestamp_ns, e->mntns_id, event_name(e->event_type), op_name(e->op),
+                 e->bytes, e->latency_ns, e->sector, e->rq, comm, e->inflight, disk_name,
+                 e->qid);
   else
-    fprintf(output, "%llu,%llu,%s,%s,%u,,%llu,0x%llx,%s,%d,%s,%u\n", e->timestamp_ns,
-            e->mntns_id, event_name(e->event_type), op_name(e->op), e->bytes, e->sector,
-            e->rq, comm, e->inflight, disk_name, e->qid);
+    n = snprintf(line, sizeof(line), "%llu,%llu,%s,%s,%u,,%llu,0x%llx,%s,%d,%s,%u\n",
+                 e->timestamp_ns, e->mntns_id, event_name(e->event_type), op_name(e->op),
+                 e->bytes, e->sector, e->rq, comm, e->inflight, disk_name, e->qid);
 
+  // snprintf returns the would-be length; clamp so a hypothetical overlong line
+  // can never make fwrite read past the buffer (free: just a compare).
+  if (n > (int)sizeof(line))
+    n = sizeof(line);
+  fwrite(line, 1, n, output);
   return 0;
 }
 
@@ -380,6 +395,7 @@ int main(int argc, char **argv) {
     standalone_bpf__destroy(skel);
     return 1;
   }
+  setvbuf(output, output_buf, _IOFBF, sizeof(output_buf));
   fprintf(output,
           "timestamp_ns,mntns_id,event,op,bytes,latency_ns,sector,rq,comm,inflight,disk_name,qid\n");
 

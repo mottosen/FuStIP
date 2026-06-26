@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "util"))
-from stats_generation.shared import parse_counters
+from stats_generation.shared import parse_counters, print_data_quality
 
 
 def parse_fio_json(path):
@@ -309,6 +309,11 @@ def main():
               f"  setup={get_val(nvme, 'cmd_setup', op)}"
               f"  completed={get_val(nvme, 'cmd_completed', op)}"
               f"  bytes={get_val(nvme, 'cmd_total_bytes', op)}")
+
+    if args.mode == "detailed":
+        print("")
+        print_data_quality(args.block_out, label="BLK")
+        print_data_quality(args.nvme_out, label="NVME")
 
     print()
 

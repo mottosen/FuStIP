@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "util"))
-from stats_generation.shared import parse_counters
+from stats_generation.shared import parse_counters, print_data_quality
 
 
 def parse_fio_json(path):
@@ -275,6 +275,9 @@ def main():
                  if get_val(fs, "sc_count", sc) > 0]
     if aux_parts:
         print(f"        {', '.join(aux_parts)}")
+
+    if args.mode == "detailed":
+        print_data_quality(args.fs_out)
 
     print()
 

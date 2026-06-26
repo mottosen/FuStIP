@@ -12,6 +12,7 @@ Provides stats computation (min, max, mean, percentiles, area under curve)
 for histograms and time-series data.
 """
 
+import json
 import math
 import re
 
@@ -43,6 +44,34 @@ _HIST_BUCKET_RE = re.compile(r"^\[(\S+),\s+(\S+)\)\s+(\d+)\s+\|")
 # lhist() renders unit-width buckets (step 1) as "[N]" rather than "[N, N+1)".
 _HIST_SINGLE_RE = re.compile(r"^\[(\S+)\]\s+(\d+)\s+\|")
 _TSERIES_DATA_RE = re.compile(r"^(\d{2}:\d{2}:\d{2})\s+.*[|*]\s*(-?\d+)\s*$")
+
+
+def print_data_quality(stats_path, label="", indent="  "):
+    """Print the BPF ring-buffer data_quality (event drops) from a detailed-stats.json.
+
+    Detailed mode counts every event the BPF program *generated* and every one that
+    failed `bpf_ringbuf_reserve` (a drop, when the consumer can't drain fast enough).
+    The harness otherwise only sees the surviving (received) events, so a drop shows
+    up indirectly as a count shortfall vs FIO; print the authoritative numbers here so
+    drops are visible per job. `label` tags the layer (e.g. "BLK"/"NVME") when one job
+    spans several stats files. No-op for summary mode or if the section is absent.
+    """
+    try:
+        with open(stats_path) as f:
+            dq = json.load(f).get("data_quality", {})
+    except (OSError, json.JSONDecodeError):
+        return
+    if not dq:
+        return
+    tag = f"{label} DROPS" if label else "DROPS"
+    gen = dq.get("total_generated", 0)
+    drop = dq.get("total_dropped", 0)
+    pct = dq.get("drop_pct", 0.0)
+    print(f"{indent}{tag}: {drop}/{gen} events dropped ({pct:.3f}%)")
+    for etype, v in dq.get("per_event_type", {}).items():
+        if v.get("generated"):
+            print(f"{indent}{' ' * len(tag)}  {etype}: {v.get('dropped')}/{v.get('generated')} "
+                  f"({v.get('drop_pct', 0.0):.3f}%)")
 
 
 def parse_counters(path):
