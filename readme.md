@@ -18,7 +18,9 @@ Both modes filter along a nested-AND hierarchy — `container ⊇ device ⊇ {co
 - **`container`** (top): restrict to these containers (resolved to mount
   namespaces at runtime). Forces _detailed_ mode — combining it with
   `mode: summary` is a pre-run error.
-- **`device`**: narrow to these block devices (nvme and block layers).
+- **`device`**: narrow to these block devices (nvme and block layers). The nvme
+  layer is single-device in _summary_ mode (a multi-device filter is rejected);
+  use _detailed_ mode for multi-device.
 - **`comm`** (command name, substring) and **`pid`** (tgid, exact): the process
   tier, unioned. With no container/device set, they collect system-wide.
 
@@ -204,6 +206,26 @@ be passed with other options (see example below).
 
     ./run.sh test stress -c fio-container -d nvme0n1
 
+**Test the NVMe layer over io_uring_cmd / NVMe passthrough** (`--nvme-direct`):
+
+    FIO_FILE=/dev/ng0n1 ./run.sh test validate --nvme-direct -l nvme -d nvme0n1 -m detailed
+
+`--nvme-direct` routes the nvme layer to the `tests/nvme_direct` suite, which
+runs the same job matrix as `block_nvme` but with `ioengine=io_uring_cmd`
+(`cmd_type=nvme`). Passthrough submits commands straight to the NVMe driver,
+bypassing the block layer, so only the nvme layer is profiled. The fio target
+(`FIO_FILE`) must be the NVMe **generic char device** (`/dev/ngXnY`), while
+`-d/--dev-filter` stays the namespace name (`nvme0n1`) used by the nvme layer's
+filter and device-info capture.
+
+> [!WARNING]
+> Passthrough writes are issued to the **whole namespace from LBA 0**, ignoring
+> partitions and filesystems — so this suite is **destructive** and must only be
+> run against a dedicated scratch namespace. As a safeguard, it refuses to start
+> if the target device has mounted partitions or partition-table/filesystem
+> signatures. A stray signature on a genuine scratch device (never a mount) can
+> be overridden with `ALLOW_NONEMPTY_DEVICE=1`.
+
 ## Output
 
 Results are written to the directory given by `--results-dir` (or the `RESULTS_DIR`
@@ -225,7 +247,9 @@ It holds one sub-directory per profiled layer plus a top-level overview. The
   bytes), `derived` IOPS/throughput (total ÷ active-I/O window), latency/size
   distributions, inflight + IOPS time-series, and access pattern (sequential vs
   random). `fs` keys by syscall (`read`/`write`/`pread64`/`pwrite64`); block/nvme by
-  request op. When filtered by device, `nvme` additionally captures
+  request op. In _detailed_ mode `nvme` nests these per device under each label
+  (`per_comm[label].per_disk[<dev>]`), so multiple devices are reported separately.
+  When filtered by device, `nvme` additionally captures
   `device-info.json` — a fingerprint of the target device(s) (model, serial,
   firmware, LBA/sector size, capacity, sector count, MDTS) gathered at capture
   time via `nvme-cli` + sysfs.

@@ -12,6 +12,7 @@ Provides stats computation (min, max, mean, percentiles, area under curve)
 for histograms and time-series data.
 """
 
+import json
 import math
 import re
 
@@ -40,7 +41,37 @@ _COUNTER_RE = re.compile(r"^@(\w+)\[([^\]]+)\]:\s+(-?\d+)\s*$")
 _KEYED_HEADER_RE = re.compile(r"^@(\w+)\[([^\]]+)\]:\s*$")
 _UNKEYED_HEADER_RE = re.compile(r"^@(\w+):\s*$")
 _HIST_BUCKET_RE = re.compile(r"^\[(\S+),\s+(\S+)\)\s+(\d+)\s+\|")
+# lhist() renders unit-width buckets (step 1) as "[N]" rather than "[N, N+1)".
+_HIST_SINGLE_RE = re.compile(r"^\[(\S+)\]\s+(\d+)\s+\|")
 _TSERIES_DATA_RE = re.compile(r"^(\d{2}:\d{2}:\d{2})\s+.*[|*]\s*(-?\d+)\s*$")
+
+
+def print_data_quality(stats_path, label="", indent="  "):
+    """Print the BPF ring-buffer data_quality (event drops) from a detailed-stats.json.
+
+    Detailed mode counts every event the BPF program *generated* and every one that
+    failed `bpf_ringbuf_reserve` (a drop, when the consumer can't drain fast enough).
+    The harness otherwise only sees the surviving (received) events, so a drop shows
+    up indirectly as a count shortfall vs FIO; print the authoritative numbers here so
+    drops are visible per job. `label` tags the layer (e.g. "BLK"/"NVME") when one job
+    spans several stats files. No-op for summary mode or if the section is absent.
+    """
+    try:
+        with open(stats_path) as f:
+            dq = json.load(f).get("data_quality", {})
+    except (OSError, json.JSONDecodeError):
+        return
+    if not dq:
+        return
+    tag = f"{label} DROPS" if label else "DROPS"
+    gen = dq.get("total_generated", 0)
+    drop = dq.get("total_dropped", 0)
+    pct = dq.get("drop_pct", 0.0)
+    print(f"{indent}{tag}: {drop}/{gen} events dropped ({pct:.3f}%)")
+    for etype, v in dq.get("per_event_type", {}).items():
+        if v.get("generated"):
+            print(f"{indent}{' ' * len(tag)}  {etype}: {v.get('dropped')}/{v.get('generated')} "
+                  f"({v.get('drop_pct', 0.0):.3f}%)")
 
 
 def parse_counters(path):
@@ -88,11 +119,30 @@ def parse_histograms(path):
 
             bucket = _HIST_BUCKET_RE.match(stripped)
             if bucket and current_map is not None:
-                lo = parse_value_with_suffix(bucket.group(1))
-                hi = parse_value_with_suffix(bucket.group(2))
+                # lhist() prints an open-ended overflow bucket "[N, ...)" for values
+                # at/above its max; its non-numeric upper bound would crash the parse,
+                # so skip it (it is empty for in-range data and carries no signal).
+                try:
+                    lo = parse_value_with_suffix(bucket.group(1))
+                    hi = parse_value_with_suffix(bucket.group(2))
+                except ValueError:
+                    continue
                 count = int(bucket.group(3))
                 data.setdefault(current_map, {}).setdefault(current_key, []).append(
                     {"lo": lo, "hi": hi, "count": count}
+                )
+                continue
+
+            single = _HIST_SINGLE_RE.match(stripped)
+            if single and current_map is not None:
+                # "[N]" is the unit bucket [N, N+1) (lhist with step 1).
+                try:
+                    lo = parse_value_with_suffix(single.group(1))
+                except ValueError:
+                    continue
+                count = int(single.group(2))
+                data.setdefault(current_map, {}).setdefault(current_key, []).append(
+                    {"lo": lo, "hi": lo + 1, "count": count}
                 )
                 continue
 
@@ -377,13 +427,26 @@ def derive_throughput(counters, duration_s, count_map, bytes_map):
     return {"iops": iops, "throughput_mb_s": throughput}
 
 
-def histogram_stats_only(buckets):
-    """Compute stats from histogram buckets without preserving bucket data.
+def histogram_buckets_only(buckets):
+    """Summary-mode distribution: exact bucket data + total count only.
 
-    Input: [{"lo": int, "hi": int, "count": int}, ...]
-    Output: {"count", "min", "max", "mean", "p1", "p5", "p50", "p95", "p99"}
+    bpftrace's hist() produces log2 (power-of-2) buckets. The only value that is
+    *exact* from such buckets is the total count. Every scalar aggregate derived
+    from them is an estimate: the mean is geometric-midpoint weighted (biased for
+    skewed distributions), the percentiles are interpolated within a bucket
+    (accurate only to the enclosing 2x range), and min/max are bracketed to a
+    bucket rather than the true extremes. Summary mode therefore emits the raw
+    buckets (the genuine, exact artifact) plus the count, and omits the estimated
+    aggregates. Detailed mode computes the full accurate set from raw per-event
+    values.
+
+    Input:  [{"lo": int, "hi": int, "count": int}, ...]
+    Output: {"count": int, "buckets": [{"lo", "hi", "count"}, ...]}
     """
-    return histogram_stats({"points": [], "ranges": buckets})
+    return {
+        "count": sum(b["count"] for b in buckets),
+        "buckets": buckets,
+    }
 
 
 def raw_values_to_hist(values):
@@ -553,12 +616,16 @@ def tseries_with_points(points):
 # ── Access pattern analysis ──
 
 
-def compute_access_pattern(sectors, bytes_list):
+def compute_access_pattern(sectors, bytes_list, sector_bytes=512):
     """Compute sequential/random access pattern from sector addresses.
 
     For consecutive IOs (already sorted by timestamp):
-      gap = abs(sector[i+1] - (sector[i] + bytes[i] // 512))
+      gap = abs(sector[i+1] - (sector[i] + bytes[i] // sector_bytes))
       gap == 0 → sequential, gap > 0 → random
+
+    `sector_bytes` is the unit of the sector addresses: 512 for block-layer
+    sectors (default), or the device logical-block size when `sectors` are NVMe
+    SLBAs in logical-block units (nvme detailed mode).
 
     Accepts lists or numpy arrays.
 
@@ -572,7 +639,7 @@ def compute_access_pattern(sectors, bytes_list):
         return {"total_ios": n, "sequential_count": 0, "random_count": 0,
                 "sequential_pct": 0, "random_pct": 0}
 
-    expected_next = s[:-1] + b[:-1] // 512
+    expected_next = s[:-1] + b[:-1] // sector_bytes
     gaps = np.abs(s[1:] - expected_next)
     seq_count = int((gaps == 0).sum())
     total_gaps = len(gaps)
@@ -587,12 +654,17 @@ def compute_access_pattern(sectors, bytes_list):
     }
 
 
-def compute_lba_distribution(sectors, bytes_list, device_sectors=None, n_bins=512):
+def compute_lba_distribution(sectors, bytes_list, device_sectors=None, n_bins=512,
+                             sector_bytes=512):
     """Compute LBA space distribution histogram.
 
     For each IO, the start LBA (sector) is binned into one of n_bins buckets
     spanning [lba_min, lba_max).  lba_max is the total device size in sectors
     when device_sectors is provided, otherwise the observed maximum end-LBA.
+
+    `sector_bytes` is the unit of the sector addresses (and of device_sectors):
+    512 for block-layer sectors (default), or the device logical-block size when
+    `sectors` are NVMe SLBAs in logical-block units (nvme detailed mode).
 
     Accepts lists or numpy arrays.
 
@@ -606,7 +678,7 @@ def compute_lba_distribution(sectors, bytes_list, device_sectors=None, n_bins=51
         return {"lba_min": 0, "lba_max": device_sectors or 0,
                 "device_sectors": device_sectors, "n_bins": n_bins, "bins": []}
     lba_min = int(s.min())
-    lba_observed_max = int((s + b // 512).max())
+    lba_observed_max = int((s + b // sector_bytes).max())
     lba_range = max(lba_observed_max - lba_min, 1)
 
     bin_idx = np.clip((s - lba_min) * n_bins // lba_range, 0, n_bins - 1).astype(np.int64)

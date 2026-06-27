@@ -19,8 +19,14 @@ STRING_COLS = {"event", "op", "syscall", "comm", "rq"}
 
 # Columns that can be empty (nullable) but must be numeric, not Utf8.
 # Polars infers Utf8 when a numeric column has empty cells in CSV.
-INT_COLS = {"latency_ns", "timestamp_ns", "bytes", "sector",
-            "q_inflight", "d_inflight", "offset", "count", "mntns_id"}
+INT_COLS = {"latency_ns", "timestamp_ns", "bytes",
+            "q_inflight", "d_inflight", "offset", "count", "mntns_id", "qid"}
+
+# Unsigned 64-bit columns. `sector` is rq->__sector, a raw u64 LBA. For NVMe
+# passthrough (io_uring_cmd) the block-layer sector is never set and reads back
+# as (u64)-1 = 18446744073709551615, which overflows Int64 and crashes the
+# conversion. Type it UInt64 so unclassified/passthrough commands convert cleanly.
+UINT_COLS = {"sector"}
 
 
 def _trim_incomplete_last_line(csv_path: Path) -> bool:
@@ -78,6 +84,8 @@ def convert(csv_path):
     for col in header:
         if col in STRING_COLS:
             overrides[col] = pl.Utf8
+        elif col in UINT_COLS:
+            overrides[col] = pl.UInt64
         elif col in INT_COLS:
             overrides[col] = pl.Int64
 

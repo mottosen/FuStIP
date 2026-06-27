@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Compare FIO JSON output against bpftrace block/nvme profiler output.
+"""Compare FIO JSON output against the nvme profiler output (io_uring_cmd path).
+
+Same checks as tests/block_nvme/check_test.py, but for the NVMe passthrough
+suite (io_uring_cmd / nvme), which bypasses the block layer entirely. Only the
+nvme layer is profiled here, so only nvme counters/access patterns are validated.
 
 Asserts that profiler metrics match FIO-reported numbers within tolerance.
 Supports both bpftrace (summary) and detailed (CSV) modes.
@@ -30,11 +34,11 @@ def parse_fio_json(path):
 
 
 def _iter_label_entries(stats):
-    """Yield all per-comm and per-container label entries from stats JSON.
+    """Yield all stat entries (counters/access_pattern/...) from the stats JSON.
 
     nvme detailed mode nests per-disk entries under each label
     (per_comm[label].per_disk[disk]); descend into those so counts sum across
-    all disks. Labels without per_disk (the block layer) are yielded directly.
+    all disks. Labels without per_disk (other layers) are yielded directly.
     """
     for bucket in ("per_comm", "per_container"):
         for label_entry in stats.get(bucket, {}).values():
@@ -48,7 +52,7 @@ def _iter_label_entries(stats):
 def parse_detailed_stats(path):
     """Parse detailed-stats.json into the same dict format as parse_counters().
 
-    The stats JSON has: {"per_comm": {"fio": {"counters": {"rq_completed": {"read": N}}}}}
+    The stats JSON has: {"per_comm": {"fio": {"counters": {"cmd_completed": {"read": N}}}}}
     We aggregate counters across all labels by summing inner values.
     """
     with open(path) as f:
@@ -67,13 +71,12 @@ def parse_access_pattern(path):
     """Extract access_pattern section from detailed-stats.json.
 
     Access pattern is per (process, device): nvme detailed nests it under
-    per_comm[label].per_disk[disk].access_pattern (block keeps it under the per-comm
-    label entry). A single job can touch more than one device — e.g. a container run
-    issues its data I/O to one device while paging its binary/libraries in from the
-    image overlay on another — so an op can appear under several disk/label entries.
-    Pool the raw sequential/random counts across them and recompute the percentages
-    (mirroring how counters are summed), so a small cross-device entry can't overwrite
-    the dominant data device's classification.
+    per_comm[label].per_disk[disk].access_pattern. A single job can touch more than one
+    device — e.g. a container run issues its data I/O to one device while paging its
+    binary/libraries in from the image overlay on another — so an op can appear under
+    several disk/label entries. Pool the raw sequential/random counts across them and
+    recompute the percentages (mirroring how counters are summed), so a small
+    cross-device entry can't overwrite the dominant data device's classification.
     """
     with open(path) as f:
         stats = json.load(f)
@@ -180,51 +183,6 @@ def classify_job(fio):
         return "read"
 
 
-def validate_blk(fio, blk, tolerance, kind, allow_over=False):
-    """Block layer: completed vs FIO, then issued~completed consistency."""
-    results = []
-
-    # Completed vs FIO
-    if kind in ("read", "mixed"):
-        results.append(check_approx(
-            "blk read completed",
-            get_val(blk, "rq_completed", "read"),
-            fio["read_ios"], tolerance, allow_over))
-        results.append(check_approx(
-            "blk read bytes",
-            get_val(blk, "rq_total_bytes", "read"),
-            fio["read_bytes"], tolerance, allow_over))
-
-    if kind in ("write", "mixed"):
-        results.append(check_approx(
-            "blk write completed",
-            get_val(blk, "rq_completed", "write"),
-            fio["write_ios"], tolerance, allow_over))
-        results.append(check_approx(
-            "blk write bytes",
-            get_val(blk, "rq_total_bytes", "write"),
-            fio["write_bytes"], tolerance, allow_over))
-
-    # Consistency: issued~completed, queued~queue_done
-    ops = ("read", "write") if kind == "mixed" else (kind,)
-    for op in ops:
-        issued = get_val(blk, "rq_issued", op)
-        completed = get_val(blk, "rq_completed", op)
-        if issued > 0 and completed > 0:
-            results.append(check_approx(
-                f"blk {op} issued~completed",
-                issued, completed, tolerance))
-
-        queued = get_val(blk, "rq_queued", op)
-        queue_done = get_val(blk, "rq_queue_done", op)
-        if queued > 0 and queue_done > 0:
-            results.append(check_approx(
-                f"blk {op} queued~queue_done",
-                queued, queue_done, tolerance))
-
-    return results
-
-
 def validate_nvme(fio, nvme, tolerance, kind, allow_over=False):
     """NVMe layer: completed vs FIO, then setup~completed consistency."""
     results = []
@@ -264,10 +222,9 @@ def validate_nvme(fio, nvme, tolerance, kind, allow_over=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Check profiler output against FIO results")
+    parser = argparse.ArgumentParser(description="Check nvme profiler output against FIO results")
     parser.add_argument("--job", required=True, help="FIO job name")
     parser.add_argument("--fio-json", required=True, help="Path to FIO JSON output")
-    parser.add_argument("--block-out", required=True, help="Path to block layer output")
     parser.add_argument("--nvme-out", required=True, help="Path to NVMe layer output")
     parser.add_argument("--mode", default="summary", choices=["summary", "detailed"],
                         help="Profiling mode (default: summary)")
@@ -278,29 +235,18 @@ def main():
     fio = parse_fio_json(args.fio_json)
 
     if args.mode == "detailed":
-        blk = parse_detailed_stats(args.block_out)
         nvme = parse_detailed_stats(args.nvme_out)
     else:
-        blk = parse_counters(args.block_out)
         nvme = parse_counters(args.nvme_out)
 
     kind = classify_job(fio)
     if args.mode == "detailed":
         ops = {"read": ["read"], "write": ["write"], "mixed": ["read", "write"]}[kind]
 
-    print(f"\n=== {args.job} (mode={args.mode}) ===")
+    print(f"\n=== {args.job} (mode={args.mode}, io_uring_cmd / nvme passthrough) ===")
 
     print(f"  FIO:  read_ios={fio['read_ios']}  read_bytes={fio['read_bytes']}"
           f"  write_ios={fio['write_ios']}  write_bytes={fio['write_bytes']}")
-
-    print("")
-    for op in ("read", "write"):
-        prefix = "BLK:" if op == "read" else ""
-        print(f"  {prefix:6}{op + ':':6}"
-              f"  queued={get_val(blk, 'rq_queued', op)}"
-              f"  issued={get_val(blk, 'rq_issued', op)}"
-              f"  completed={get_val(blk, 'rq_completed', op)}"
-              f"  bytes={get_val(blk, 'rq_total_bytes', op)}")
 
     print("")
     for op in ("read", "write"):
@@ -311,29 +257,11 @@ def main():
               f"  bytes={get_val(nvme, 'cmd_total_bytes', op)}")
 
     if args.mode == "detailed":
-        print("")
-        print_data_quality(args.block_out, label="BLK")
-        print_data_quality(args.nvme_out, label="NVME")
+        print_data_quality(args.nvme_out)
 
     print()
 
     all_passed = True
-
-    blk_results = validate_blk(fio, blk, args.tolerance, kind, args.container)
-    for passed, msg in blk_results:
-        print(f"  {msg}")
-        if not passed:
-            all_passed = False
-
-    if args.mode == "detailed":
-        blk_ap = parse_access_pattern(args.block_out)
-        for passed, msg in validate_access_pattern(args.job, blk_ap, "blk", ops, args.tolerance,
-                                                   lookup_key="rq_sectors"):
-            print(f"  {msg}")
-            if not passed:
-                all_passed = False
-
-    print()
 
     nvme_results = validate_nvme(fio, nvme, args.tolerance, kind, args.container)
     for passed, msg in nvme_results:

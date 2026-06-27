@@ -277,35 +277,45 @@ def generate_stats(parquet_path):
                     entry["tseries"].setdefault("iops", {})[op] = tseries_stats(iops_points)
         del per_comm_snap
 
-    # --- Scan 4: Access pattern (per comm) ---
-    # Scan per-comm to avoid partition_by() on a 100M+ row DataFrame, which creates
-    # full copies of all partitions simultaneously and spikes RSS to 3× the frame size.
+    # --- Scan 4: Access pattern (per comm, per op, timestamp-ordered) ---
+    # The gap test depends on submission order, but streaming collect does not preserve
+    # row order and the parquet is ~6% out-of-order on adjacent timestamps (multi-CPU
+    # ring buffer). So sort by timestamp_ns after collect. To keep the sorted unit (and
+    # the sort's ~2x transient) small, scan per (comm, op) over only timestamp_ns/sector/
+    # bytes — one op at a time, no op string in the frame, no partition_by full-copy
+    # spike. Peak is ~2x a single op's reduced frame (well under the quantile ceiling).
     if has_sector:
+        has_ts = "timestamp_ns" in schema
+        cols = (["timestamp_ns"] if has_ts else []) + ["sector", "bytes"]
         for (comm, mntns_id_str) in list(_entries.keys()):
             if has_mntns and mntns_id_str:
                 comm_filter = (pl.col("comm") == comm) & (pl.col("mntns_id") == int(mntns_id_str))
             else:
                 comm_filter = (pl.col("comm") == comm)
-            issue_df = (pl.scan_parquet(parquet_path)
-                          .filter(comm_filter)
-                          .filter(pl.col("event") == "issue")
-                          .filter(pl.col("sector").is_not_null())
-                          .select(["op", "sector", "bytes"])
-                          .collect(engine="streaming"))
-            if len(issue_df) == 0:
-                del issue_df
+            base = (pl.scan_parquet(parquet_path)
+                      .filter(comm_filter)
+                      .filter(pl.col("event") == "issue")
+                      .filter(pl.col("sector").is_not_null()))
+            ops = base.select("op").unique().collect(engine="streaming")["op"].to_list()
+            if not ops:
                 continue
             entry = ensure_comm_entry(comm, mntns_id_str)
             entry["access_pattern"].setdefault("rq_sectors", {})
-            for op_part in issue_df.partition_by("op", maintain_order=False):
-                op = op_part["op"][0]
-                sectors = op_part["sector"].cast(pl.Int64).to_numpy()
-                bytes_list = op_part["bytes"].cast(pl.Int64).to_numpy()
-                if len(sectors) >= 2:
-                    entry["access_pattern"]["rq_sectors"][op] = compute_access_pattern(
-                        sectors, bytes_list
-                    )
-            del issue_df
+            for op in ops:
+                op_df = (base.filter(pl.col("op") == op)
+                             .select(cols)
+                             .collect(engine="streaming"))
+                if len(op_df) < 2:
+                    del op_df
+                    continue
+                if has_ts:
+                    op_df = op_df.sort("timestamp_ns")
+                sectors = op_df["sector"].cast(pl.Int64).to_numpy()
+                bytes_list = op_df["bytes"].cast(pl.Int64).to_numpy()
+                entry["access_pattern"]["rq_sectors"][op] = compute_access_pattern(
+                    sectors, bytes_list
+                )
+                del op_df
 
     result = bind_containers(_entries, mntns_map, comm_map)
     result["derived"] = {"duration_s": round(duration_s, 2)}

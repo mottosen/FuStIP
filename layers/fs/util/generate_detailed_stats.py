@@ -358,7 +358,13 @@ def generate_stats(parquet_path):
     if has_offset:
         # Scan per-comm to avoid partition_by on 80M-row DataFrames (partition_by
         # creates full copies — 80M rows × 2 copies = OOM on tight memory budget).
-        # Filter at scan time, keep only the 3 columns needed for gap analysis.
+        # Filter at scan time, keep only the columns needed for gap analysis.
+        # The gap test depends on submission order, but streaming collect does not
+        # preserve row order and the parquet is ~6% out-of-order on adjacent timestamps
+        # (multi-CPU ring buffer). So pull timestamp_ns and sort the reduced frame
+        # eagerly; the per-fd filter below then yields each fd group in submission order.
+        has_ts = "timestamp_ns" in schema
+        cols = (["timestamp_ns"] if has_ts else []) + ["offset", "bytes", "fd"]
         comm_keys = list(_entries.keys())
         for sc in ["pread64", "pwrite64"]:
             for (comm, mntns_id_str) in comm_keys:
@@ -370,11 +376,13 @@ def generate_stats(parquet_path):
                 sc_df = (pl.scan_parquet(parquet_path)
                            .filter((pl.col("event") == "enter") & (pl.col("syscall") == sc)
                                    & pl.col("offset").is_not_null() & comm_filter)
-                           .select(["offset", "bytes", "fd"])
+                           .select(cols)
                            .collect(engine="streaming"))
                 if len(sc_df) < 2:
                     del sc_df
                     continue
+                if has_ts:
+                    sc_df = sc_df.sort("timestamp_ns")
 
                 entry = ensure_comm_entry(comm, mntns_id_str)
                 entry["access_pattern"].setdefault("sc_offsets", {})

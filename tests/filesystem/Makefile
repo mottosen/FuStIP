@@ -23,9 +23,16 @@ MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 FS_DIR = ../../layers/fs
 SYSSTAT_DIR = ../../layers/sysstat
+UTIL_DIR := $(MAKEFILE_DIR)../../util
 
 FIO_OUT = $(RESULTS_DIR)/fio/fs-fio_out.json
 FIO_COMPOSE ?= $(ROOT_DIR)/util/container/fio-test/fio-test.yml
+
+# Docker Compose command, inferred from the environment (provided by devbox):
+# prefer the v2 plugin (`docker compose`), fall back to the standalone binary
+# (`docker-compose`). With the wrong/absent one, `docker` parses the `-f` as a
+# root flag → "unknown shorthand flag: 'f'" / exit 125.
+DOCKER_COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compose" || echo "docker-compose")
 
 VAL_JOBS = val_seqread val_seqwrite val_randread val_randwrite val_randrw
 WORK_JOBS = work_index_search work_bulk_insert work_compaction work_query_insert work_scan work_high_qd
@@ -38,6 +45,16 @@ ensure-sudo:
 	$(Q)echo -e "\nEnsuring sudo is available.."
 	$(Q)sudo -v
 	$(Q)echo -e "Done!\n"
+
+# Build the fio-test image up front (container mode only) so the per-job
+# `docker compose run` does no image-build I/O *inside* the traced window. The
+# build is cached; it only does real work when the context changes.
+.PHONY: prebuild
+prebuild:
+ifdef CONTAINER_FILTER
+	$(Q)FIO_DIR=$(dir $(FIO_FILE)) TEST_DIR=$(MAKEFILE_DIR) RESULTS_DIR=$(RESULTS_DIR) \
+		$(DOCKER_COMPOSE) -f $(FIO_COMPOSE) build $(REDIRECT)
+endif
 
 # ── Aggregate targets ──
 
@@ -54,7 +71,10 @@ stress: $(STRESS_JOBS)
 all: validate workload stress
 
 # ── Per-job pattern ──
-# Each target: start collection → run fio → stop collection → check results
+# Each target: wait for device quiescence → start collection → run fio →
+# stop collection → check results. The quiescence wait (and prebuild prereq)
+# keep the previous job's draining I/O and the container build out of the
+# capture window, which otherwise pollutes short jobs (seq/rnd, counts).
 
 ifeq ($(MODE),detailed)
     FS_OUT_FLAG = --fs-out $(RESULTS_DIR)/fs/detailed-stats.json
@@ -77,17 +97,18 @@ endif
 
 define JOB_TEMPLATE
 .PHONY: $(1)
-$(1): ensure-sudo
+$(1): ensure-sudo prebuild
 	$(Q)echo -e "\n============================================================"
 	$(Q)echo -e "  Running: $(1)  [mode=$(MODE)]"
 	$(Q)echo -e "============================================================\n"
+	$(Q)bash $(UTIL_DIR)/wait_device_idle.sh "$(if $(DEV_FILTER),$(DEV_FILTER),$(FIO_FILE))" 10 $(REDIRECT) || true
 	$(if $(filter fs,$(LAYERS)),$(Q)$(MAKE) -C $(FS_DIR) start-collection $(LAYER_VARS) $(REDIRECT))
 	$(if $(filter sysstat,$(LAYERS)),$(Q)$(MAKE) -C $(SYSSTAT_DIR) start-collection $(LAYER_VARS) $(REDIRECT))
 	$(Q)sleep 5
 	$(Q)mkdir -p $(RESULTS_DIR)/fio
 ifdef CONTAINER_FILTER
 	$(Q)FIO_DIR=$(dir $(FIO_FILE)) TEST_DIR=$(MAKEFILE_DIR) RESULTS_DIR=$(RESULTS_DIR) \
-		docker compose -f $(FIO_COMPOSE) run --rm --build --name $(CONTAINER_FILTER) \
+		$(DOCKER_COMPOSE) -f $(FIO_COMPOSE) run --rm --name $(CONTAINER_FILTER) \
 		fio-test ./jobs.fio \
 		--filename=$(FIO_FILE) --output-format=json \
 		--output=$(FIO_OUT) --section=$(1) \

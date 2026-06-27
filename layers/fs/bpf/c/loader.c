@@ -15,6 +15,10 @@
 
 static volatile sig_atomic_t running = 1;
 static FILE *output;
+// 4 MB fully-buffered stdio buffer for the CSV. Collapses per-event writes into
+// large write() syscalls so the single-threaded ring-buffer consumer drains fast
+// enough to avoid reserve drops under bursty, high-queue-depth workloads.
+static char output_buf[1 << 22];
 #define MAX_CONTAINER_FILTERS 32
 #define MAX_COMM_FILTERS 8
 #define MAX_PID_FILTERS 8
@@ -93,37 +97,38 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	char comm[17] = {};
 	memcpy(comm, e->comm, 16);
 
+	// Build the whole CSV line in memory, then emit it with a single fwrite.
+	// Far cheaper than a dozen locking fprintf calls per event, which is what
+	// let the ring buffer overflow under high-queue-depth bursts.
 	// Format: timestamp_ns,mntns_id,event,syscall,bytes,latency_ns,fd,offset,tid,comm,inflight
-	fprintf(output, "%llu,%llu,%s,%s,",
-		e->timestamp_ns, e->mntns_id, event, sc_name(e->syscall));
-
-	// bytes
+	char line[256];
+	int n = 0;
+	n += snprintf(line + n, sizeof(line) - n, "%llu,%llu,%s,%s,",
+		      e->timestamp_ns, e->mntns_id, event, sc_name(e->syscall));
 	if (e->bytes != 0)
-		fprintf(output, "%lld,", e->bytes);
+		n += snprintf(line + n, sizeof(line) - n, "%lld,", e->bytes);
 	else
-		fprintf(output, ",");
-
-	// latency_ns
+		line[n++] = ',';
 	if (e->latency_ns > 0)
-		fprintf(output, "%llu,", e->latency_ns);
+		n += snprintf(line + n, sizeof(line) - n, "%llu,", e->latency_ns);
 	else
-		fprintf(output, ",");
-
-	// fd
+		line[n++] = ',';
 	if (e->fd >= 0)
-		fprintf(output, "%d,", e->fd);
+		n += snprintf(line + n, sizeof(line) - n, "%d,", e->fd);
 	else
-		fprintf(output, ",");
-
-	// offset
+		line[n++] = ',';
 	if (e->offset >= 0)
-		fprintf(output, "%lld,", e->offset);
+		n += snprintf(line + n, sizeof(line) - n, "%lld,", e->offset);
 	else
-		fprintf(output, ",");
+		line[n++] = ',';
+	n += snprintf(line + n, sizeof(line) - n, "%u,%s,%d\n",
+		      e->tid, comm, e->inflight);
 
-	// tid,comm,inflight
-	fprintf(output, "%u,%s,%d\n", e->tid, comm, e->inflight);
-
+	// snprintf returns the would-be length; clamp so a hypothetical overlong
+	// line can never make fwrite read past the buffer (free: just a compare).
+	if (n > (int)sizeof(line))
+		n = sizeof(line);
+	fwrite(line, 1, n, output);
 	return 0;
 }
 
@@ -269,8 +274,9 @@ int main(int argc, char **argv)
 	int container_count = 0;
 	int container_resolved[MAX_CONTAINER_FILTERS] = {};
 	int opt;
+	int verbose = 0;
 
-	while ((opt = getopt(argc, argv, "o:p:P:c:")) != -1) {
+	while ((opt = getopt(argc, argv, "o:p:P:c:v")) != -1) {
 		switch (opt) {
 		case 'o':
 			output_path = optarg;
@@ -283,6 +289,9 @@ int main(int argc, char **argv)
 			break;
 		case 'c':
 			container_filter = optarg;
+			break;
+		case 'v':
+			verbose = 1;
 			break;
 		default:
 			usage(argv[0]);
@@ -337,6 +346,7 @@ int main(int argc, char **argv)
 		standalone_bpf__destroy(skel);
 		return 1;
 	}
+	setvbuf(output, output_buf, _IOFBF, sizeof(output_buf));
 	fprintf(output, "timestamp_ns,mntns_id,event,syscall,bytes,latency_ns,fd,offset,tid,comm,inflight\n");
 
 	struct ring_buffer *rb = ring_buffer__new(
@@ -346,6 +356,15 @@ int main(int argc, char **argv)
 		fclose(output);
 		standalone_bpf__destroy(skel);
 		return 1;
+	}
+
+	// Past setup: silence the loader's informational runtime logs (tracing-started
+	// banner, container resolution, stop/counters) so they don't reach the terminal
+	// in normal runs. Done by reopening our own stderr — which a backgrounded sudo
+	// can't reconnect to the tty. The Makefile passes -v only in DEBUG mode; setup
+	// and attach errors above still surface.
+	if (!verbose && freopen("/dev/null", "w", stderr) == NULL) {
+		// best-effort: if the redirect fails, informational logs may still appear
 	}
 
 	fprintf(stderr, "FS layer detailed tracing started (container: %s, comm: %s, pid: %s)...\n",

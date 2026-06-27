@@ -21,11 +21,12 @@ endif
 
 MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-BLOCK_DIR = ../../layers/block
+# nvme_direct exercises the NVMe layer over io_uring_cmd passthrough, which
+# bypasses the block layer — so this suite only profiles the nvme layer.
 NVME_DIR = ../../layers/nvme
 UTIL_DIR := $(MAKEFILE_DIR)../../util
 
-FIO_OUT = $(RESULTS_DIR)/fio/block_nvme-fio_out.json
+FIO_OUT = $(RESULTS_DIR)/fio/nvme_direct-fio_out.json
 FIO_COMPOSE ?= $(ROOT_DIR)/util/container/fio-test/fio-test.yml
 
 # Docker Compose command, inferred from the environment (provided by devbox):
@@ -45,6 +46,14 @@ ensure-sudo:
 	$(Q)echo -e "\nEnsuring sudo is available.."
 	$(Q)sudo -v
 	$(Q)echo -e "Done!\n"
+
+# Safety guard: passthrough writes hit the whole namespace from LBA 0, so refuse
+# to run against a device with mounted partitions or data signatures. Override a
+# stray signature (never a mount) on a genuine scratch device with
+# ALLOW_NONEMPTY_DEVICE=1.
+.PHONY: ensure-device-free
+ensure-device-free:
+	$(Q)python $(MAKEFILE_DIR)assert_device_free.py "$(FIO_FILE)"
 
 # Build the fio-test image up front (container mode only) so the per-job
 # `docker compose run` does no image-build I/O *inside* the traced window. The
@@ -77,16 +86,14 @@ all: validate workload stress
 # capture window, which otherwise pollutes short jobs (seq/rnd, counts).
 
 ifeq ($(MODE),detailed)
-    BLOCK_OUT_FLAG = --block-out $(RESULTS_DIR)/block/detailed-stats.json
     NVME_OUT_FLAG = --nvme-out $(RESULTS_DIR)/nvme/detailed-stats.json
     MODE_FLAG = --mode detailed
 else
-    BLOCK_OUT_FLAG = --block-out $(RESULTS_DIR)/block/trace.out
     NVME_OUT_FLAG = --nvme-out $(RESULTS_DIR)/nvme/trace.out
     MODE_FLAG =
 endif
 
-LAYERS ?= block nvme
+LAYERS ?= nvme
 
 # Variables passed to layer Makefiles
 ifdef CONTAINER_FILTER
@@ -99,12 +106,11 @@ endif
 
 define JOB_TEMPLATE
 .PHONY: $(1)
-$(1): ensure-sudo prebuild
+$(1): ensure-device-free ensure-sudo prebuild
 	$(Q)echo -e "\n============================================================"
-	$(Q)echo -e "  Running: $(1)  [mode=$(MODE)]"
+	$(Q)echo -e "  Running: $(1)  [mode=$(MODE)]  (io_uring_cmd / nvme passthrough)"
 	$(Q)echo -e "============================================================\n"
 	$(Q)bash $(UTIL_DIR)/wait_device_idle.sh "$(if $(DEV_FILTER),$(DEV_FILTER),$(FIO_FILE))" 10 $(REDIRECT) || true
-	$(if $(filter block,$(LAYERS)),$(Q)$(MAKE) -C $(BLOCK_DIR) start-collection $(LAYER_VARS) $(REDIRECT))
 	$(if $(filter nvme,$(LAYERS)),$(Q)$(MAKE) -C $(NVME_DIR) start-collection $(LAYER_VARS) $(REDIRECT))
 	$(Q)sleep 5
 	$(Q)mkdir -p $(RESULTS_DIR)/fio
@@ -121,18 +127,12 @@ else
 		--section=$(1)
 endif
 	$(Q)sleep 5
-	$(Q)( \
-		$(if $(filter nvme,$(LAYERS)), $(MAKE) -C $(NVME_DIR) stop-profiling $(LAYER_VARS) $(REDIRECT) &) \
-		$(if $(filter block,$(LAYERS)), $(MAKE) -C $(BLOCK_DIR) stop-profiling $(LAYER_VARS) $(REDIRECT) &) \
-		wait )
+	$(if $(filter nvme,$(LAYERS)),$(Q)$(MAKE) -C $(NVME_DIR) stop-profiling $(LAYER_VARS) $(REDIRECT))
 	$(if $(filter nvme,$(LAYERS)),$(Q)$(MAKE) -C $(NVME_DIR) csv-to-parquet $(LAYER_VARS) $(REDIRECT))
-	$(if $(filter block,$(LAYERS)),$(Q)$(MAKE) -C $(BLOCK_DIR) csv-to-parquet $(LAYER_VARS) $(REDIRECT))
 	$(if $(filter nvme,$(LAYERS)),$(Q)$(MAKE) -C $(NVME_DIR) generate-stats $(LAYER_VARS) $(REDIRECT))
-	$(if $(filter block,$(LAYERS)),$(Q)$(MAKE) -C $(BLOCK_DIR) generate-stats $(LAYER_VARS) $(REDIRECT))
 	$(Q)sleep 1
 	$(Q)python $(MAKEFILE_DIR)check_test.py --job $(1) \
 		--fio-json $(FIO_OUT) \
-		$(if $(filter block,$(LAYERS)),$(BLOCK_OUT_FLAG)) \
 		$(if $(filter nvme,$(LAYERS)),$(NVME_OUT_FLAG)) \
 		$(MODE_FLAG) \
 		$(CONTAINER_FLAG)

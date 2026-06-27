@@ -1,0 +1,238 @@
+[global]
+; ── Target ──
+size=1G
+
+; ── Engine ──
+; NVMe passthrough via io_uring_cmd. The fio target (--filename) must be the
+; NVMe *generic char device* (/dev/ngXnY), NOT the block device (/dev/nvmeXnY):
+; passthrough commands are submitted straight to the NVMe driver, bypassing the
+; block layer entirely. No direct=1 here — passthrough already bypasses the page
+; cache, and the char device does not support O_DIRECT (fio would error on open).
+ioengine=io_uring_cmd
+cmd_type=nvme
+
+; ── Reporting ──
+group_reporting=1
+numjobs=1
+
+; ── Latency distribution ──
+lat_percentiles=1
+percentile_list=1:5:10:20:30:40:50:60:70:80:90:95:99:99.5:99.9:99.95:99.99
+
+
+; ============================================================
+;  0  File prep — sequential write to pre-populate the range
+; ============================================================
+; Raw namespace: no file to fallocate, so prep simply writes the working set
+; through the same passthrough engine (sync/fallocate are invalid on /dev/ngXnY).
+[prep]
+rw=write
+bs=1m
+time_based=0
+stonewall
+
+
+; ============================================================
+;  A  Validation — simple, predictable jobs for profiler checks
+; ============================================================
+; QD=1, short runtime, single op type.  Each job targets one
+; metric to verify exact match with FIO.
+
+; Sequential read counting — QD=1, 128K sequential reads.
+; Verifies profiler captures exact IO count and byte total.
+; Expected access pattern: sequential.
+[val_seqread]
+rw=read
+bs=128k
+iodepth=1
+time_based=1
+runtime=5
+stonewall
+
+; Sequential write counting — QD=1, 128K sequential writes.
+; Verifies profiler captures exact IO count and byte total.
+; Expected access pattern: sequential.
+[val_seqwrite]
+rw=write
+bs=128k
+iodepth=1
+time_based=1
+runtime=5
+stonewall
+
+; Random read counting — QD=1, 4K random reads.
+; Verifies profiler captures exact IO count and byte total.
+; Expected access pattern: random.
+[val_randread]
+rw=randread
+bs=4k
+iodepth=1
+time_based=1
+runtime=5
+stonewall
+
+; Random write counting — QD=1, 4K random writes.
+; Verifies profiler captures exact IO count and byte total.
+; Expected access pattern: random.
+[val_randwrite]
+rw=randwrite
+bs=4k
+iodepth=1
+time_based=1
+runtime=5
+stonewall
+
+; Mixed random read/write — QD=1, 50/50 4K random reads+writes.
+; Verifies profiler correctly splits and counts mixed IO.
+; Expected access pattern: random.
+[val_randrw]
+rw=randrw
+rwmixread=50
+bs=4k
+iodepth=1
+time_based=1
+runtime=5
+stonewall
+
+; High QD stress — maximize NVMe inflights (4 threads × QD256 = 1024 slots).
+; Tests profiler under extreme queue depth / concurrency.
+; Expected access pattern: random.
+[val_high_qd]
+rw=randread
+bs=4k
+iodepth=256
+numjobs=4
+size=16G
+time_based=1
+runtime=5
+stonewall
+
+
+; ============================================================
+;  B  Workloads — VDB-like heavy IO patterns
+; ============================================================
+; Longer runtime, larger file, higher queue depths.
+
+; ANN vector search — random 4K reads across index structures.
+; Simulates vector similarity search access pattern.
+; Expected access pattern: random.
+[work_index_search]
+rw=randread
+bs=4k
+iodepth=64
+size=16G
+time_based=1
+runtime=30
+stonewall
+
+; Batch vector insert — sequential large writes.
+; Simulates bulk data ingestion with sequential 128K writes.
+; Expected access pattern: sequential.
+[work_bulk_insert]
+rw=write
+bs=128k
+iodepth=32
+size=16G
+time_based=1
+runtime=30
+stonewall
+
+; Background compaction — read old segments, write new ones.
+; Simulates LSM/segment compaction with mixed random 128K IO.
+; Expected access pattern: random.
+[work_compaction]
+rw=randrw
+rwmixread=50
+bs=128k
+iodepth=16
+size=16G
+time_based=1
+runtime=30
+stonewall
+
+; Concurrent queries (reads) + inserts (writes).
+; Simulates mixed query+insert workload with 70/30 random 4K IO.
+; Expected access pattern: random.
+[work_query_insert]
+rw=randrw
+rwmixread=70
+bs=4k
+iodepth=32
+size=16G
+time_based=1
+runtime=30
+stonewall
+
+; Full table/partition sequential scan.
+; Simulates brute-force scan with sequential 128K reads.
+; Expected access pattern: sequential.
+[work_scan]
+rw=read
+bs=128k
+iodepth=64
+size=16G
+time_based=1
+runtime=30
+stonewall
+
+; Stress test — max inflight random reads/writes (8 threads).
+; Tests profiler under extreme concurrency and event rate.
+; Expected access pattern: random.
+[work_high_qd]
+rw=randrw
+bs=4k
+iodepth=256
+numjobs=8
+size=16G
+time_based=1
+runtime=30
+stonewall
+
+
+; ============================================================
+;  C  Stress — sustained profiling over long durations
+; ============================================================
+; High-rate mixed random IO to stress profiler event handling,
+; ring buffer throughput, and counter accuracy over time.
+
+; 2-minute sustained mixed random IO — baseline stress test.
+; 4 threads × QD128 = 512 in-flight IOs, 4K random reads/writes.
+; Expected access pattern: random.
+[stress_2m]
+rw=randrw
+rwmixread=50
+bs=4k
+iodepth=128
+numjobs=4
+size=16G
+time_based=1
+runtime=120
+stonewall
+
+; 5-minute sustained — tests profiler stability over medium duration.
+; Same parameters as stress_2m with extended runtime.
+; Expected access pattern: random.
+[stress_5m]
+rw=randrw
+rwmixread=50
+bs=4k
+iodepth=128
+numjobs=4
+size=16G
+time_based=1
+runtime=300
+stonewall
+
+; 10-minute sustained — longest stress test, exercises prolonged collection.
+; Same parameters as stress_2m with extended runtime.
+; Expected access pattern: random.
+[stress_10m]
+rw=randrw
+rwmixread=50
+bs=4k
+iodepth=128
+numjobs=4
+size=16G
+time_based=1
+runtime=600
+stonewall

@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "util"))
-from stats_generation.shared import parse_counters
+from stats_generation.shared import parse_counters, print_data_quality
 
 
 def parse_fio_json(path):
@@ -59,18 +59,44 @@ def parse_detailed_stats(path):
 def parse_access_pattern(path):
     """Extract access_pattern section from detailed-stats.json.
 
-    Merges access patterns across all per-comm and per-container labels.
-    In tests there is typically one label, so last-write-wins is fine.
+    Merges access patterns across all per-comm and per-container labels. An op can
+    appear under several label entries, so pool the raw sequential/random counts across
+    them and recompute the percentages (mirroring how counters are summed), rather than
+    letting one entry overwrite another.
     """
     with open(path) as f:
         stats = json.load(f)
     merged = {}
     for entry in _iter_label_entries(stats):
-        for key, val in entry.get("access_pattern", {}).items():
-            if key not in merged:
-                merged[key] = {}
-            merged[key].update(val)
+        for key, ops in entry.get("access_pattern", {}).items():
+            dst = merged.setdefault(key, {})
+            for op, ap in ops.items():
+                _pool_access_pattern(dst, op, ap)
     return merged
+
+
+def _pool_access_pattern(dst, op, ap):
+    """Accumulate one op's access-pattern entry into dst[op] by summing raw counts.
+
+    Falls back to keeping the existing (or first) entry when the raw
+    sequential/random counts are not both present to pool with.
+    """
+    cur = dst.get(op)
+    if cur is None:
+        dst[op] = dict(ap)
+        return
+    if "sequential_count" not in ap or "sequential_count" not in cur:
+        return  # counts unavailable on one side — keep the existing entry
+    seq = cur["sequential_count"] + ap["sequential_count"]
+    rnd = cur["random_count"] + ap["random_count"]
+    tot = seq + rnd
+    dst[op] = {
+        "total_ios": cur.get("total_ios", 0) + ap.get("total_ios", 0),
+        "sequential_count": seq,
+        "random_count": rnd,
+        "sequential_pct": round(100 * seq / tot, 2) if tot else 0,
+        "random_pct": round(100 * rnd / tot, 2) if tot else 0,
+    }
 
 
 SEQUENTIAL_JOBS = {"val_seqread", "val_seqwrite", "work_bulk_insert", "work_scan"}
@@ -249,6 +275,9 @@ def main():
                  if get_val(fs, "sc_count", sc) > 0]
     if aux_parts:
         print(f"        {', '.join(aux_parts)}")
+
+    if args.mode == "detailed":
+        print_data_quality(args.fs_out)
 
     print()
 

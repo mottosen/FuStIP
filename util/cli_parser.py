@@ -90,12 +90,22 @@ def parse_args(argv=None):
     profile_sub.add_parser("start", parents=[parent], help="Start profiling")
     profile_sub.add_parser("stop", parents=[parent], help="Stop profiling")
 
+    # Test-only flags (kept off the shared parent so they don't pollute `profile`).
+    test_parent = argparse.ArgumentParser(add_help=False)
+    test_parent.add_argument(
+        "--nvme-direct", dest="nvme_direct", action="store_true",
+        help="Route the nvme layer through the io_uring_cmd / NVMe passthrough "
+             "suite (tests/nvme_direct) instead of tests/block_nvme. Passthrough "
+             "bypasses the block layer, so only the nvme layer is profiled. "
+             "FIO_FILE must point to the generic char device (/dev/ngXnY) while "
+             "-d/--dev-filter stays the namespace name (e.g. nvme0n1). [CLI only]")
+
     test_parser = action_sub.add_parser("test", help="Run test suite(s)")
     test_sub = test_parser.add_subparsers(dest="sub_action", required=True)
-    test_sub.add_parser("validate", parents=[parent], help="Run validation jobs")
-    test_sub.add_parser("vdb", parents=[parent], help="Run VDB-like workload jobs")
-    test_sub.add_parser("stress", parents=[parent], help="Run stress (long-duration) jobs")
-    test_sub.add_parser("all", parents=[parent], help="Run all test jobs")
+    test_sub.add_parser("validate", parents=[parent, test_parent], help="Run validation jobs")
+    test_sub.add_parser("vdb", parents=[parent, test_parent], help="Run VDB-like workload jobs")
+    test_sub.add_parser("stress", parents=[parent, test_parent], help="Run stress (long-duration) jobs")
+    test_sub.add_parser("all", parents=[parent, test_parent], help="Run all test jobs")
 
     args = parser.parse_args(argv)
 
@@ -107,9 +117,14 @@ def parse_args(argv=None):
     # container_filter conflict check, so an explicit `mode: summary` alongside a
     # container_filter can be distinguished from an unset mode and rejected.
 
+    # --nvme-direct routes through the io_uring_cmd / NVMe passthrough suite, which
+    # bypasses the block layer and profiles only nvme. Default to nvme alone when
+    # -l is omitted, and reject any other layer if -l is given explicitly.
+    nvme_direct = getattr(args, "nvme_direct", False)
+
     # Flatten comma-separated values from repeated -l flags
     if args.layers is None:
-        args.layers = list(ALL_LAYERS)
+        args.layers = ["nvme"] if nvme_direct else list(ALL_LAYERS)
         return args
 
     raw = []
@@ -132,6 +147,12 @@ def parse_args(argv=None):
                 seen.add(l)
                 unique.append(l)
         args.layers = unique
+
+    if nvme_direct and set(args.layers) != {"nvme"}:
+        parser.error(
+            "--nvme-direct profiles only the nvme layer (passthrough bypasses the "
+            "block layer); pass -l nvme or omit -l"
+        )
 
     return args
 
@@ -170,6 +191,19 @@ def validate(args):
             print("Error: nvme layer requires -d/--dev-filter, -p/--comm-filter, or "
                   "-P/--pid-filter (or -c/--container-filter)", file=sys.stderr)
             sys.exit(1)
+        # nvme summary mode is single-device only: its bpftrace maps are keyed by
+        # op (not disk), so a multi-device filter would silently merge devices'
+        # counts/latency and mis-normalize the LBA histogram (one device's capacity
+        # for all). Detailed mode keeps per-event disk_name and can break down per
+        # device. Enforce one device here rather than emit wrong aggregates.
+        if "nvme" in args.layers and args.mode != "detailed" and args.dev_filter:
+            devs = [d for d in args.dev_filter.split(",") if d.strip()]
+            if len(devs) > 1:
+                print("Error: nvme summary mode profiles one device at a time "
+                      f"(got -d {args.dev_filter}); pass a single device, use "
+                      "detailed mode (-m detailed), or run separate profiles",
+                      file=sys.stderr)
+                sys.exit(1)
         if not is_test:
             if "block" in args.layers and not (args.dev_filter or has_proc):
                 print("Error: block layer requires -d/--dev-filter, -p/--comm-filter, or "
@@ -189,9 +223,14 @@ def resolve_env(args):
     if not args.results_dir:
         print("Error: results dir not set (use --results-dir or RESULTS_DIR env var)", file=sys.stderr)
         sys.exit(1)
+    # Anchor to an absolute path: the layer Makefiles run with their own CWD
+    # (layers/<x>), so a relative RESULTS_DIR would resolve against the wrong
+    # directory and fail ensure-results-exists.
+    args.results_dir = os.path.abspath(args.results_dir)
 
     if not args.tmp_dir:
         args.tmp_dir = os.environ.get("FUSTIP_TMP_DIR") or args.results_dir
+    args.tmp_dir = os.path.abspath(args.tmp_dir)
 
     if args.action == "test":
         fio_file = os.environ.get("FIO_FILE")
@@ -390,8 +429,15 @@ def generate_test_commands(args):
         cmds.append(map_cmd)
 
     # Determine which layers within each suite are selected
-    block_nvme_layers = sorted(TEST_SUITES["block_nvme"] & selected)
+    block_nvme_set = TEST_SUITES["block_nvme"] & selected
     filesystem_layers = sorted(TEST_SUITES["filesystem"] & selected)
+
+    # --nvme-direct re-routes the nvme layer to the io_uring_cmd passthrough
+    # suite (nvme only), pulling it out of the block_nvme grouping.
+    nvme_direct = getattr(args, "nvme_direct", False) and "nvme" in block_nvme_set
+    if nvme_direct:
+        block_nvme_set = block_nvme_set - {"nvme"}
+    block_nvme_layers = sorted(block_nvme_set)
 
     if block_nvme_layers:
         vs = []
@@ -415,6 +461,26 @@ def generate_test_commands(args):
         vs.append(f"FIO_FILE={args.fio_file}")
         vs.append(f"RESULTS_DIR={args.results_dir}")
         cmds.append(f"make -C tests/block_nvme {target} {' '.join(vs)} || echo '!! block_nvme suite failed'")
+
+    if nvme_direct:
+        # io_uring_cmd / NVMe passthrough suite — nvme layer only (the Makefile
+        # defaults to LAYERS=nvme). FIO_FILE must be the generic char device
+        # (/dev/ngXnY); DEV_FILTER stays the namespace name for the nvme layer.
+        vs = []
+        if args.debug:
+            vs.append("DEBUG=1")
+        if args.container_filter:
+            vs.append(f"CONTAINER_FILTER={args.container_filter}")
+        else:
+            vs.append(f"MODE={args.mode}")
+        vs.append("COMM_FILTER=fio")
+        if args.dev_filter:
+            vs.append(f"DEV_FILTER={args.dev_filter}")
+        if args.pid_filter:
+            vs.append(f"PID_FILTER={args.pid_filter}")
+        vs.append(f"FIO_FILE={args.fio_file}")
+        vs.append(f"RESULTS_DIR={args.results_dir}")
+        cmds.append(f"make -C tests/nvme_direct {target} {' '.join(vs)} || echo '!! nvme_direct suite failed'")
 
     if filesystem_layers:
         vs = []

@@ -141,10 +141,10 @@ int BPF_PROG(nvme_setup_cmd, void *ns, struct request *req) {
 }
 
 SEC("raw_tracepoint/nvme_setup_cmd")
-int BPF_PROG(nvme_rawtp_setup) {
-  // No filtering here — fentry already filtered.
-  // Just pick up the rq pointer from the fentry bridge.
-  return handle_nvme_rawtp_setup();
+int BPF_PROG(nvme_rawtp_setup, struct request *req, void *cmd) {
+  // No filtering here — fentry already filtered. Pick up the rq pointer from the
+  // fentry bridge; `cmd` (struct nvme_command *) carries the real opcode/SLBA.
+  return handle_nvme_rawtp_setup(cmd);
 }
 
 SEC("raw_tracepoint/nvme_complete_rq")

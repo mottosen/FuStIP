@@ -48,10 +48,32 @@ def _run_json(cmd):
         return None
 
 
+def _all_nvme_namespaces():
+    """Every NVMe namespace block device on the host (e.g. nvme0n1, nvme1n1).
+
+    Used when no device filter is given (container/comm/pid-scoped runs) so the
+    fingerprint still covers whichever device the workload hits. Namespace devices
+    match nvmeXnY; partitions (nvmeXnYpZ) are excluded.
+    """
+    try:
+        names = [p.name for p in Path("/sys/block").glob("nvme*")]
+    except OSError:
+        return []
+    return sorted(n for n in names if re.match(r"^nvme\d+n\d+$", n))
+
+
 def _sysfs_int(dev, rel):
     try:
         return int(Path(f"/sys/block/{dev}/{rel}").read_text().strip())
     except (OSError, ValueError):
+        return None
+
+
+def _sysfs_mq_count(dev):
+    """Number of hardware (I/O) queues: count numeric subdirs in /sys/block/<dev>/mq."""
+    try:
+        return sum(1 for p in Path(f"/sys/block/{dev}/mq").iterdir() if p.name.isdigit())
+    except OSError:
         return None
 
 
@@ -85,6 +107,12 @@ def collect_device(dev, nvme_list):
         "physical_block_bytes": _sysfs_int(dev, "queue/physical_block_size"),
         "model": _sysfs_str(dev, "device/model"),
         "serial": _sysfs_str(dev, "device/serial"),
+        # Queue geometry for on-device queue-distribution analysis: hw_queues is
+        # the I/O queue count, hw_queue_depth the per-queue tag depth (NVMe SQ
+        # depth), block_nr_requests the block-layer scheduler queue depth.
+        "hw_queues": _sysfs_mq_count(dev),
+        "hw_queue_depth": _sysfs_int(dev, "mq/0/nr_tags"),
+        "block_nr_requests": _sysfs_int(dev, "queue/nr_requests"),
     }
 
     # nvme list (no root) — richer/cleaner identity + sizing.
@@ -128,6 +156,11 @@ def main():
         return
     results_dir = Path(sys.argv[1])
     devs = [d.strip() for d in sys.argv[2].split(",") if d.strip()]
+    if not devs:
+        # No device filter (container/comm/pid-scoped run): fingerprint every NVMe
+        # namespace so post-processing has geometry for whichever device the workload
+        # actually hit, regardless of -d.
+        devs = _all_nvme_namespaces()
     if not devs:
         return
 

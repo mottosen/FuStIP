@@ -2,10 +2,12 @@ ifdef DEBUG
     Q =
     ERR_REDIRECT =
     OUT_REDIRECT =
+    VERBOSE_FLAG = -v
 else
     Q = @
     ERR_REDIRECT = 2>/dev/null
     OUT_REDIRECT = 1>/dev/null
+    VERBOSE_FLAG =
     MAKEFLAGS += --no-print-directory
 endif
 
@@ -58,11 +60,10 @@ endif
 
 	$(Q)mkdir -p "$(PIDS_DIR)"
 
-# Device fingerprint (nvme-cli + sysfs) — independent of mode; captured
-# whenever a device filter names the target device(s).
-	$(Q)if [ -n "$(DEV_FILTER)" ]; then \
-		python "./util/collect_device_info.py" "$(RESULTS_DIR)" "$(DEV_FILTER)" $(ERR_REDIRECT) || true; \
-	fi
+# Device fingerprint (nvme-cli + sysfs) — independent of mode; captured whenever the
+# nvme layer runs so post-processing always has logical-block size / capacity, even
+# without -d. With no DEV_FILTER, collect_device_info enumerates all NVMe namespaces.
+	$(Q)python "./util/collect_device_info.py" "$(RESULTS_DIR)" "$(DEV_FILTER)" $(ERR_REDIRECT) || true
 
 ifeq ($(MODE),detailed)
 	$(Q)echo -e "\nStarting detailed collection.."
@@ -77,29 +78,55 @@ ifeq ($(MODE),detailed)
 		$(if $(COMM_FILTER),-p $(COMM_FILTER)) \
 		$(if $(PID_FILTER),-P $(PID_FILTER)) \
 		$(if $(CONTAINER_FILTER),-c $(CONTAINER_FILTER)) \
+		$(VERBOSE_FLAG) \
 		$(ERR_REDIRECT) 1>&2 & echo $$! > "$(PIDS_DIR)/detailed.pid"
 
 	$(Q)echo -e "Detailed collection is running!\n"
 else
 	$(Q)echo -e "\nStarting bpftrace collection.."
 
-	$(Q)sudo $(BPFTRACE) ./bt/trace.bt "$(if $(DEV_FILTER),$(DEV_FILTER),_)" "$(if $(COMM_FILTER),$(COMM_FILTER),_)" $$(echo '$(PID_FILTER)' | tr ',' ' ') \
+# Remove any stale output first so the readiness poll below can't match a marker
+# left by a previous run (bpftrace also truncates on open, but this closes the race).
+	$(Q)sudo rm -f "$(RESULTS_DIR)/nvme/trace.out" $(ERR_REDIRECT) || true
+
+	$(Q)sudo $(BPFTRACE) ./bt/trace.bt "$(if $(DEV_FILTER),$(DEV_FILTER),_)" "$(if $(COMM_FILTER),$(COMM_FILTER),_)" \
+		$$(python -c "import json; d=json.load(open('$(RESULTS_DIR)/nvme/device-info.json')); dev='$(DEV_FILTER)'.split(',')[0]; print(d.get(dev,{}).get('nsze_lbas',0))" 2>/dev/null || echo 0) \
+		$$(echo '$(PID_FILTER)' | tr ',' ' ') \
 		--no-warnings \
 		-o "$(RESULTS_DIR)/nvme/trace.out" \
 		$(ERR_REDIRECT) 1>&2 & echo $$! > "$(PIDS_DIR)/trace.pid"
+
+# Block until bpftrace has attached every probe: its BEGIN block prints the marker
+# below to trace.out only after attach completes. Waiting for it (instead of a blind
+# sleep in the caller) prevents losing the head of the workload to slow/variable probe
+# attach. Bail out if bpftrace dies first, or after a 10s timeout.
+	$(Q)pid=$$(cat "$(PIDS_DIR)/trace.pid"); i=0; \
+		until sudo grep -q "bpftrace - NVMe Layer" "$(RESULTS_DIR)/nvme/trace.out" 2>/dev/null; do \
+			if [ ! -d "/proc/$$pid" ]; then echo "bpftrace exited before becoming ready" >&2; break; fi; \
+			i=$$((i+1)); if [ $$i -ge 100 ]; then echo "timed out waiting for bpftrace attach" >&2; break; fi; \
+			sleep 0.1; \
+		done
 
 	$(Q)echo -e "bpftrace collection is running!\n"
 endif
 
 .PHONY: stop-profiling
-stop-profiling:
+stop-profiling: ensure-sudo
+# The pidfile holds the backgrounded `sudo` wrapper's PID, not the loader's. The
+# loader runs as root (sudo's child), so signal it via -P as root: SIGTERM first so
+# it flushes counters and closes detailed.csv cleanly, wait for exit, then SIGKILL as
+# a backstop and reap the wrapper. A plain unprivileged `kill` of the wrapper PID is
+# EPERM (root process) and orphans the loader, which keeps its since-unlinked CSV
+# open and silently eats disk until reboot.
 	$(Q)for pidfile in $(PIDS_DIR)/*.pid; do \
 		if [ -f "$$pidfile" ]; then \
 			pid=$$(cat "$$pidfile"); \
-			kill $$pid $(ERR_REDIRECT) 1>&2 || true; \
-			i=0; while [ -d "/proc/$$pid" ] && [ $$i -lt 50 ]; do \
+			sudo pkill -TERM -P $$pid $(ERR_REDIRECT) 1>&2 || true; \
+			i=0; while sudo pgrep -P $$pid >/dev/null 2>&1 && [ $$i -lt 50 ]; do \
 				sleep 0.2; i=$$((i+1)); \
 			done; \
+			sudo pkill -KILL -P $$pid $(ERR_REDIRECT) 1>&2 || true; \
+			sudo kill $$pid $(ERR_REDIRECT) 1>&2 || true; \
 		fi; \
 	done
 	$(Q)rm -rf "$(PIDS_DIR)"
