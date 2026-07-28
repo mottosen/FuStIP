@@ -5,6 +5,11 @@ Reads cpu.csv, mem.csv, dev.csv from the results directory,
 groups by command, computes per-metric aggregate statistics,
 and writes sysstat-stats.json.
 
+cgroup_mem.csv, when present, is folded in as two further sections
+(cgroup_mem, cgroup_mem_events) covering what pidstat's process-resident
+figures cannot see — page cache in particular. It is optional: runs predating
+the collector, and layers configured without it, simply omit both sections.
+
 Usage:
     python ./util/generate_stats.py <results_dir>
 """
@@ -194,6 +199,166 @@ def dev_stats(rows):
     return result
 
 
+# ── cgroup memory (cgroup_mem.csv) ──
+
+# Sentinel written by collect_cgroup_mem.py for a field the kernel does not expose
+# on that cgroup (the root cgroup has memory.stat but no memory.current/.events/
+# .peak/.max, and memory.peak is missing on older kernels).
+CGROUP_ABSENT = -1
+
+CGROUP_GAUGES = [
+    "memory_current", "memory_peak",
+    "anon", "file", "active_file", "inactive_file", "file_mapped",
+    "shmem", "slab", "kernel", "pagetables", "percpu", "sock",
+]
+# Cumulative-since-cgroup-creation counters. Percentiles of a monotone counter are
+# meaningless, so these get first/last/delta instead of a stat block.
+CGROUP_COUNTERS = [
+    "ev_low", "ev_high", "ev_max", "ev_oom", "ev_oom_kill",
+    "pgmajfault", "pgscan", "pgsteal",
+    "workingset_refault_file", "workingset_refault_anon",
+]
+CGROUP_LIMITS = ["memory_max", "memory_high"]
+
+
+def parse_cgroup_csv(path):
+    """Read cgroup_mem.csv into row dicts with the numeric fields coerced.
+
+    No container_map remapping: the collector already emits the same label space
+    that cpu/mem/dev are bucketed into (container name, comm, or "system").
+    """
+    rows = []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            parsed = {
+                "time": row["time"],
+                "label": row["label"],
+                "cgroup_path": row["cgroup_path"],
+            }
+            for field in CGROUP_GAUGES + CGROUP_COUNTERS + CGROUP_LIMITS:
+                try:
+                    parsed[field] = int(row[field])
+                except (KeyError, TypeError, ValueError):
+                    parsed[field] = CGROUP_ABSENT
+            rows.append(parsed)
+    return rows
+
+
+def _cgroup_paths(rows):
+    """Return {label: [cgroup_path, ...]} — which cgroups each label resolved to."""
+    paths = defaultdict(set)
+    for row in rows:
+        paths[row["label"]].add(row["cgroup_path"])
+    return {label: sorted(p) for label, p in paths.items()}
+
+
+def _host_mem_total():
+    """Total host RAM in bytes from /proc/meminfo, or 0 if unreadable."""
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, IndexError, ValueError):
+        pass
+    return 0
+
+
+def _sum_across_cgroups(rows, fields):
+    """Aggregate label -> time -> {field: summed value}, plus which fields exist.
+
+    A label can span several cgroups (the same comm in different slices); they are
+    disjoint, so summing them is correct. A field is "present" for a label only if
+    some sample carried a real value — an all-ABSENT field is dropped by the
+    callers rather than reported as a run of -1s.
+    """
+    agg = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    present = defaultdict(set)
+    for row in rows:
+        label, time = row["label"], row["time"]
+        for field in fields:
+            value = row[field]
+            if value == CGROUP_ABSENT:
+                continue
+            agg[label][time][field] += value
+            present[label].add(field)
+    return agg, present
+
+
+def cgroup_mem_stats(rows, duration_s):
+    """Per-label cgroup memory gauges as time-series with AUC.
+
+    Byte-valued levels, so they take the same stat block shape as the pidstat
+    sections. max_area_under_curve uses the cgroup's own memory.max when one is
+    set (the interesting case for capped runs) and falls back to host RAM;
+    limit_source records which, so no consumer has to guess the denominator.
+    """
+    agg, present = _sum_across_cgroups(rows, CGROUP_GAUGES)
+
+    # Highest limit observed per label — a cgroup's limit can change mid-run, and
+    # the ceiling that matters for normalisation is the one it could have reached.
+    limits = defaultdict(int)
+    for row in rows:
+        if row["memory_max"] != CGROUP_ABSENT:
+            limits[row["label"]] = max(limits[row["label"]], row["memory_max"])
+    mem_total = _host_mem_total()
+
+    result = {}
+    for label, times in agg.items():
+        if limits.get(label):
+            limit, limit_source = limits[label], "memory.max"
+        else:
+            limit, limit_source = mem_total, "MemTotal"
+
+        label_result = {}
+        for metric in CGROUP_GAUGES:
+            if metric not in present[label]:
+                continue  # kernel does not expose it here
+            points = [{"time": t, "value": times[t][metric]} for t in sorted(times)]
+            stats = tseries_stats(points)
+            stats["max_area_under_curve"] = round(limit * duration_s, 2)
+            label_result[metric] = stats
+
+        if not label_result:
+            continue
+        label_result["limit_bytes"] = limit
+        label_result["limit_source"] = limit_source
+        label_result["cgroup_paths"] = _cgroup_paths(rows).get(label, [])
+        result[label] = label_result
+
+    return result
+
+
+def cgroup_mem_event_stats(rows):
+    """Per-label first/last/delta for the cumulative cgroup counters.
+
+    memory.events (reclaim/throttle/OOM) and the pg*/workingset_* counters are
+    monotone totals since cgroup creation, so the useful per-run figure is the
+    delta. first/last are kept so a cgroup that outlives the run stays traceable.
+    """
+    agg, present = _sum_across_cgroups(rows, CGROUP_COUNTERS)
+
+    result = {}
+    for label, times in agg.items():
+        ordered = _sort_times_chronological(times.keys())
+        if not ordered:
+            continue
+        label_result = {}
+        for counter in CGROUP_COUNTERS:
+            if counter not in present[label]:
+                continue
+            first = times[ordered[0]][counter]
+            last = times[ordered[-1]][counter]
+            label_result[counter] = {
+                "first": first,
+                "last": last,
+                "delta": last - first,
+            }
+        if label_result:
+            result[label] = label_result
+
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate stats from sysstat (pidstat) CSV output"
@@ -247,12 +412,26 @@ def main():
             )
             print(f"  Processed {path.name}: {len(csv_data[name])} rows")
 
-    if not csv_data:
+    # Optional: cgroup memory, collected alongside pidstat over the same window.
+    cgroup_path = sysstat_dir / "cgroup_mem.csv"
+    cgroup_rows = []
+    if cgroup_path.exists():
+        cgroup_rows = parse_cgroup_csv(cgroup_path)
+        print(f"  Processed {cgroup_path.name}: {len(cgroup_rows)} rows")
+
+    if not csv_data and not cgroup_rows:
         print(f"No sysstat CSV files found in {sysstat_dir}")
         return
 
+    # duration_s stays defined by the pidstat window, not the union of both
+    # collectors. It is the denominator for cpu/mem max_area_under_curve and for
+    # the consumers' AUC-per-second normalisation, so letting a second collector
+    # widen it would silently shift existing metrics — the cgroup sampler emits
+    # its first sample immediately where pidstat's comes one interval later, so
+    # the union is reliably ~1s longer. cgroup rows are used only when there is
+    # no pidstat data at all (collector run standalone).
     all_rows = [row for rows in csv_data.values() for row in rows]
-    duration_s = compute_duration(all_rows)
+    duration_s = compute_duration(all_rows if all_rows else cgroup_rows)
     result["duration_s"] = duration_s
 
     if "cpu" in csv_data:
@@ -262,6 +441,13 @@ def main():
         result["mem"] = {"per_command": mem_stats(csv_data["mem"], duration_s)}
     if "dev" in csv_data:
         result["dev"] = {"per_command": dev_stats(csv_data["dev"])}
+    if cgroup_rows:
+        gauges = cgroup_mem_stats(cgroup_rows, duration_s)
+        events = cgroup_mem_event_stats(cgroup_rows)
+        if gauges:
+            result["cgroup_mem"] = {"per_command": gauges}
+        if events:
+            result["cgroup_mem_events"] = {"per_command": events}
 
     result["label_order"] = get_label_order(containers, processes)
 
