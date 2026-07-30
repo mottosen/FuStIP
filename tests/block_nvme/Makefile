@@ -26,7 +26,10 @@ NVME_DIR = ../../layers/nvme
 UTIL_DIR := $(MAKEFILE_DIR)../../util
 
 FIO_OUT = $(RESULTS_DIR)/fio/block_nvme-fio_out.json
-FIO_COMPOSE ?= $(ROOT_DIR)/util/container/fio-test/fio-test.yml
+# Self-relative rather than $(ROOT_DIR)-relative: when FuStIP is vendored as a
+# submodule the surrounding project exports its own ROOT_DIR, which silently
+# resolved this to a nonexistent path and broke every container-mode job.
+FIO_COMPOSE ?= $(MAKEFILE_DIR)../../util/container/fio-test/fio-test.yml
 
 # Docker Compose command, inferred from the environment (provided by devbox):
 # prefer the v2 plugin (`docker compose`), fall back to the standalone binary

@@ -430,6 +430,30 @@ TEST_TARGET_MAP = {
 }
 
 
+def _test_comm_vars(args):
+    """COMM_FILTER for a test suite invocation.
+
+    Without a container the workload has no isolation, so comm is pinned to fio
+    (the test workload) regardless of any -p the caller passed — otherwise the
+    capture would be system-wide and the counts meaningless.
+
+    A container already provides that isolation: fio is the only process in it.
+    So the process tier is left unset there and stays a pass-through, which is
+    both the tool's documented filter semantics (each unset tier passes through)
+    and the shape real profiling configs use — they set container_filter alone.
+    Pinning comm on top would test a strictly narrower scope than anything
+    profiled in practice, and would drop I/O issued from kernel worker contexts
+    the container still owns (io_uring's iou-wrk-* threads inherit the mount
+    namespace but not the comm). An explicit -p still narrows within the
+    container for callers who want the nested case.
+    """
+    if not args.container_filter:
+        return ["COMM_FILTER=fio"]
+    if args.comm_filter:
+        return [f"COMM_FILTER={args.comm_filter}"]
+    return []
+
+
 def generate_test_commands(args):
     selected = set(args.layers)
     target = TEST_TARGET_MAP[args.sub_action]
@@ -463,11 +487,9 @@ def generate_test_commands(args):
             vs.append(f"CONTAINER_FILTER={args.container_filter}")
         else:
             vs.append(f"MODE={args.mode}")
-        # comm is always forced to fio (the test workload), regardless of any -p
-        # the user passed. Device/pid filters from the test command are honored in
-        # every mode — including container — so container runs scope by
-        # container ∩ device ∩ comm like the other modes, not container-only.
-        vs.append("COMM_FILTER=fio")
+        # Process tier per _test_comm_vars. Device/pid filters from the test
+        # command are honored in every mode, including container.
+        vs.extend(_test_comm_vars(args))
         if args.dev_filter:
             vs.append(f"DEV_FILTER={args.dev_filter}")
         if args.pid_filter:
@@ -489,7 +511,7 @@ def generate_test_commands(args):
             vs.append(f"CONTAINER_FILTER={args.container_filter}")
         else:
             vs.append(f"MODE={args.mode}")
-        vs.append("COMM_FILTER=fio")
+        vs.extend(_test_comm_vars(args))
         if args.dev_filter:
             vs.append(f"DEV_FILTER={args.dev_filter}")
         if args.pid_filter:
@@ -516,10 +538,9 @@ def generate_test_commands(args):
             vs.append(f"CONTAINER_FILTER={args.container_filter}")
         else:
             vs.append(f"MODE={args.mode}")
-        # comm is always forced to fio, regardless of any -p the user passed; pid
-        # from the test command is honored in every mode. (fs has no device tier,
-        # so no DEV_FILTER here.)
-        vs.append("COMM_FILTER=fio")
+        # Process tier per _test_comm_vars; pid from the test command is honored
+        # in every mode. (fs has no device tier, so no DEV_FILTER here.)
+        vs.extend(_test_comm_vars(args))
         if args.pid_filter:
             vs.append(f"PID_FILTER={args.pid_filter}")
         if filesystem_layers != sorted(TEST_SUITES["filesystem"]):
