@@ -156,16 +156,98 @@ def check_approx(label, actual, expected, tolerance, allow_over=False):
     return passed, msg
 
 
+def is_uring_job(job_name):
+    """io_uring jobs are validated differently — see validate_io_uring()."""
+    return "uring" in job_name
+
+
 def syscall_keys_for_job(job_name):
     """Determine which syscall counters to validate based on job name.
 
     sync engine (val_seq*) -> read()/write() syscalls
     psync engine (val_rand*, work_*) -> pread64()/pwrite64() syscalls
+    io_uring engine (val_uring*) -> neither; the point is that both stay at zero
     """
     if job_name.startswith("val_seq"):
         return "read", "write"
     else:
         return "pread64", "pwrite64"
+
+
+# Classic file-read syscalls. An io_uring reader must not produce these in any
+# quantity — a handful can come from fio's own setup (reading its job file, etc.).
+CLASSIC_READ_SYSCALLS = ("read", "pread64")
+CLASSIC_READ_ALLOWANCE = 64
+
+
+def submitted_sqes(fs_out):
+    """(sum of to_submit, call count, reap-only call count) over io_uring_enter.
+
+    `to_submit` rides in the `bytes` column — io_uring_enter is the one traced syscall that is
+    not a file operation, so the generic fields are overloaded (see layers/fs/bpf/event.h).
+    A call that submits nothing and only waits for completions writes no value there, so the
+    column is null on those rows; they are counted separately rather than summed.
+
+    Returns (None, None, None) when the parquet is unavailable (summary mode).
+    """
+    pq = Path(fs_out).parent / "detailed.parquet"
+    if not pq.exists():
+        return None, None, None
+    import polars as pl
+
+    df = pl.scan_parquet(pq).select(["syscall", "event", "bytes"]).filter(
+        (pl.col("syscall") == "io_uring_enter") & (pl.col("event") == "enter")
+    ).collect()
+    reap_only = int(df["bytes"].null_count() + (df["bytes"] == 0).sum())
+    return int(df["bytes"].sum()), df.height, reap_only
+
+
+def validate_io_uring(fio, fs, tolerance, fs_out=None):
+    """Assert the io_uring asymmetry: submissions are visible, classic reads are not.
+
+    Three claims, in the order they matter:
+
+    1. io_uring_enter fires. Without this the probe is not attached and the rest is
+       vacuous rather than a finding.
+    2. The classic read syscalls stay at ~zero while FIO reports thousands of reads.
+       This is the fs-layer blindness, reproduced on a workload with no database in
+       it — the reason the job exists.
+    3. The SQEs submitted across those calls equal FIO's I/O count. Note this is a
+       claim about `to_submit`, NOT about the number of calls: io_uring_enter is also
+       how an application *reaps* completions, so a call count above the I/O count is
+       normal (fio issues one such wait per in-flight batch) and says nothing wrong.
+       Checking the submitted count is both the correct invariant and the validation
+       that the overloaded `bytes` column means what the schema claims.
+    """
+    results = []
+    enters = get_val(fs, "sc_count", "io_uring_enter")
+    classic = sum(get_val(fs, "sc_completed", sc) for sc in CLASSIC_READ_SYSCALLS)
+    read_ios = fio["read_ios"]
+
+    results.append((
+        enters > 0,
+        f"[{'PASS' if enters > 0 else 'FAIL'}] fs io_uring_enter fired: {enters} calls"
+        + ("" if enters > 0 else " — probe not attached, or the kernel has no io_uring"),
+    ))
+
+    budget = max(CLASSIC_READ_ALLOWANCE, int(tolerance * read_ios))
+    blind = classic <= budget
+    results.append((
+        blind,
+        f"[{'PASS' if blind else 'FAIL'}] fs classic reads stayed silent: "
+        f"{classic} read+pread64 vs {read_ios} FIO reads (budget {budget})",
+    ))
+
+    if fs_out and read_ios > 0:
+        submitted, calls, reap_only = submitted_sqes(fs_out)
+        if submitted is None:
+            results.append((True, "[SKIP] fs submitted SQEs: needs detailed mode (no parquet)"))
+        else:
+            passed, msg = check_approx("fs submitted SQEs vs FIO reads", submitted, read_ios,
+                                       tolerance)
+            results.append((passed, msg + f" [{calls} calls, {reap_only} reap-only]"))
+
+    return results
 
 
 def classify_job(fio):
@@ -233,6 +315,7 @@ def validate_consistency(fs, tolerance, read_key, write_key, kind):
 AUXILIARY_SYSCALLS = [
     "openat", "close", "lseek", "newfstatat", "newfstat",
     "unlinkat", "mkdirat", "mmap", "munmap",
+    "io_uring_enter", "io_submit", "io_getevents",
 ]
 
 
@@ -281,9 +364,14 @@ def main():
 
     print()
 
-    results = validate_completed_vs_fio(fio, fs, args.tolerance, read_key, write_key, kind,
-                                        args.container)
-    results += validate_consistency(fs, args.tolerance, read_key, write_key, kind)
+    if is_uring_job(args.job):
+        # Counting io_uring reads as read()/pread64() would fail by construction — that
+        # absence IS the result here, so this job gets its own assertions.
+        results = validate_io_uring(fio, fs, args.tolerance, args.fs_out)
+    else:
+        results = validate_completed_vs_fio(fio, fs, args.tolerance, read_key, write_key, kind,
+                                            args.container)
+        results += validate_consistency(fs, args.tolerance, read_key, write_key, kind)
 
     all_passed = True
     for passed, msg in results:
@@ -291,7 +379,7 @@ def main():
         if not passed:
             all_passed = False
 
-    if args.mode == "detailed":
+    if args.mode == "detailed" and not is_uring_job(args.job):
         ops = {"read": [read_key], "write": [write_key], "mixed": [read_key, write_key]}[kind]
         fs_ap = parse_access_pattern(args.fs_out)
         for passed, msg in validate_access_pattern(args.job, fs_ap, "fs", ops, args.tolerance,

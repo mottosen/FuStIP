@@ -79,6 +79,24 @@ time_based=1
 runtime=5
 stonewall
 
+; Random read via io_uring → NO read()/pread64() syscall at all.
+; This job exists to pin down the fs layer's io_uring behaviour: a syscall tracer
+; that watches only the classic file syscalls reports *zero I/O* for an io_uring
+; application, even while the device is saturated. The check asserts exactly that
+; asymmetry — io_uring_enter fires, read/pread64 do not — so the claim is a test
+; result on a workload with no Milvus in it, not an anecdote.
+; direct=1 so the reads really reach the device rather than the page cache.
+; Expected access pattern: random.
+[val_uring_randread]
+ioengine=io_uring
+direct=1
+rw=randread
+bs=4k
+iodepth=32
+time_based=1
+runtime=5
+stonewall
+
 ; Mixed random read/write via psync → pread64() + pwrite64() syscalls.
 ; Verifies profiler correctly splits and counts mixed IO.
 ; Expected access pattern: random.
