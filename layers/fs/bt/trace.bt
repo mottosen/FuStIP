@@ -228,6 +228,27 @@ tracepoint:syscalls:sys_enter_munmap
     @sc_count["munmap"] = count();
 }
 
+// Asynchronous submission paths, whose I/O never appears as read/pread64: io_uring for modern
+// engines, libaio for anything on the older interface. Counted only here, as for the other
+// non-data syscalls — detailed mode is what carries their latency and batch sizes.
+tracepoint:syscalls:sys_enter_io_uring_enter
+/ (@comm_filter == "_" && @has_pid == 0) || strcontains(@comm_filter, comm) || @pid_allow[(uint64)pid] /
+{
+    @sc_count["io_uring_enter"] = count();
+}
+
+tracepoint:syscalls:sys_enter_io_submit
+/ (@comm_filter == "_" && @has_pid == 0) || strcontains(@comm_filter, comm) || @pid_allow[(uint64)pid] /
+{
+    @sc_count["io_submit"] = count();
+}
+
+tracepoint:syscalls:sys_enter_io_getevents
+/ (@comm_filter == "_" && @has_pid == 0) || strcontains(@comm_filter, comm) || @pid_allow[(uint64)pid] /
+{
+    @sc_count["io_getevents"] = count();
+}
+
 // ── Inflight time-series ──
 
 interval:s:1
