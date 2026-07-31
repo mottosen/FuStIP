@@ -145,14 +145,14 @@ static int handle_event(void *ctx, void *data, size_t data_sz) {
   char line[256];
   int n;
   if (e->latency_ns > 0)
-    n = snprintf(line, sizeof(line), "%llu,%llu,%s,%s,%u,%llu,%llu,0x%llx,%s,%d,%s,%u\n",
+    n = snprintf(line, sizeof(line), "%llu,%llu,%s,%s,%u,%llu,%llu,0x%llx,%u,%s,%d,%s,%u\n",
                  e->timestamp_ns, e->mntns_id, event_name(e->event_type), op_name(e->op),
-                 e->bytes, e->latency_ns, e->sector, e->rq, comm, e->inflight, disk_name,
-                 e->qid);
+                 e->bytes, e->latency_ns, e->sector, e->rq, e->tid, comm, e->inflight,
+                 disk_name, e->qid);
   else
-    n = snprintf(line, sizeof(line), "%llu,%llu,%s,%s,%u,,%llu,0x%llx,%s,%d,%s,%u\n",
+    n = snprintf(line, sizeof(line), "%llu,%llu,%s,%s,%u,,%llu,0x%llx,%u,%s,%d,%s,%u\n",
                  e->timestamp_ns, e->mntns_id, event_name(e->event_type), op_name(e->op),
-                 e->bytes, e->sector, e->rq, comm, e->inflight, disk_name, e->qid);
+                 e->bytes, e->sector, e->rq, e->tid, comm, e->inflight, disk_name, e->qid);
 
   // snprintf returns the would-be length; clamp so a hypothetical overlong line
   // can never make fwrite read past the buffer (free: just a compare).
@@ -397,7 +397,7 @@ int main(int argc, char **argv) {
   }
   setvbuf(output, output_buf, _IOFBF, sizeof(output_buf));
   fprintf(output,
-          "timestamp_ns,mntns_id,event,op,bytes,latency_ns,sector,rq,comm,inflight,disk_name,qid\n");
+          "timestamp_ns,mntns_id,event,op,bytes,latency_ns,sector,rq,tid,comm,inflight,disk_name,qid\n");
 
   struct ring_buffer *rb = ring_buffer__new(bpf_map__fd(skel->maps.events),
                                             handle_event, NULL, NULL);
