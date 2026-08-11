@@ -111,7 +111,7 @@ define JOB_TEMPLATE
 .PHONY: $(1)
 $(1): ensure-device-free ensure-sudo prebuild
 	$(Q)echo -e "\n============================================================"
-	$(Q)echo -e "  Running: $(1)  [mode=$(MODE)]  (io_uring_cmd / nvme passthrough)"
+	$(Q)echo -e "  Running: $(1)  [mode=$(MODE)]$(if $(PROFILER_CPUSET),  [collectors pinned to $(PROFILER_CPUSET)],  [collectors unpinned])  (io_uring_cmd / nvme passthrough)"
 	$(Q)echo -e "============================================================\n"
 	$(Q)bash $(UTIL_DIR)/wait_device_idle.sh "$(if $(DEV_FILTER),$(DEV_FILTER),$(FIO_FILE))" 10 $(REDIRECT) || true
 	$(if $(filter nvme,$(LAYERS)),$(Q)$(MAKE) -C $(NVME_DIR) start-collection $(LAYER_VARS) $(REDIRECT))

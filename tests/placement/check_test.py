@@ -32,9 +32,11 @@ still returns 0, and the run produces an empty capture that looks normal.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 LAYERS = Path(__file__).resolve().parent.parent.parent / "layers"
@@ -146,6 +148,23 @@ def main() -> int:
         rc, out = dry_run(layer, args, "")
         check(f"  {layer} accepts an empty cpuset", rc == 0 and "taskset" not in out,
               f"rc={rc}")
+
+    print("\na finished run records where its collectors ran")
+    # Not cosmetic: an unpinned collector on a busy host loses events silently, so
+    # "were these counts collected under pinning?" is a question about the RESULT.
+    # Answering it from the result file rather than from shell history is the point.
+    overview = LAYERS.parent / "util" / "generate_overview.py"
+    for cpuset, want in ((CPUSET, f"pinned to {CPUSET}"), ("", "unpinned")):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "sysstat").mkdir()
+            (Path(tmp) / "sysstat" / "sysstat-stats.json").write_text('{"per_command":{}}')
+            env = {**os.environ, "PROFILER_CPUSET": cpuset}
+            subprocess.run([sys.executable, str(overview), tmp], env=env,
+                           capture_output=True, text=True)
+            got = (Path(tmp) / "fustip_overview.txt")
+            head = got.read_text().splitlines()[:4] if got.exists() else []
+            check(f"  overview says {want!r}",
+                  any(f"collectors: {want}" in l for l in head), "\n".join(head))
 
     print()
     if failures:

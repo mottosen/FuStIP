@@ -140,6 +140,11 @@ and only ~2.37 M/s on one — so one core can be *worse* than not pinning at all
 Compare against your own load: `data_quality.drop_pct` in each layer's
 `detailed-stats.json` reports what was lost.
 
+Every run records its own placement, so "were these counts collected under pinning?"
+is answered by the result rather than by remembering how it was launched —
+`fustip_overview.txt` opens with `collectors: pinned to 0,48` or
+`collectors: unpinned`, and the test suites print the same in each job banner.
+
 The variable propagates into the test suites too, so the pinned path gets the same
 end-to-end coverage as the unpinned one — the fio suites still assert the
 profiler's counts against FIO's, now with the collectors on their reserved cores:

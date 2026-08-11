@@ -102,7 +102,7 @@ define JOB_TEMPLATE
 .PHONY: $(1)
 $(1): ensure-sudo prebuild
 	$(Q)echo -e "\n============================================================"
-	$(Q)echo -e "  Running: $(1)  [mode=$(MODE)]"
+	$(Q)echo -e "  Running: $(1)  [mode=$(MODE)]$(if $(PROFILER_CPUSET),  [collectors pinned to $(PROFILER_CPUSET)],  [collectors unpinned])"
 	$(Q)echo -e "============================================================\n"
 	$(Q)bash $(UTIL_DIR)/wait_device_idle.sh "$(if $(DEV_FILTER),$(DEV_FILTER),$(FIO_FILE))" 10 $(REDIRECT) || true
 	$(if $(filter fs,$(LAYERS)),$(Q)$(MAKE) -C $(FS_DIR) start-collection $(LAYER_VARS) $(REDIRECT))
