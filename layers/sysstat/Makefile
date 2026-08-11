@@ -12,6 +12,33 @@ endif
 PIDSTAT := $(shell which pidstat)
 PIDS_DIR = /tmp/sysstat-pids
 
+# Pin the samplers to the cores the caller reserved for profiling, if any.
+#
+# pidstat fails the same way the eBPF layers do and for the same reason, just on the
+# complementary workloads: a starved sampler does not error, it silently returns fewer rows.
+# Measured across 328 search-phase result sets, coverage (samples returned / window seconds
+# at 1 Hz) is 0.98 median but falls to 0.46-0.65 on exactly the runs where the SUT saturates
+# the CPU — and every percentile is still computed, so the output looks entirely normal while
+# p50 has slid into the gaps. Both samplers go in the reservation; the cgroup collector is
+# unprivileged and cheap, but it shares the same fate if left to compete.
+#
+# Empty or unset = no pinning, which is right on an unloaded machine.
+TASKSET = $(if $(PROFILER_CPUSET),taskset -c $(PROFILER_CPUSET),)
+# Refuse an impossible cpuset at PARSE time, before anything is launched.
+#
+# Without this the failure is silent and looks like success: taskset would exit
+# "Invalid argument", the backgrounded loader would never start, start-collection
+# would still return 0, and the run would produce an empty capture. That is the
+# exact failure class this pinning exists to remove, so it must not be reachable
+# through a typo. Parse-time (not recipe-time) so it also fires under `make -n`.
+ifneq ($(PROFILER_CPUSET),)
+ifneq ($(shell taskset -c $(PROFILER_CPUSET) true >/dev/null 2>&1; echo $$?),0)
+$(error PROFILER_CPUSET="$(PROFILER_CPUSET)" is not settable on this machine \
+        (taskset rejected it). Give a CPU list this host actually has, or unset \
+        it to run unpinned.)
+endif
+endif
+
 export TZ := UTC
 export LC_ALL := C
 
@@ -42,7 +69,7 @@ start-collection: ensure-results-exists ensure-sudo
 
 	$(Q)mkdir -p "$(PIDS_DIR)"
 
-	$(Q)sudo -E $(PIDSTAT) -turd $(INTERVAL) \
+	$(Q)$(TASKSET) sudo -E $(PIDSTAT) -turd $(INTERVAL) \
 		> "$(RESULTS_DIR)/sysstat/pidstat.out" \
 		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/pidstat.pid"
 
@@ -55,7 +82,7 @@ start-collection: ensure-results-exists ensure-sudo
 # yielding an empty CSV.
 	$(Q)python "./util/collect_cgroup_mem.py" --check $(OUT_REDIRECT)
 
-	$(Q)python "./util/collect_cgroup_mem.py" "$(RESULTS_DIR)/sysstat" \
+	$(Q)$(TASKSET) python "./util/collect_cgroup_mem.py" "$(RESULTS_DIR)/sysstat" \
 		$(if $(CONTAINER_FILTER),--container "$(CONTAINER_FILTER)") \
 		$(if $(COMM_FILTER),--comm "$(COMM_FILTER)") \
 		$(if $(PID_FILTER),--pid "$(PID_FILTER)") \
