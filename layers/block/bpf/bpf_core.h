@@ -8,10 +8,10 @@
 // comm/mntns/tid are captured in the SUBMITTER's context (insert, or issue when the request
 // direct-dispatched past insert) and carried to the completion probe, which runs in interrupt
 // context where `current` is not the submitting task.
-// The insert and issue stages no longer emit their own record, so everything they
-// observe that the completion probe cannot re-derive is stashed here and carried
-// forward. queue_latency_ns and the two queue-depth snapshots are only meaningful
-// when the request actually went through insert, which `flags` records.
+// Only the completion probe emits a record, so everything the insert and issue
+// stages observe that the completion probe cannot re-derive is stashed here and
+// carried forward. queue_latency_ns and the two queue-depth snapshots are only
+// meaningful when the request actually went through insert, which `flags` records.
 struct rq_data {
 	__u8  op;
 	__u8  flags;                 // BLK_F_QUEUED once insert has fired
@@ -62,7 +62,7 @@ struct {
 
 // Counter slots: 0 = requests queued (reached insert), 2 = requests issued,
 // 4 = completions emitted, 5 = completions dropped by a full ring.
-// Slots 1 and 3 are unused: insert and issue no longer reserve records.
+// Slots 1 and 3 are unused: only the completion probe reserves a record.
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 6);

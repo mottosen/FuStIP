@@ -77,11 +77,11 @@ def parse_access_pattern(path, layer=None, lookup_key=None):
     `iou-wrk-*` kernel workers, so the device sees one perfect ramp while `fio` and
     `iou-wrk` each see a subsequence full of holes.
 
-    Summing the per-comm counts does not recover it, which is what this used to do.
-    Sequentiality is adjacency within an ORDERED stream, so counts computed over
-    different streams are not addable — pooling them reports a job that was 100 %
-    sequential at the device as 89.9 %. Re-derive it from the parquet instead, over
-    all comms at once and in reconstructed submission order.
+    Summing the per-comm counts does not recover it either. Sequentiality is adjacency
+    within an ORDERED stream, so counts computed over different streams are not
+    addable — pooling them reports a job that was 100 % sequential at the device as
+    89.9 %. Derive it from the parquet instead, over all comms at once and in
+    reconstructed submission order.
 
     Falls back to the pooled JSON figure when there is no parquet to read (summary
     mode), which keeps the old behaviour where it is the only thing available.
@@ -227,9 +227,9 @@ def validate_blk(fio, blk, tolerance, kind, allow_over=False):
             get_val(blk, "rq_total_bytes", "write"),
             fio["write_bytes"], tolerance, allow_over))
 
-    # Stage consistency moved to check_stage_consistency() against the BPF stage
+    # Stage consistency is checked by check_stage_consistency() against the BPF stage
     # counters in data_quality: with one row per request there are no insert/issue
-    # rows to count, so rq_issued/rq_queued no longer exist per op.
+    # rows to count, so there is no per-op rq_issued/rq_queued to compare against.
 
     return results
 
@@ -259,9 +259,9 @@ def validate_nvme(fio, nvme, tolerance, kind, allow_over=False):
             get_val(nvme, "cmd_total_bytes", "write"),
             fio["write_bytes"], tolerance, allow_over))
 
-    # Stage consistency moved to check_stage_consistency() against the BPF stage
+    # Stage consistency is checked by check_stage_consistency() against the BPF stage
     # counters in data_quality: with one row per command there are no setup rows to
-    # count, so cmd_setup no longer exists per op.
+    # count, so there is no per-op cmd_setup to compare against.
 
     return results
 

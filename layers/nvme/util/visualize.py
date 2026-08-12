@@ -111,10 +111,10 @@ def _build_row(label, parquet_path, comm_filter, ts_min, device_sectors=None,
     types = sort_types(counts.keys())
 
     def inflight_fn(ax, t=types, ts_min=ts_min):
-        # Each command contributes a depth sample at both ends of its life, as its
-        # two rows used to. Sampling only at completion would leave any second that
-        # contained submissions but no completions with no sample at all, flattening
-        # exactly the ramp-up spikes this plot exists to show.
+        # Each command contributes a depth sample at both ends of its life. Sampling
+        # only at completion would leave any second that contained submissions but no
+        # completions with no sample at all, flattening exactly the ramp-up spikes
+        # this plot exists to show.
         base = _scan(["timestamp_ns", "latency_ns", "op", "inflight", "inflight_at_setup"])
         at_setup = base.select([
             "op",

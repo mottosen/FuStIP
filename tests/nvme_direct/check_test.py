@@ -210,9 +210,9 @@ def validate_nvme(fio, nvme, tolerance, kind, allow_over=False):
             get_val(nvme, "cmd_total_bytes", "write"),
             fio["write_bytes"], tolerance, allow_over))
 
-    # Stage consistency moved to check_stage_consistency() against the BPF stage
+    # Stage consistency is checked by check_stage_consistency() against the BPF stage
     # counters in data_quality: with one row per command there are no setup rows to
-    # count, so cmd_setup no longer exists per op.
+    # count, so there is no per-op cmd_setup to compare against.
 
     return results
 

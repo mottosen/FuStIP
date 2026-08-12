@@ -4,17 +4,15 @@
 
 // ── One record per request ──
 //
-// The layer used to emit THREE ring-buffer records per request (insert, issue,
-// complete). It now emits one, at completion, carrying everything needed to
-// reconstruct the other two stages:
+// The layer emits ONE ring-buffer record per request, at completion, carrying
+// everything needed to place the two earlier stages on the timeline:
 //
 //   issue time  = timestamp_ns - latency_ns
 //   insert time = issue time  - queue_latency_ns   (only when BLK_F_QUEUED)
 //
-// Unlike the nvme layer this is not just a merge, because `latency_ns` used to
-// mean two unrelated things depending on the row — queue latency on `issue`,
-// driver latency on `complete`. They are now separate fields, so nothing has to
-// be inferred from which row it came from.
+// The two waits are separate fields rather than one: `latency_ns` is always the
+// driver's (issue -> complete) and `queue_latency_ns` always the scheduler's
+// (insert -> issue), so neither has to be interpreted by context.
 //
 // The rate argument is the same as the nvme layer's: three collectors sharing a
 // host drop each one's sustainable rate well below what it manages alone, and block
@@ -24,9 +22,9 @@
 // ── Flags ──
 // Requests dispatched straight to the driver skip `insert` entirely (scheduler
 // 'none', io_uring — the common case for the workloads this layer profiles).
-// That used to be inferred from `latency_ns == 0` on the issue row; with one row
-// per request there is no issue row, and "no queue stage" would be indistinguishable
-// from "queued with an immeasurably short wait". BLK_F_QUEUED records it explicitly,
+// "No queue stage" would otherwise be indistinguishable from "queued with an
+// immeasurably short wait", since both leave queue_latency_ns at zero.
+// BLK_F_QUEUED records it explicitly,
 // which is what keeps direct-dispatched requests out of the queue-latency
 // distribution and makes the direct-dispatch fraction computable.
 #define BLK_F_QUEUED (1 << 0)

@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Validate a results tree against the collapsed on-disk schema.
+"""Validate a results tree against the on-disk record schema.
 
 Standalone counterpart to the schema checks the fio suites run after a capture.
 This one needs no root, no device and no workload — it reads parquets that already
 exist, which makes it the tool for two jobs the fio suites cannot do:
 
   * checking a capture produced on another machine, and
-  * checking a tree after `migrate_event_schema.py` has rewritten it, where the
-    question is precisely whether the rewrite produced the same shape a live
-    collector would have.
+  * checking a tree that was rewritten after the fact, where the question is
+    precisely whether the rewrite produced the shape a live collector would have.
 
 Exits non-zero if any layer fails, so it can gate a migration.
 
@@ -28,7 +27,7 @@ LAYERS = ("nvme", "block")
 
 
 def check_tree(root: Path) -> tuple[int, int, int]:
-    """Validate every collapsed layer under `root`. -> (checked, failed, skipped)"""
+    """Validate every recognised layer under `root`. -> (checked, failed, skipped)"""
     checked = failed = skipped = 0
     for layer in LAYERS:
         pq = root / layer / "detailed.parquet"

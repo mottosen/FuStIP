@@ -116,8 +116,8 @@ static void sample_drops(struct standalone_bpf *skel) {
 }
 
 static void write_counters(struct standalone_bpf *skel, const char *csv_path) {
-  /* Counter slots: 0 = commands submitted, 1 = (unused, setup no longer reserves),
-   * 2 = completions emitted, 3 = completions dropped by a full ring. */
+  /* Counter slots: 0 = commands submitted, 2 = completions emitted, 3 = completions
+   * dropped by a full ring. Slot 1 is unused: only completion reserves a record. */
   __u64 totals[4] = {};
   if (read_counter_totals(skel, totals, 4) != 0)
     return;
@@ -169,12 +169,12 @@ static void write_counters(struct standalone_bpf *skel, const char *csv_path) {
   else
     strcpy(untracked_json + sizeof(untracked_json) - 2, "}");
 
-  /* Commands submitted but never completed by teardown. The separate setup row
-   * used to make these visible as an unmatched row; with one row per command they
-   * would otherwise vanish silently, so account for them explicitly.
+  /* Commands submitted but never completed by teardown. They emit no record at all,
+   * so without this counter they would vanish silently rather than showing up as a
+   * shortfall.
    *
-   * `setup.dropped` is now structurally zero — setup reserves no ring-buffer
-   * record — but the key is still emitted so the JSON shape stays stable. */
+   * `setup.dropped` is structurally zero — setup reserves no ring-buffer record —
+   * but the key is emitted so the JSON shape is the same for every layer. */
   unsigned long long incomplete = totals[0] > totals[2] ? totals[0] - totals[2] : 0;
 
   FILE *f = fopen(path, "w");

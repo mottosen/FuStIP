@@ -9,7 +9,7 @@ MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 # Structural validation of an existing capture. Needs no root, no device and no
 # workload — it only reads parquets — so it is the check to run against a tree
-# produced elsewhere, or against one that migrate_event_schema.py has rewritten.
+# produced elsewhere, or against one that was rewritten after the fact.
 #
 # RESULTS_DIR: one or more directories holding <layer>/detailed.parquet. A caller
 # with its own tree layout expands the paths itself:

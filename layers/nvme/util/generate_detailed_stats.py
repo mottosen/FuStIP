@@ -35,6 +35,9 @@ from container.labeling import bind_containers, load_comm_label_map, load_mntns_
 
 LAYER_PREFIX = "nvme"
 
+# On-disk format this reader implements; must match the collector's counters.json.
+SCHEMA_VERSION = 2
+
 # rq->__sector for commands with no block-layer LBA (NVMe passthrough via
 # io_uring_cmd) reads back as (u64)-1. Treat it as "unset" so it never feeds
 # the access-pattern / LBA-distribution analysis as a real sector.
@@ -156,10 +159,9 @@ def generate_stats(parquet_path):
 
         # Every row is a completed command.
         #
-        # `cmd_setup` is deliberately NOT emitted per (comm, disk, op) any more. It
-        # used to be a count of setup rows; there are none, and the BPF submission
-        # counter is a scalar with no comm/disk/op breakdown. Reporting a per-op
-        # `cmd_setup` derived from `cmd_completed` would make the setup~completed
+        # `cmd_setup` is deliberately NOT emitted per (comm, disk, op). The BPF
+        # submission counter is a scalar with no comm/disk/op breakdown, and a per-op
+        # figure derived from `cmd_completed` would make the setup~completed
         # consistency check compare a number against itself. The submission total
         # and the resulting incomplete count are reported once, under data_quality.
         comm_counters["cmd_completed"] = dict(zip(
@@ -374,15 +376,16 @@ def load_data_quality(layer_dir, event_counts):
         with open(counters_file) as f:
             counters = json.load(f)
 
-        # Schema 2: one ring-buffer record per command, emitted at completion.
-        # A capture written by the old two-record collector is refused rather than
-        # summed as if it were this one — its totals mean something different, and
-        # a quietly wrong drop_pct is exactly the failure this rewrite exists to end.
-        version = counters.get("schema_version", 1)
-        if version < 2:
+        # This reader implements SCHEMA_VERSION. A capture written to any other
+        # version is refused rather than summed as if it were this one: the counter
+        # names are the same but their meaning is not, so the failure would surface
+        # as a quietly wrong drop_pct rather than as an error.
+        version = counters.get("schema_version")
+        if version != SCHEMA_VERSION:
             raise ValueError(
-                f"{counters_file} is schema v{version} (two records per command). "
-                "This tool reads v2 only; migrate the capture first."
+                f"{counters_file} declares schema_version "
+                f"{version if version is not None else '<unset>'}; this tool reads "
+                f"v{SCHEMA_VERSION} only."
             )
 
         submitted = counters.get("setup", {}).get("generated", 0)
@@ -393,7 +396,7 @@ def load_data_quality(layer_dir, event_counts):
         received = int(event_counts.get("command", 0))
 
         result = {
-            "schema_version": 2,
+            "schema_version": SCHEMA_VERSION,
             "total_generated": gen,
             "total_dropped": drop,
             "total_received": received,
@@ -408,9 +411,8 @@ def load_data_quality(layer_dir, event_counts):
                     "drop_pct": round(100 * drop / gen, 4) if gen > 0 else 0.0,
                 }
             },
-            # Commands submitted but not completed when collection stopped. The
-            # separate setup row used to expose these as unmatched rows; with one
-            # row per command they would otherwise be invisible.
+            # Commands submitted but not completed when collection stopped. They
+            # emit no record, so this counter is the only place they appear.
             "commands_submitted": submitted,
             "commands_incomplete": counters.get("incomplete", max(0, submitted - gen)),
         }

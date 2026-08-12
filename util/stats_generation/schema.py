@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """Structural validation of a detailed capture's on-disk schema.
 
-The nvme and block layers emit ONE record per operation, carrying the fields needed
-to reconstruct the stages that no longer have their own record. Most of that
-carry-forward happens in BPF across probes that fire in different contexts, and if a
-field is dropped on the way the result is not an error — it is a plausible-looking
-column full of zeros. A queue-latency distribution computed from such a column has a
-mean, a p99 and a shape; nothing about it says the data is wrong.
+The nvme and block layers emit ONE record per operation, at completion, carrying the
+fields describing the stages that precede it. Most of that carry-forward happens in
+BPF across probes that fire in different contexts, and if a field is dropped on the
+way the result is not an error — it is a plausible-looking column full of zeros. A
+queue-latency distribution computed from such a column has a mean, a p99 and a shape;
+nothing about it says the data is wrong.
 
 So the invariants below are deliberately mechanical and sharp. Each one is false for
-a specific way the collapse could break:
+a specific way the carry-forward can break:
 
-  * `event` absent            - the collector is actually emitting one row per op.
   * latency always present    - every row is a completion, not a stray stage record.
   * inflight_at_setup >= 1    - it is a POST-increment, so a real capture can never
                                 contain 0. All-zero means the setup probe's value
@@ -32,7 +31,9 @@ without re-running a workload.
 """
 import polars as pl
 
-# Columns every collapsed layer must carry, and the ones that prove it collapsed.
+# Columns every one-record-per-operation layer must carry. A capture that predates
+# a field, or was written by a different tool, fails here rather than being read
+# with the missing column silently treated as absent data.
 REQUIRED = {
     "nvme": ["timestamp_ns", "op", "bytes", "latency_ns", "sector", "rq", "tid",
              "comm", "inflight_at_setup", "inflight", "disk_name", "qid"],
@@ -41,8 +42,6 @@ REQUIRED = {
               "q_inflight_at_insert", "q_inflight_at_issue",
               "d_inflight_at_issue", "d_inflight_at_complete"],
 }
-# `event` means several records per operation — the thing that was removed.
-FORBIDDEN = {"nvme": ["event"], "block": ["event", "q_inflight", "d_inflight"]}
 
 
 def _r(ok, msg):
@@ -50,10 +49,10 @@ def _r(ok, msg):
 
 
 def validate_layer_schema(parquet_path, layer, label=""):
-    """Check one layer's parquet against the collapsed schema. -> [(passed, msg)]"""
+    """Check one layer's parquet against the on-disk schema. -> [(passed, msg)]"""
     tag = f"{label} " if label else f"{layer} "
     if layer not in REQUIRED:
-        return [(True, f"[SKIP] {tag}schema: layer '{layer}' is not collapsed")]
+        return [(True, f"[SKIP] {tag}schema: layer '{layer}' has no record schema")]
     try:
         schema = pl.scan_parquet(parquet_path).collect_schema()
     except Exception as exc:                                  # noqa: BLE001
@@ -66,11 +65,6 @@ def validate_layer_schema(parquet_path, layer, label=""):
     out.append(_r(not missing,
                   f"{tag}schema: required columns present"
                   + (f" — missing {missing}" if missing else "")))
-
-    present = [c for c in FORBIDDEN[layer] if c in cols]
-    out.append(_r(not present,
-                  f"{tag}schema: one row per operation"
-                  + (f" — found pre-collapse column(s) {present}" if present else "")))
 
     if missing:
         # Value checks below would raise on the missing columns; the structural

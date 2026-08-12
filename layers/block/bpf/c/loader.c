@@ -121,7 +121,7 @@ static void write_counters(struct standalone_bpf *skel, const char *csv_path)
 {
 	/* Counter slots: 0 = requests queued (reached insert), 2 = requests issued,
 	 * 4 = completions emitted, 5 = completions dropped. Slots 1 and 3 are unused:
-	 * insert and issue no longer reserve ring-buffer records. */
+	 * only the completion probe reserves a ring-buffer record. */
 	__u64 totals[6] = {};
 	if (read_counter_totals(skel, totals, 6) != 0)
 		return;
@@ -174,11 +174,10 @@ static void write_counters(struct standalone_bpf *skel, const char *csv_path)
 		strcpy(untracked_json + sizeof(untracked_json) - 2, "}");
 
 	/* Requests issued but not completed when collection stopped, and requests that
-	 * bypassed the scheduler queue entirely (direct dispatch). Both used to be
-	 * visible as unmatched rows; with one row per request they need explicit
-	 * accounting. insert/issue no longer reserve ring-buffer records, so their
-	 * "dropped" counts are structurally zero and the keys are kept only so the
-	 * JSON shape stays stable. */
+	 * bypassed the scheduler queue entirely (direct dispatch). Neither is visible in
+	 * the records themselves, so both are counted here. insert/issue reserve no
+	 * ring-buffer record, so their "dropped" counts are structurally zero and the
+	 * keys are emitted only so the JSON shape is the same for every layer. */
 	unsigned long long incomplete = totals[2] > totals[4] ? totals[2] - totals[4] : 0;
 	unsigned long long direct = totals[2] > totals[0] ? totals[2] - totals[0] : 0;
 

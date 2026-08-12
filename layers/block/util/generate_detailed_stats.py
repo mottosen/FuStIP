@@ -35,6 +35,9 @@ from container.labeling import bind_containers, load_comm_label_map, load_mntns_
 
 LAYER_PREFIX = "block"
 
+# On-disk format this reader implements; must match the collector's counters.json.
+SCHEMA_VERSION = 2
+
 
 def _sec_to_time(s):
     h, m, ss = s // 3600, (s % 3600) // 60, s % 60
@@ -144,11 +147,11 @@ def generate_stats(parquet_path):
 
         # Every row is a completed request.
         #
-        # rq_issued / rq_queued are no longer emitted per (comm, op): they used to
-        # count issue and insert rows, and there are none. Deriving them from the
-        # completion count would make the issued~completed consistency check compare
-        # a number against itself. The totals, and the direct-dispatch count they
-        # imply, are reported once under data_quality.
+        # rq_issued / rq_queued are deliberately NOT emitted per (comm, op): the BPF
+        # stage counters have no op breakdown, and deriving them from the completion
+        # count would make the issued~completed consistency check compare a number
+        # against itself. The totals, and the direct-dispatch count they imply, are
+        # reported once under data_quality.
         comm_counters["rq_completed"] = dict(zip(
             part["op"].to_list(),
             [int(v) for v in part["count"].to_list()]
@@ -228,7 +231,7 @@ def generate_stats(parquet_path):
     if duration_s > 0:
         window_ns = 1_000_000_000
         # Each request contributes a depth sample at every stage transition it
-        # actually made, exactly as its three rows used to:
+        # actually made:
         #
         #   insert (queued only) -> q_inflight_at_insert
         #   issue                -> q_inflight_at_issue (queued only), d_inflight_at_issue
@@ -369,15 +372,16 @@ def load_data_quality(layer_dir, event_counts):
         with open(counters_file) as f:
             counters = json.load(f)
 
-        # Schema 2: one ring-buffer record per request, emitted at completion.
-        # An old three-record capture is refused rather than summed as if it were
-        # this one — its totals mean something different, and a quietly wrong
-        # drop_pct is the failure this rewrite exists to end.
-        version = counters.get("schema_version", 1)
-        if version < 2:
+        # This reader implements SCHEMA_VERSION. A capture written to any other
+        # version is refused rather than summed as if it were this one: the counter
+        # names are the same but their meaning is not, so the failure would surface
+        # as a quietly wrong drop_pct rather than as an error.
+        version = counters.get("schema_version")
+        if version != SCHEMA_VERSION:
             raise ValueError(
-                f"{counters_file} is schema v{version} (three records per request). "
-                "This tool reads v2 only; migrate the capture first."
+                f"{counters_file} declares schema_version "
+                f"{version if version is not None else '<unset>'}; this tool reads "
+                f"v{SCHEMA_VERSION} only."
             )
 
         queued = counters.get("insert", {}).get("generated", 0)
@@ -390,7 +394,7 @@ def load_data_quality(layer_dir, event_counts):
         direct = counters.get("direct_dispatch", max(0, issued - queued))
 
         result = {
-            "schema_version": 2,
+            "schema_version": SCHEMA_VERSION,
             "total_generated": gen,
             "total_dropped": drop,
             "total_received": received,
@@ -405,8 +409,8 @@ def load_data_quality(layer_dir, event_counts):
                     "drop_pct": round(100 * drop / gen, 4) if gen > 0 else 0.0,
                 }
             },
-            # Stage totals. These used to be per-op row counts (rq_queued/rq_issued);
-            # the BPF counters have no op breakdown, so they are reported once here.
+            # Stage totals. The BPF counters have no op breakdown, so they are
+            # reported once here rather than per (comm, op).
             "requests_queued": queued,
             "requests_issued": issued,
             "requests_incomplete": counters.get("incomplete", max(0, issued - gen)),

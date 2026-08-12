@@ -4,25 +4,24 @@
 
 // ── One record per command ──
 //
-// The layer used to emit TWO ring-buffer records per NVMe command (setup and
-// complete). It no longer does: every field on the old setup record was either
-// byte-identical on the complete record (op, bytes, sector, comm, tid, disk_name,
-// qid — all copied from the same cmd_data entry, never re-read) or recoverable
-// from it (setup time is exactly `timestamp_ns - latency_ns`). The one exception
-// was the setup-time queue depth, which is carried explicitly as
-// `inflight_at_setup` below.
+// The layer emits ONE ring-buffer record per NVMe command, at completion. Nothing
+// about the submission is lost: op, bytes, sector, comm, tid, disk_name and qid are
+// captured at setup into cmd_data and copied out unchanged, and the setup time is
+// exactly `timestamp_ns - latency_ns`. The one value that is neither carried nor
+// derivable is the setup-time queue depth, so it is a field of its own
+// (`inflight_at_setup` below).
 //
-// This halves the record rate, which is what makes the layer usable under load.
+// One record rather than two per command is what makes the layer usable under load.
 // Measured on a 2x24-core host: one consumer sustains ~2.03 M events/s alone but
 // only ~1.47 M/s once the block and fs collectors run beside it. A workload
 // offering 1.40 M/s therefore sat ~5 % under that ceiling and lost events on every
 // burst. One record per command puts the offered rate at 0.70 M/s, and pairs with
 // the 512 MB ring for ~6.4 s of burst absorption.
 //
-// Correlation was ALREADY kernel-side (cmd_time / cmd_metadata, keyed by the
-// request pointer) and latency was already computed in BPF, so this removes a
-// pairing step rather than adding one. Commands that never complete emit nothing
-// and are accounted for by (setup_generated - complete_generated) in counters.json.
+// Correlation is kernel-side (cmd_time / cmd_metadata, keyed by the request pointer)
+// and latency is computed in BPF, so userspace never pairs anything. Commands that
+// never complete emit nothing and are accounted for by
+// (setup_generated - complete_generated) in counters.json.
 
 // ── NVMe operation types ──
 // Stable enum used in the CSV/stats; the BPF setup probe normalizes the NVMe
