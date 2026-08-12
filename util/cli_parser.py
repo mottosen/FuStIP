@@ -428,6 +428,16 @@ def generate_profile_commands(args):
                 seq_cmds.append(
                     f'cp "{td}/{layer}/counters.json" "{rd}/{layer}/" 2>/dev/null || true'
                 )
+                # drops.csv must travel even though counters.json already carries the
+                # totals: the totals are a MEAN over the whole capture, and loss arrives
+                # in bursts, so a ring that empties for three seconds of a five-minute
+                # run reads as well under 1 % and hides inside every threshold. This is
+                # the only per-interval record, the loader writes it beside the raw CSV
+                # in tmp_dir, and the rm -rf below deletes that dir — so a layer left off
+                # this whitelist generates the series for the whole run and discards it.
+                seq_cmds.append(
+                    f'cp "{td}/{layer}/drops.csv" "{rd}/{layer}/" 2>/dev/null || true'
+                )
             else:
                 # summary mode: bpftrace output
                 seq_cmds.append(
