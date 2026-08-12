@@ -29,7 +29,8 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "util"))
 from stats_generation.shared import (compute_access_pattern,
                                      compute_lba_distribution,
-                                     derive_throughput, tseries_stats)
+                                     derive_throughput, load_device_geometry,
+                                     tseries_stats)
 from container.labeling import bind_containers, load_comm_label_map, load_mntns_label_map
 
 LAYER_PREFIX = "nvme"
@@ -86,67 +87,6 @@ def _entry_key(row, has_mntns, has_disk):
     return row["comm"], mntns_str, disk
 
 
-def load_device_geometry(parquet_path):
-    """Return geom_for(disk) -> (capacity_lba | None, sector_bytes).
-
-    `capacity_lba` (device size in logical blocks) normalises the LBA distribution;
-    `sector_bytes` (logical-block size) converts transfer bytes to logical blocks for
-    the access-pattern gap test. Detailed-mode `sector` is now the NVMe SLBA in
-    logical-block units, so both come from the device's own geometry.
-
-    Prefers the capture-time `device-info.json` (offline-safe: `nsze_lbas` +
-    `lba_size_bytes`), falling back to live sysfs on the capture host. The fallback reads
-    the device's real logical-block size from `/sys/block/<dev>/queue/logical_block_size`
-    (NOT a hardcoded 512 — many NVMe namespaces are 4096-logical, and assuming 512 makes
-    the gap test off by a constant factor → sequential IO misreported as random); the
-    `/sys/block/<dev>/size` capacity is in 512-byte units and is converted to logical
-    blocks. Multi-device safe — geometry is resolved per disk.
-    """
-    info_path = Path(parquet_path).parent / "device-info.json"
-    info = {}
-    if info_path.exists():
-        try:
-            info = json.loads(info_path.read_text())
-        except (OSError, ValueError):
-            info = {}
-
-    def geom_for(disk):
-        entry = info.get(disk) if disk else None
-        if entry is None and len(info) == 1:
-            entry = next(iter(info.values()))
-        if isinstance(entry, dict):
-            # sector_bytes: nvme-list SectorSize, else the sysfs logical block size the
-            # collector records — never silently 512 when the device says otherwise.
-            sector_bytes = int(entry.get("lba_size_bytes")
-                               or entry.get("logical_block_bytes") or 512)
-            # capacity in *logical blocks*: nsze_lbas is already in those units;
-            # sectors_512b is in 512-byte units, so convert it.
-            if entry.get("nsze_lbas"):
-                cap = int(entry["nsze_lbas"]) or None
-            elif entry.get("sectors_512b"):
-                cap = int(entry["sectors_512b"]) * 512 // sector_bytes or None
-            else:
-                cap = None
-            if cap:
-                return cap, sector_bytes
-        if disk:
-            try:
-                lbs_path = Path(f"/sys/block/{disk}/queue/logical_block_size")
-                sector_bytes = int(lbs_path.read_text().strip()) if lbs_path.exists() else 512
-                size_path = Path(f"/sys/block/{disk}/size")
-                if size_path.exists():
-                    # /sys/block/*/size is always in 512-byte units; convert to the
-                    # device's own logical blocks (SLBAs are in logical-block units).
-                    cap_lba = int(size_path.read_text().strip()) * 512 // sector_bytes
-                    return cap_lba, sector_bytes
-                return None, sector_bytes
-            except (ValueError, OSError):
-                pass
-        return None, 512
-
-    return geom_for
-
-
 def generate_stats(parquet_path):
     """Parse an NVMe layer detailed Parquet and compute per-disk stats.
 
@@ -183,14 +123,21 @@ def generate_stats(parquet_path):
     # Group by raw (comm, mntns_id, disk) to keep streaming engine effective.
     # ts_min/ts_max and event_counts derived from this result (no separate scan).
     # Explicit select avoids loading 'rq' (~5 GB) and other unreferenced columns.
+    # One row per command, so there is no `event` column to filter on and every row
+    # is a completion. The active span still runs first SUBMISSION → last completion,
+    # so ts_min comes from the reconstructed submit time (timestamp_ns - latency_ns);
+    # taking it from timestamp_ns would shorten the window by one command's latency
+    # and inflate the derived IOPS.
     comm_agg_raw = (pl.scan_parquet(parquet_path)
-                      .select([*group_keys, "event", "op", "bytes", "timestamp_ns"])
-                      .filter(pl.col("event").is_in(["setup", "complete"]))
-                      .group_by(*group_keys, "event", "op")
+                      .select([*group_keys, "op", "bytes", "timestamp_ns", "latency_ns"])
+                      .with_columns(
+                          (pl.col("timestamp_ns") - pl.col("latency_ns")).alias("submit_ts")
+                      )
+                      .group_by(*group_keys, "op")
                       .agg(
                           pl.len().alias("count"),
                           pl.col("bytes").sum().alias("total_bytes"),
-                          pl.col("timestamp_ns").min().alias("ts_min"),
+                          pl.col("submit_ts").min().alias("ts_min"),
                           pl.col("timestamp_ns").max().alias("ts_max"),
                       )
                       .collect(engine="streaming"))
@@ -198,8 +145,8 @@ def generate_stats(parquet_path):
     ts_min = comm_agg_raw["ts_min"].min()
     ts_max = comm_agg_raw["ts_max"].max()
     duration_s = (ts_max - ts_min) / 1e9 if ts_min and ts_max and ts_max > ts_min else 0
-    event_agg = comm_agg_raw.group_by("event").agg(pl.col("count").sum())
-    event_counts = dict(zip(event_agg["event"].to_list(), event_agg["count"].to_list()))
+    # Received-record count, for the data_quality cross-check against counters.json.
+    event_counts = {"command": int(comm_agg_raw["count"].sum())}
 
     for part in comm_agg_raw.partition_by(group_keys, maintain_order=False):
         row0 = part.row(0, named=True)
@@ -207,23 +154,22 @@ def generate_stats(parquet_path):
         entry = ensure_entry(key)
         comm_counters = {}
 
-        complete_rows = part.filter(pl.col("event") == "complete")
-        if len(complete_rows) > 0:
-            comm_counters["cmd_completed"] = dict(zip(
-                complete_rows["op"].to_list(),
-                [int(v) for v in complete_rows["count"].to_list()]
-            ))
-            comm_counters["cmd_total_bytes"] = dict(zip(
-                complete_rows["op"].to_list(),
-                [int(v) for v in complete_rows["total_bytes"].to_list()]
-            ))
-
-        setup_rows = part.filter(pl.col("event") == "setup")
-        if len(setup_rows) > 0:
-            comm_counters["cmd_setup"] = dict(zip(
-                setup_rows["op"].to_list(),
-                [int(v) for v in setup_rows["count"].to_list()]
-            ))
+        # Every row is a completed command.
+        #
+        # `cmd_setup` is deliberately NOT emitted per (comm, disk, op) any more. It
+        # used to be a count of setup rows; there are none, and the BPF submission
+        # counter is a scalar with no comm/disk/op breakdown. Reporting a per-op
+        # `cmd_setup` derived from `cmd_completed` would make the setup~completed
+        # consistency check compare a number against itself. The submission total
+        # and the resulting incomplete count are reported once, under data_quality.
+        comm_counters["cmd_completed"] = dict(zip(
+            part["op"].to_list(),
+            [int(v) for v in part["count"].to_list()]
+        ))
+        comm_counters["cmd_total_bytes"] = dict(zip(
+            part["op"].to_list(),
+            [int(v) for v in part["total_bytes"].to_list()]
+        ))
 
         entry["counters"] = comm_counters
         # Trustworthy iops/throughput = completed ÷ active duration (the
@@ -238,15 +184,13 @@ def generate_stats(parquet_path):
     # Process one op at a time: quantile on ~60M rows uses ~11 GB RSS.
     # Per-op scans reuse allocator memory (~12 GB total vs ~22 GB simultaneous).
     ops = (pl.scan_parquet(parquet_path)
-             .filter(pl.col("event") == "complete")
              .select("op")
              .unique()
              .collect()["op"].to_list())
 
     for op in ops:
         raw_lat_op = (pl.scan_parquet(parquet_path)
-                        .select([*group_keys, "event", "op", "latency_ns"])
-                        .filter(pl.col("event") == "complete")
+                        .select([*group_keys, "op", "latency_ns"])
                         .filter(pl.col("op") == op)
                         .filter(pl.col("latency_ns").is_not_null())
                         .group_by(*group_keys)
@@ -259,8 +203,7 @@ def generate_stats(parquet_path):
 
     for op in ops:
         raw_size_op = (pl.scan_parquet(parquet_path)
-                         .select([*group_keys, "event", "op", "bytes"])
-                         .filter(pl.col("event") == "complete")
+                         .select([*group_keys, "op", "bytes"])
                          .filter(pl.col("op") == op)
                          .group_by(*group_keys)
                          .agg(_series_stats_exprs("bytes"))
@@ -275,17 +218,36 @@ def generate_stats(parquet_path):
     # tseries computed per entry; bind_containers keeps dominant comm's per disk.
     if duration_s > 0:
         window_ns = 1_000_000_000
-        per_comm_snap = (pl.scan_parquet(parquet_path)
-                           .select([*group_keys, "event", "op", "timestamp_ns", "inflight"])
-                           .filter(pl.col("event").is_in(["setup", "complete"]))
-                           .with_columns(
-                               ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
-                           )
+        # Each command contributes TWO depth samples, exactly as the two rows used
+        # to: one at its submission second carrying inflight_at_setup, one at its
+        # completion second carrying inflight. Sampling only at completion would
+        # leave any second that contained submissions but no completions with no
+        # sample at all, which silently flattens ramp-up spikes and shifts the
+        # percentiles of cmd_inflight.
+        #
+        # io_count is credited to the completion sample only, so the IOPS series
+        # keeps counting completed commands per second.
+        base = (pl.scan_parquet(parquet_path)
+                  .select([*group_keys, "op", "timestamp_ns", "latency_ns",
+                           "inflight", "inflight_at_setup"]))
+        submit_samples = base.select([
+            *group_keys, "op",
+            ((pl.col("timestamp_ns") - pl.col("latency_ns") - ts_min) // window_ns)
+                .cast(pl.Int64).alias("sec"),
+            pl.col("inflight_at_setup").alias("inflight"),
+            pl.lit(0, dtype=pl.Int32).alias("is_completion"),
+        ])
+        complete_samples = base.select([
+            *group_keys, "op",
+            ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec"),
+            pl.col("inflight"),
+            pl.lit(1, dtype=pl.Int32).alias("is_completion"),
+        ])
+        per_comm_snap = (pl.concat([submit_samples, complete_samples])
                            .group_by(*group_keys, "op", "sec")
                            .agg(
                                pl.col("inflight").last(),
-                               pl.when(pl.col("event") == "complete")
-                                 .then(pl.lit(1)).otherwise(pl.lit(0)).sum().alias("io_count"),
+                               pl.col("is_completion").sum().alias("io_count"),
                            )
                            .collect(engine="streaming"))
 
@@ -331,10 +293,16 @@ def generate_stats(parquet_path):
     # processing ops one at a time, to keep peak RSS low on large (stress-test) captures.
     # `sector` is the NVMe SLBA in logical-block units, so the gap/distribution math uses
     # the disk's own lba_size (sector_bytes) and capacity (capacity_lba).
+    # ORDERING, load-bearing: compute_access_pattern() asks "does command i+1 start
+    # where command i ended?", which is only meaningful in SUBMISSION order. Rows are
+    # now completions, and at queue depth > 1 completions reorder — sorting by the
+    # row's own timestamp_ns would feed the gap test a sequence the device never saw
+    # and silently report sequential I/O as random. Sort by the reconstructed submit
+    # time instead. shared.py cannot detect a violation of this contract.
     geom_for = load_device_geometry(parquet_path)
     if has_sector:
         has_ts = "timestamp_ns" in schema
-        cols = (["timestamp_ns"] if has_ts else []) + ["sector", "bytes"]
+        cols = (["timestamp_ns", "latency_ns"] if has_ts else []) + ["sector", "bytes"]
         for key in list(_entries.keys()):
             comm, mntns_id_str, disk = key
             # Skip the null/unresolved disk_name pseudo-key when a real disk_name column
@@ -348,7 +316,6 @@ def generate_stats(parquet_path):
                 cond = cond & (pl.col("disk_name") == disk)
             base = (pl.scan_parquet(parquet_path)
                       .filter(cond)
-                      .filter(pl.col("event") == "setup")
                       .filter(pl.col("sector").is_not_null())
                       .filter(pl.col("sector") != SECTOR_UNSET))
             ops = base.select("op").unique().collect(engine="streaming")["op"].to_list()
@@ -366,7 +333,10 @@ def generate_stats(parquet_path):
                     del op_df
                     continue
                 if has_ts:
-                    op_df = op_df.sort("timestamp_ns")
+                    op_df = (op_df
+                             .with_columns((pl.col("timestamp_ns") - pl.col("latency_ns"))
+                                           .alias("submit_ts"))
+                             .sort("submit_ts"))
                 sectors = op_df["sector"].cast(pl.Int64).to_numpy()
                 bytes_list = op_df["bytes"].cast(pl.Int64).to_numpy()
                 if len(sectors) >= 2:
@@ -404,31 +374,45 @@ def load_data_quality(layer_dir, event_counts):
         with open(counters_file) as f:
             counters = json.load(f)
 
-        per_event_type = {}
-        total_generated = 0
-        total_dropped = 0
+        # Schema 2: one ring-buffer record per command, emitted at completion.
+        # A capture written by the old two-record collector is refused rather than
+        # summed as if it were this one — its totals mean something different, and
+        # a quietly wrong drop_pct is exactly the failure this rewrite exists to end.
+        version = counters.get("schema_version", 1)
+        if version < 2:
+            raise ValueError(
+                f"{counters_file} is schema v{version} (two records per command). "
+                "This tool reads v2 only; migrate the capture first."
+            )
 
-        for event_type in ("setup", "complete"):
-            entry = counters.get(event_type, {})
-            gen = entry.get("generated", 0)
-            drop = entry.get("dropped", 0)
-            received = int(event_counts.get(event_type, 0))
-            total_generated += gen
-            total_dropped += drop
-            per_event_type[event_type] = {
-                "generated": gen,
-                "dropped": drop,
-                "received": received,
-                "drop_pct": round(100 * drop / gen, 4) if gen > 0 else 0.0,
-            }
+        submitted = counters.get("setup", {}).get("generated", 0)
+        completed = counters.get("complete", {})
+        gen = completed.get("generated", 0)
+        drop = completed.get("dropped", 0)
+        # Rows actually in the parquet — an independent cross-check of gen - drop.
+        received = int(event_counts.get("command", 0))
 
-        total_received = total_generated - total_dropped
         result = {
-            "total_generated": total_generated,
-            "total_dropped": total_dropped,
-            "total_received": total_received,
-            "drop_pct": round(100 * total_dropped / total_generated, 4) if total_generated > 0 else 0.0,
-            "per_event_type": per_event_type,
+            "schema_version": 2,
+            "total_generated": gen,
+            "total_dropped": drop,
+            "total_received": received,
+            "drop_pct": round(100 * drop / gen, 4) if gen > 0 else 0.0,
+            # Kept as a single-entry mapping so consumers that iterate per_event_type
+            # (print_data_quality, the overview) keep working unchanged.
+            "per_event_type": {
+                "command": {
+                    "generated": gen,
+                    "dropped": drop,
+                    "received": received,
+                    "drop_pct": round(100 * drop / gen, 4) if gen > 0 else 0.0,
+                }
+            },
+            # Commands submitted but not completed when collection stopped. The
+            # separate setup row used to expose these as unmatched rows; with one
+            # row per command they would otherwise be invisible.
+            "commands_submitted": submitted,
+            "commands_incomplete": counters.get("incomplete", max(0, submitted - gen)),
         }
 
         # Untracked completions: completions whose command was never tracked at

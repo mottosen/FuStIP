@@ -108,6 +108,8 @@ ifeq ($(MODE),detailed)
 		$(if $(COMM_FILTER),-p $(COMM_FILTER)) \
 		$(if $(PID_FILTER),-P $(PID_FILTER)) \
 		$(if $(CONTAINER_FILTER),-c $(CONTAINER_FILTER)) \
+		$(if $(RING_MB),-b $(RING_MB)) \
+		$(if $(STATS_INTERVAL),-i $(STATS_INTERVAL)) \
 		$(VERBOSE_FLAG) \
 		$(ERR_REDIRECT) 1>&2 & echo $$! > "$(PIDS_DIR)/detailed.pid"
 

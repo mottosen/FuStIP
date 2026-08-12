@@ -24,7 +24,7 @@ $(INCLUDE_DIR)/vmlinux.h:
 
 # ── Standalone (BPF + userspace loader) ──
 
-c/standalone.bpf.o: c/standalone.bpf.c ../bpf/bpf_core.h $(INCLUDE_DIR)/vmlinux.h
+c/standalone.bpf.o: c/standalone.bpf.c ../bpf/bpf_core.h ../bpf/event.h $(INCLUDE_DIR)/vmlinux.h
 	$(Q)echo "  CLANG   $@"
 	$(Q)NIX_HARDENING_ENABLE="" $(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) \
 		-I$(INCLUDE_DIR) -I.. \
@@ -34,7 +34,7 @@ c/standalone.skel.h: c/standalone.bpf.o
 	$(Q)echo "  SKEL    $@"
 	$(Q)$(BPFTOOL) gen skeleton $< > $@
 
-standalone: c/loader.c c/standalone.skel.h
+standalone: c/loader.c ../bpf/event.h c/standalone.skel.h
 	$(Q)echo "  CC      c/standalone"
 	$(Q)$(CC) -g -O2 -Wall -Ic/ -o c/standalone $< -lbpf -lelf -lz
 

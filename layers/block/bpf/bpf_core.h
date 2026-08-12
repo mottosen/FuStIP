@@ -8,13 +8,22 @@
 // comm/mntns/tid are captured in the SUBMITTER's context (insert, or issue when the request
 // direct-dispatched past insert) and carried to the completion probe, which runs in interrupt
 // context where `current` is not the submitting task.
+// The insert and issue stages no longer emit their own record, so everything they
+// observe that the completion probe cannot re-derive is stashed here and carried
+// forward. queue_latency_ns and the two queue-depth snapshots are only meaningful
+// when the request actually went through insert, which `flags` records.
 struct rq_data {
 	__u8  op;
+	__u8  flags;                 // BLK_F_QUEUED once insert has fired
 	__u32 bytes;
 	__u64 sector;
 	__u64 mntns_id;
 	__u8  comm[16];
 	__u32 tid;
+	__u64 queue_latency_ns;      // insert -> issue, measured at issue
+	__s32 q_inflight_at_insert;
+	__s32 q_inflight_at_issue;
+	__s32 d_inflight_at_issue;
 };
 
 // ── Per-(op, comm) key for inflight counters ──
@@ -48,11 +57,12 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 1 << 28); // 256 MB
+	__uint(max_entries, 1 << 29); // 512 MB default; override at load time with -b
 } events SEC(".maps");
 
-// Per-event-type counters: [type*2] = generated, [type*2+1] = dropped
-// Block: insert=0,1  issue=2,3  complete=4,5
+// Counter slots: 0 = requests queued (reached insert), 2 = requests issued,
+// 4 = completions emitted, 5 = completions dropped by a full ring.
+// Slots 1 and 3 are unused: insert and issue no longer reserve records.
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 6);
@@ -108,6 +118,7 @@ static __always_inline int handle_block_rq_insert(struct request *rq)
 	// Store metadata for later probes
 	struct rq_data data = {
 		.op = op,
+		.flags = BLK_F_QUEUED,   // reaching insert IS what "queued" means
 		.bytes = bytes,
 		.sector = sector,
 	};
@@ -115,49 +126,27 @@ static __always_inline int handle_block_rq_insert(struct request *rq)
 	data.mntns_id = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
 	bpf_get_current_comm(&data.comm, sizeof(data.comm));
 	data.tid = (__u32)bpf_get_current_pid_tgid();
-	bpf_map_update_elem(&rq_metadata, &rq_key, &data, BPF_ANY);
 
-	// Atomically increment queue inflight; snapshot driver inflight
+	// Atomically increment queue inflight
 	struct inflight_key ikey = {};
 	ikey.op = op;
 	__builtin_memcpy(ikey.comm, data.comm, 16);
 	__s64 zero = 0;
 	bpf_map_update_elem(&q_inflight_counts, &ikey, &zero, BPF_NOEXIST);
 	__s64 *qcnt = bpf_map_lookup_elem(&q_inflight_counts, &ikey);
-	__s32 qi = 0;
 	if (qcnt)
-		qi = (__s32)(__sync_fetch_and_add(qcnt, 1) + 1);
+		data.q_inflight_at_insert = (__s32)(__sync_fetch_and_add(qcnt, 1) + 1);
+	// Ensure the driver counter exists so issue can increment it.
 	bpf_map_update_elem(&d_inflight_counts, &ikey, &zero, BPF_NOEXIST);
-	__s64 *dcnt = bpf_map_lookup_elem(&d_inflight_counts, &ikey);
-	__s32 di = 0;
-	if (dcnt)
-		di = (__s32)*dcnt;
 
-	// Emit insert event
+	bpf_map_update_elem(&rq_metadata, &rq_key, &data, BPF_ANY);
+
+	// No ring-buffer record: count the request as queued and let the completion
+	// probe emit the single record. This counter is what `rq_queued` reports, and
+	// (issued - queued) is the direct-dispatch count.
 	__u32 gen_key = 0;
 	__u64 *gen_cnt = bpf_map_lookup_elem(&event_counters, &gen_key);
 	if (gen_cnt) (*gen_cnt)++;
-
-	struct block_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-	if (e) {
-		e->timestamp_ns = ts;
-		e->mntns_id = data.mntns_id;
-		e->event_type = EVT_INSERT;
-		e->op = op;
-		e->bytes = bytes;
-		e->latency_ns = 0;
-		e->sector = sector;
-		e->rq = rq_key;
-		__builtin_memcpy(e->comm, data.comm, 16);
-		e->tid = data.tid;
-		e->q_inflight = qi;
-		e->d_inflight = di;
-		bpf_ringbuf_submit(e, 0);
-	} else {
-		__u32 drop_key = 1;
-		__u64 *drop_cnt = bpf_map_lookup_elem(&event_counters, &drop_key);
-		if (drop_cnt) (*drop_cnt)++;
-	}
 
 	return 0;
 }
@@ -186,22 +175,27 @@ static __always_inline int handle_block_rq_issue(struct request *rq)
 	// the direct-dispatch path (scheduler 'none', io_uring) where insert never fired — it is
 	// the common case for the workloads this layer exists to profile, so tid must be captured
 	// here too or it would be null on exactly the I/O that matters.
+	//
+	// flags and q_inflight_at_insert must be carried across as well: `data` is a fresh
+	// struct (op/bytes/sector are deliberately re-read here to catch scheduler merges),
+	// so anything the insert stage recorded is lost unless copied forward. Dropping
+	// BLK_F_QUEUED here would silently reclassify every queued request as direct-dispatched.
 	struct rq_data *old_data = bpf_map_lookup_elem(&rq_metadata, &rq_key);
 	if (old_data) {
 		__builtin_memcpy(data.comm, old_data->comm, 16);
 		data.mntns_id = old_data->mntns_id;
 		data.tid = old_data->tid;
+		data.flags = old_data->flags;
+		data.q_inflight_at_insert = old_data->q_inflight_at_insert;
 	} else {
 		bpf_get_current_comm(&data.comm, sizeof(data.comm));
 		data.tid = (__u32)bpf_get_current_pid_tgid();
 	}
-	bpf_map_update_elem(&rq_metadata, &rq_key, &data, BPF_ANY);
 
 	// Compute queue latency (insert → issue)
-	__u64 queue_lat = 0;
 	__u64 *t_insert = bpf_map_lookup_elem(&insert_time, &rq_key);
 	if (t_insert) {
-		queue_lat = now - *t_insert;
+		data.queue_latency_ns = now - *t_insert;
 		bpf_map_delete_elem(&insert_time, &rq_key);
 	}
 
@@ -211,46 +205,25 @@ static __always_inline int handle_block_rq_issue(struct request *rq)
 	ikey.op = op;
 	__builtin_memcpy(ikey.comm, data.comm, 16);
 	__s64 *qcnt = bpf_map_lookup_elem(&q_inflight_counts, &ikey);
-	__s32 qi = 0;
 	if (qcnt) {
 		if (t_insert)
-			qi = (__s32)(__sync_fetch_and_add(qcnt, -1) - 1);
+			data.q_inflight_at_issue = (__s32)(__sync_fetch_and_add(qcnt, -1) - 1);
 		else
-			qi = (__s32)*qcnt;
+			data.q_inflight_at_issue = (__s32)*qcnt;
 	}
 	// Always increment driver inflight
 	__s64 zero = 0;
 	bpf_map_update_elem(&d_inflight_counts, &ikey, &zero, BPF_NOEXIST);
 	__s64 *dcnt = bpf_map_lookup_elem(&d_inflight_counts, &ikey);
-	__s32 di = 0;
 	if (dcnt)
-		di = (__s32)(__sync_fetch_and_add(dcnt, 1) + 1);
+		data.d_inflight_at_issue = (__s32)(__sync_fetch_and_add(dcnt, 1) + 1);
 
-	// Emit issue event
+	bpf_map_update_elem(&rq_metadata, &rq_key, &data, BPF_ANY);
+
+	// No ring-buffer record here either. This counter is `rq_issued`.
 	__u32 gen_key2 = 2;  // ISSUE_GEN
 	__u64 *gen_cnt2 = bpf_map_lookup_elem(&event_counters, &gen_key2);
 	if (gen_cnt2) (*gen_cnt2)++;
-
-	struct block_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-	if (e) {
-		e->timestamp_ns = now;
-		e->mntns_id = data.mntns_id;
-		e->event_type = EVT_ISSUE;
-		e->op = op;
-		e->bytes = bytes;
-		e->latency_ns = queue_lat;
-		e->sector = sector;
-		e->rq = rq_key;
-		__builtin_memcpy(e->comm, data.comm, 16);
-		e->tid = data.tid;
-		e->q_inflight = qi;
-		e->d_inflight = di;
-		bpf_ringbuf_submit(e, 0);
-	} else {
-		__u32 drop_key2 = 3;  // ISSUE_DROP
-		__u64 *drop_cnt2 = bpf_map_lookup_elem(&event_counters, &drop_key2);
-		if (drop_cnt2) (*drop_cnt2)++;
-	}
 
 	return 0;
 }
@@ -287,20 +260,16 @@ static __always_inline int handle_block_rq_complete(struct request *rq)
 		return 0;
 	}
 
-	// Snapshot queue inflight; atomically decrement driver inflight
+	// Atomically decrement driver inflight
 	struct inflight_key ikey = {};
 	ikey.op = data->op;
 	__builtin_memcpy(ikey.comm, data->comm, 16);
-	__s64 *qcnt = bpf_map_lookup_elem(&q_inflight_counts, &ikey);
-	__s32 qi = 0;
-	if (qcnt)
-		qi = (__s32)*qcnt;
 	__s64 *dcnt = bpf_map_lookup_elem(&d_inflight_counts, &ikey);
 	__s32 di = 0;
 	if (dcnt)
 		di = (__s32)(__sync_fetch_and_add(dcnt, -1) - 1);
 
-	// Emit complete event
+	// Emit the single record for this request's whole life
 	__u32 gen_key3 = 4;  // COMPLETE_GEN
 	__u64 *gen_cnt3 = bpf_map_lookup_elem(&event_counters, &gen_key3);
 	if (gen_cnt3) (*gen_cnt3)++;
@@ -309,16 +278,19 @@ static __always_inline int handle_block_rq_complete(struct request *rq)
 	if (e) {
 		e->timestamp_ns = now;
 		e->mntns_id = data->mntns_id;
-		e->event_type = EVT_COMPLETE;
 		e->op = data->op;
+		e->flags = data->flags;
 		e->bytes = data->bytes;
 		e->latency_ns = driver_lat;
+		e->queue_latency_ns = data->queue_latency_ns;
 		e->sector = data->sector;
 		e->rq = rq_key;
 		__builtin_memcpy(e->comm, data->comm, 16);
 		e->tid = data->tid;
-		e->q_inflight = qi;
-		e->d_inflight = di;
+		e->q_inflight_at_insert = data->q_inflight_at_insert;
+		e->q_inflight_at_issue = data->q_inflight_at_issue;
+		e->d_inflight_at_issue = data->d_inflight_at_issue;
+		e->d_inflight_at_complete = di;
 		bpf_ringbuf_submit(e, 0);
 	} else {
 		__u32 drop_key3 = 5;  // COMPLETE_DROP

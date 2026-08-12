@@ -2,10 +2,34 @@
 #ifndef __BLOCK_EVENT_H
 #define __BLOCK_EVENT_H
 
-// ── Event types ──
-#define EVT_INSERT  0
-#define EVT_ISSUE   1
-#define EVT_COMPLETE 2
+// ── One record per request ──
+//
+// The layer used to emit THREE ring-buffer records per request (insert, issue,
+// complete). It now emits one, at completion, carrying everything needed to
+// reconstruct the other two stages:
+//
+//   issue time  = timestamp_ns - latency_ns
+//   insert time = issue time  - queue_latency_ns   (only when BLK_F_QUEUED)
+//
+// Unlike the nvme layer this is not just a merge, because `latency_ns` used to
+// mean two unrelated things depending on the row — queue latency on `issue`,
+// driver latency on `complete`. They are now separate fields, so nothing has to
+// be inferred from which row it came from.
+//
+// The rate argument is the same as the nvme layer's: three collectors sharing a
+// host drop each one's sustainable rate well below what it manages alone, and block
+// was the second heaviest producer at 1.13 M records/s. One record per request
+// takes it to 0.38 M/s.
+//
+// ── Flags ──
+// Requests dispatched straight to the driver skip `insert` entirely (scheduler
+// 'none', io_uring — the common case for the workloads this layer profiles).
+// That used to be inferred from `latency_ns == 0` on the issue row; with one row
+// per request there is no issue row, and "no queue stage" would be indistinguishable
+// from "queued with an immeasurably short wait". BLK_F_QUEUED records it explicitly,
+// which is what keeps direct-dispatched requests out of the queue-latency
+// distribution and makes the direct-dispatch fraction computable.
+#define BLK_F_QUEUED (1 << 0)
 
 // ── Block operation types (cmd_flags & 0xFF) ──
 #define BLK_OP_READ        0
@@ -15,19 +39,31 @@
 #define BLK_OP_WRITE_ZEROS 9
 
 // ── Event struct (ring buffer → userspace) ──
+// Emitted once, at completion. 90 bytes.
 struct block_event {
-	__u64 timestamp_ns;
-	__u64 mntns_id;     // mount namespace id of originating task (0 if unknown)
-	__u8  event_type;   // EVT_INSERT, EVT_ISSUE, EVT_COMPLETE
-	__u8  op;           // BLK_OP_*
-	__u32 bytes;        // rq->__data_len
-	__u64 latency_ns;   // queue lat (issue), driver lat (complete), 0 (insert)
-	__u64 sector;       // rq->__sector
-	__u64 rq;           // request pointer (correlation ID)
-	char  comm[16];     // process name
-	__u32 tid;          // SUBMITTING thread id (captured at insert/issue, carried to complete)
-	__s32 q_inflight;   // queue inflight (insert -> issue)
-	__s32 d_inflight;   // driver inflight (issue -> complete)
+	__u64 timestamp_ns;      // COMPLETION time
+	__u64 mntns_id;          // mount namespace id of originating task (0 if unknown)
+	__u8  op;                // BLK_OP_*
+	__u8  flags;             // BLK_F_* (see above)
+	__u32 bytes;             // rq->__data_len, as re-read at issue (post-merge)
+	__u64 latency_ns;        // DRIVER latency: issue -> complete
+	__u64 queue_latency_ns;  // QUEUE latency: insert -> issue; 0 unless BLK_F_QUEUED
+	__u64 sector;            // rq->__sector, as re-read at issue (post-merge)
+	__u64 rq;                // request pointer (correlation ID)
+	char  comm[16];          // process name
+	__u32 tid;               // SUBMITTING thread id (captured at insert/issue, carried here)
+	// Depth snapshots at each stage this request itself passed through.
+	//
+	// These cannot be collapsed into one field or derived from each other: both
+	// counters are shared per (op, comm) and every concurrent sibling mutates them
+	// in between, so the value at completion says nothing about the value when this
+	// request was inserted or issued. Carrying all four preserves the queue-depth
+	// and driver-depth time series exactly, including the seconds that contain
+	// submissions but no completions.
+	__s32 q_inflight_at_insert;    // 0 when not queued
+	__s32 q_inflight_at_issue;     // 0 when not queued
+	__s32 d_inflight_at_issue;
+	__s32 d_inflight_at_complete;
 } __attribute__((packed));
 
 #endif // __BLOCK_EVENT_H
