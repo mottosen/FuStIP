@@ -15,6 +15,7 @@ for histograms and time-series data.
 import json
 import math
 import re
+from pathlib import Path
 
 import numpy as np
 
@@ -55,14 +56,18 @@ def print_data_quality(stats_path, label="", indent="  "):
     up indirectly as a count shortfall vs FIO; print the authoritative numbers here so
     drops are visible per job. `label` tags the layer (e.g. "BLK"/"NVME") when one job
     spans several stats files. No-op for summary mode or if the section is absent.
+
+    Returns the drop percentage, or None when there is no data_quality section to read
+    (summary mode, or an older stats file). Callers that need a verdict rather than a
+    printout should use `check_data_quality` below.
     """
     try:
         with open(stats_path) as f:
             dq = json.load(f).get("data_quality", {})
     except (OSError, json.JSONDecodeError):
-        return
+        return None
     if not dq:
-        return
+        return None
     tag = f"{label} DROPS" if label else "DROPS"
     gen = dq.get("total_generated", 0)
     drop = dq.get("total_dropped", 0)
@@ -72,6 +77,95 @@ def print_data_quality(stats_path, label="", indent="  "):
         if v.get("generated"):
             print(f"{indent}{' ' * len(tag)}  {etype}: {v.get('dropped')}/{v.get('generated')} "
                   f"({v.get('drop_pct', 0.0):.3f}%)")
+    return pct
+
+
+def check_data_quality(stats_path, label="", max_drop_pct=0.0):
+    """Assert that the ring buffer lost no events. Returns (passed, msg) like check_approx.
+
+    This exists because event loss was, until now, reported only as a printed line that
+    no test consulted — a capture could discard 23% of its NVMe events while every suite
+    exited 0. A drop is a silent correctness failure: the CSV looks entirely normal, just
+    short. So it has to fail the run, not decorate it.
+
+    The default threshold is 0.0: with one row per operation and a 512 MB ring the
+    collector has multiples of the headroom the heaviest measured workload needs, so any
+    drop at all means something regressed. Raise it deliberately per job if ever needed.
+
+    A missing data_quality section (summary mode, older stats file) is not a failure —
+    there is nothing to check — but it is reported so it cannot be mistaken for a pass.
+    """
+    try:
+        with open(stats_path) as f:
+            dq = json.load(f).get("data_quality", {})
+    except (OSError, json.JSONDecodeError):
+        dq = {}
+    tag = f"{label} drops" if label else "drops"
+    if not dq:
+        return True, f"[SKIP] {tag}: no data_quality section (summary mode or pre-drop-counter capture)"
+    pct = dq.get("drop_pct", 0.0)
+    gen = dq.get("total_generated", 0)
+    drop = dq.get("total_dropped", 0)
+    passed = pct <= max_drop_pct
+    msg = (f"[{'PASS' if passed else 'FAIL'}] {tag}: {drop}/{gen} events dropped "
+           f"({pct:.3f}%)")
+    if not passed:
+        msg += f" — exceeds {max_drop_pct:.3f}% threshold; the capture is incomplete"
+    return passed, msg
+
+
+def check_stage_consistency(stats_path, label="", tolerance=0.02):
+    """Verify the layer finished and recorded everything it started. -> [(passed, msg)]
+
+    Replaces the old per-op `setup~completed` / `issued~completed` checks. Those
+    counted setup/issue ROWS against completion rows; with one row per operation
+    there are no setup or issue rows, and a per-op figure derived from the
+    completion count would compare a number against itself — a check that can
+    never fail is worse than no check, because it reads as coverage.
+
+    The stage totals come from independent per-CPU BPF counters that are
+    incremented whether or not a ring-buffer record is reserved, so this remains a
+    genuine cross-check. It catches two distinct faults:
+
+      * operations started but never completed (a probe missing its partner, or a
+        capture stopped mid-flight — a small tail is normal, a large one is not);
+      * a parquet row count that disagrees with generated-minus-dropped, which
+        would mean records were lost somewhere other than the ring buffer.
+    """
+    try:
+        with open(stats_path) as f:
+            dq = json.load(f).get("data_quality", {})
+    except (OSError, json.JSONDecodeError):
+        dq = {}
+    tag = f"{label} " if label else ""
+    if not dq:
+        return [(True, f"[SKIP] {tag}stage consistency: no data_quality section")]
+
+    results = []
+    # nvme names them commands_*, block requests_*; whichever is present.
+    started_key = next((k for k in ("commands_submitted", "requests_issued") if k in dq), None)
+    incomplete_key = next((k for k in ("commands_incomplete", "requests_incomplete") if k in dq), None)
+    if started_key and incomplete_key:
+        started = dq.get(started_key, 0)
+        incomplete = dq.get(incomplete_key, 0)
+        frac = (incomplete / started) if started else 0.0
+        passed = frac <= tolerance
+        results.append((passed,
+                        f"[{'PASS' if passed else 'FAIL'}] {tag}started~finished: "
+                        f"{incomplete}/{started} never completed ({frac:.2%})"
+                        + ("" if passed else f" — exceeds {tolerance:.0%}")))
+
+    gen = dq.get("total_generated", 0)
+    drop = dq.get("total_dropped", 0)
+    received = dq.get("total_received", 0)
+    expected = gen - drop
+    if gen:
+        # Exact equality: these count the same records by two independent routes.
+        passed = received == expected
+        results.append((passed,
+                        f"[{'PASS' if passed else 'FAIL'}] {tag}rows~counters: "
+                        f"{received} rows vs {expected} expected (generated {gen} - dropped {drop})"))
+    return results
 
 
 def parse_counters(path):
@@ -652,6 +746,118 @@ def compute_access_pattern(sectors, bytes_list, sector_bytes=512):
         "sequential_pct": round(100 * seq_count / total_gaps, 2),
         "random_pct": round(100 * rnd_count / total_gaps, 2),
     }
+
+
+def load_device_geometry(parquet_path):
+    """Return geom_for(disk) -> (capacity_lba | None, sector_bytes).
+
+    `capacity_lba` (device size in logical blocks) normalises the LBA distribution;
+    `sector_bytes` (logical-block size) converts transfer bytes to logical blocks for
+    the access-pattern gap test. Detailed-mode `sector` is now the NVMe SLBA in
+    logical-block units, so both come from the device's own geometry.
+
+    Prefers the capture-time `device-info.json` (offline-safe: `nsze_lbas` +
+    `lba_size_bytes`), falling back to live sysfs on the capture host. The fallback reads
+    the device's real logical-block size from `/sys/block/<dev>/queue/logical_block_size`
+    (NOT a hardcoded 512 — many NVMe namespaces are 4096-logical, and assuming 512 makes
+    the gap test off by a constant factor → sequential IO misreported as random); the
+    `/sys/block/<dev>/size` capacity is in 512-byte units and is converted to logical
+    blocks. Multi-device safe — geometry is resolved per disk.
+    """
+    info_path = Path(parquet_path).parent / "device-info.json"
+    info = {}
+    if info_path.exists():
+        try:
+            info = json.loads(info_path.read_text())
+        except (OSError, ValueError):
+            info = {}
+
+    def geom_for(disk):
+        entry = info.get(disk) if disk else None
+        if entry is None and len(info) == 1:
+            entry = next(iter(info.values()))
+        if isinstance(entry, dict):
+            # sector_bytes: nvme-list SectorSize, else the sysfs logical block size the
+            # collector records — never silently 512 when the device says otherwise.
+            sector_bytes = int(entry.get("lba_size_bytes")
+                               or entry.get("logical_block_bytes") or 512)
+            # capacity in *logical blocks*: nsze_lbas is already in those units;
+            # sectors_512b is in 512-byte units, so convert it.
+            if entry.get("nsze_lbas"):
+                cap = int(entry["nsze_lbas"]) or None
+            elif entry.get("sectors_512b"):
+                cap = int(entry["sectors_512b"]) * 512 // sector_bytes or None
+            else:
+                cap = None
+            if cap:
+                return cap, sector_bytes
+        if disk:
+            try:
+                lbs_path = Path(f"/sys/block/{disk}/queue/logical_block_size")
+                sector_bytes = int(lbs_path.read_text().strip()) if lbs_path.exists() else 512
+                size_path = Path(f"/sys/block/{disk}/size")
+                if size_path.exists():
+                    # /sys/block/*/size is always in 512-byte units; convert to the
+                    # device's own logical blocks (SLBAs are in logical-block units).
+                    cap_lba = int(size_path.read_text().strip()) * 512 // sector_bytes
+                    return cap_lba, sector_bytes
+                return None, sector_bytes
+            except (ValueError, OSError):
+                pass
+        return None, 512
+
+    return geom_for
+
+
+def device_access_pattern(parquet_path, sector_bytes_for=None):
+    """Access pattern over the WHOLE capture, per (disk, op). -> {disk: {op: pattern}}
+
+    The per-comm entries in the stats JSON answer "was THIS thread's stream
+    sequential?". That is a different question from "was the stream the DEVICE saw
+    sequential?", and the two diverge whenever one logical stream is issued by more
+    than one thread — which is the normal case, not a corner one. A sequential fio
+    write job offloads part of its submissions to `iou-wrk-*` kernel workers, so the
+    device sees one perfect ramp while each comm sees a subsequence full of holes.
+
+    Summing per-comm `sequential_count` does not recover it either: sequentiality is
+    a property of adjacency within an ordered stream, so counts computed over
+    different streams cannot be added. The stream has to be re-ordered as a whole,
+    which is what this does.
+
+    ORDERING: rows are completions, so the sort key is the reconstructed submission
+    time (`timestamp_ns - latency_ns`) — see compute_access_pattern()'s contract.
+    """
+    import polars as pl                                      # local: shared.py is numpy-only
+
+    lf = pl.scan_parquet(parquet_path)
+    cols = lf.collect_schema().names()
+    if not {"sector", "bytes", "op", "timestamp_ns", "latency_ns"} <= set(cols):
+        return {}
+    disk_col = "disk_name" if "disk_name" in cols else None
+    sel = ["sector", "bytes", "op", "timestamp_ns", "latency_ns"] + ([disk_col] if disk_col else [])
+    df = (lf.select(sel)
+            .filter(pl.col("sector").is_not_null() & (pl.col("sector") != (1 << 64) - 1))
+            .with_columns((pl.col("timestamp_ns") - pl.col("latency_ns")).alias("submit_ts"))
+            .sort("submit_ts")
+            .collect(engine="streaming"))
+    if df.is_empty():
+        return {}
+
+    out = {}
+    disks = df[disk_col].unique().to_list() if disk_col else [None]
+    for disk in disks:
+        sub = df.filter(pl.col(disk_col) == disk) if disk_col else df
+        sector_bytes = sector_bytes_for(disk)[1] if sector_bytes_for else 512
+        per_op = {}
+        for op in sub["op"].unique().to_list():
+            o = sub.filter(pl.col("op") == op)
+            if o.height < 2:
+                continue
+            per_op[op] = compute_access_pattern(o["sector"].cast(pl.Int64).to_numpy(),
+                                                o["bytes"].cast(pl.Int64).to_numpy(),
+                                                sector_bytes=sector_bytes)
+        out[disk] = per_op
+    return out
 
 
 def compute_lba_distribution(sectors, bytes_list, device_sectors=None, n_bins=512,

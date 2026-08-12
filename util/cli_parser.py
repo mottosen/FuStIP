@@ -51,6 +51,14 @@ def _apply_config_defaults(args, cfg):
         args.container_filter = _as_csv(cfg["container_filter"])
     if args.dev_filter is None and "dev_filter" in cfg:
         args.dev_filter = _as_csv(cfg["dev_filter"])
+    # ring_mb accepts a scalar (all layers) or a per-layer map, because the layers
+    # do not generate at the same rate: nvme and block are the heavy ones, fs is
+    # roughly a quarter of either, and a machine that cannot spare 3 x 512 MB should
+    # be able to shrink the quiet layer without shrinking the ones that need it.
+    if args.ring_mb is None and "ring_mb" in cfg:
+        args.ring_mb = cfg["ring_mb"]
+    if args.stats_interval is None and "stats_interval" in cfg:
+        args.stats_interval = cfg["stats_interval"]
 
 
 def parse_args(argv=None):
@@ -72,6 +80,12 @@ def parse_args(argv=None):
                              "Narrows within any container/device; system-wide if it is the only filter [config: comm_filter]")
     parent.add_argument("-P", "--pid-filter", help="Process ID (tgid) filter, comma-separated for multiple. "
                              "Peer of comm-filter (union); system-wide if no container/device set [config: pid_filter]")
+    parent.add_argument("--ring-mb", dest="ring_mb", default=None,
+                        help="BPF ring buffer size in MiB, power of two. A bare number applies "
+                             "to every layer; 'nvme=512,fs=256' sets them individually. "
+                             "Default is the compiled-in 512 MB.")
+    parent.add_argument("--stats-interval", dest="stats_interval", type=int, default=None,
+                        help="Seconds between drops.csv samples (default 1; 0 disables)")
     parent.add_argument("--config", metavar="FILE", help="YAML config file; CLI flags override file values [CLI only]")
     parent.add_argument("--results-dir", dest="results_dir", help="Results directory for stats and visualizations (overrides RESULTS_DIR env var) [CLI only]")
     parent.add_argument("--tmp-dir", "--data-dir", dest="tmp_dir", default=None,
@@ -284,8 +298,41 @@ def build_layer_vars(layer, args, data_dir=None):
     if args.pid_filter:
         vs.append(f"PID_FILTER={args.pid_filter}")
 
+    # Ring size and drop-sampling interval apply to the eBPF layers only; sysstat
+    # returned above and has no ring buffer.
+    ring = _ring_mb_for(layer, getattr(args, "ring_mb", None))
+    if ring:
+        vs.append(f"RING_MB={ring}")
+    if getattr(args, "stats_interval", None) is not None:
+        vs.append(f"STATS_INTERVAL={args.stats_interval}")
+
     vs.append(f"RESULTS_DIR={target_dir}")
     return vs
+
+
+def _ring_mb_for(layer, ring_mb):
+    """Resolve the ring size for one layer. -> str | None
+
+    Accepts a scalar (int or bare numeric string) applying to every layer, a dict
+    from the YAML config, or a 'nvme=512,fs=256' CLI string. An entry naming a
+    layer that is not running is ignored rather than an error, so one config can
+    serve invocations that enable different layer sets.
+    """
+    if ring_mb is None:
+        return None
+    if isinstance(ring_mb, dict):
+        v = ring_mb.get(layer)
+        return str(v) if v is not None else None
+    text = str(ring_mb).strip()
+    if "=" not in text:
+        return text or None
+    for part in text.split(","):
+        if "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        if name.strip() == layer:
+            return value.strip() or None
+    return None
 
 
 def _concurrent(cmds):
