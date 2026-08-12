@@ -23,7 +23,14 @@ PIDS_DIR = /tmp/sysstat-pids
 # unprivileged and cheap, but it shares the same fate if left to compete.
 #
 # Empty or unset = no pinning, which is right on an unloaded machine.
-TASKSET = $(if $(PROFILER_CPUSET),taskset -c $(PROFILER_CPUSET),)
+# Per-layer reservation, falling back to the pooled one. A pooled cpuset lets the
+# scheduler put two single-threaded collectors on the two SMT siblings of one
+# physical core, which costs each of them ~2.12x throughput — the collectors then
+# contend inside the reservation meant to isolate them. PROFILER_CPUSET_SYSSTAT gives
+# this layer a core of its own; PROFILER_CPUSET remains the union, so anything that
+# sets only the pooled variable behaves exactly as before.
+PROFILER_CPUS := $(if $(PROFILER_CPUSET_SYSSTAT),$(PROFILER_CPUSET_SYSSTAT),$(PROFILER_CPUSET))
+TASKSET = $(if $(PROFILER_CPUS),taskset -c $(PROFILER_CPUS),)
 # Refuse an impossible cpuset at PARSE time, before anything is launched.
 #
 # Without this the failure is silent and looks like success: taskset would exit
@@ -31,9 +38,9 @@ TASKSET = $(if $(PROFILER_CPUSET),taskset -c $(PROFILER_CPUSET),)
 # would still return 0, and the run would produce an empty capture. That is the
 # exact failure class this pinning exists to remove, so it must not be reachable
 # through a typo. Parse-time (not recipe-time) so it also fires under `make -n`.
-ifneq ($(PROFILER_CPUSET),)
-ifneq ($(shell taskset -c $(PROFILER_CPUSET) true >/dev/null 2>&1; echo $$?),0)
-$(error PROFILER_CPUSET="$(PROFILER_CPUSET)" is not settable on this machine \
+ifneq ($(PROFILER_CPUS),)
+ifneq ($(shell taskset -c $(PROFILER_CPUS) true >/dev/null 2>&1; echo $$?),0)
+$(error PROFILER_CPUSET="$(PROFILER_CPUS)" is not settable on this machine \
         (taskset rejected it). Give a CPU list this host actually has, or unset \
         it to run unpinned.)
 endif
