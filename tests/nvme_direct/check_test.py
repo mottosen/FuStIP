@@ -15,7 +15,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "util"))
-from stats_generation.shared import parse_counters, print_data_quality
+from stats_generation.shared import (parse_counters, print_data_quality,
+                                     check_data_quality, check_stage_consistency)
+from stats_generation.schema import validate_layer_schema
 
 
 def parse_fio_json(path):
@@ -208,15 +210,9 @@ def validate_nvme(fio, nvme, tolerance, kind, allow_over=False):
             get_val(nvme, "cmd_total_bytes", "write"),
             fio["write_bytes"], tolerance, allow_over))
 
-    # Consistency: setup~completed
-    ops = ("read", "write") if kind == "mixed" else (kind,)
-    for op in ops:
-        setup = get_val(nvme, "cmd_setup", op)
-        completed = get_val(nvme, "cmd_completed", op)
-        if setup > 0 and completed > 0:
-            results.append(check_approx(
-                f"nvme {op} setup~completed",
-                setup, completed, tolerance))
+    # Stage consistency moved to check_stage_consistency() against the BPF stage
+    # counters in data_quality: with one row per command there are no setup rows to
+    # count, so cmd_setup no longer exists per op.
 
     return results
 
@@ -230,6 +226,9 @@ def main():
                         help="Profiling mode (default: summary)")
     parser.add_argument("--tolerance", type=float, default=0.02, help="Tolerance for count checks (default: 0.02)")
     parser.add_argument("--container", action="store_true", help="Container mode: allow profiler counts above FIO")
+    parser.add_argument("--max-drop-pct", type=float, default=0.0,
+                        help="Fail if the BPF ring buffer dropped more than this %% of "
+                             "events (default: 0.0 — any drop is a regression)")
     args = parser.parse_args()
 
     fio = parse_fio_json(args.fio_json)
@@ -277,6 +276,31 @@ def main():
             if not passed:
                 all_passed = False
 
+    # Schema first: every check below reads columns, so a structural problem should
+    # be reported as one rather than as a pile of odd values.
+    if args.mode == "detailed":
+        for _sp, _slayer, _slabel in ((args.nvme_out, "nvme", "NVME"),):
+            _pq = Path(_sp).parent / "detailed.parquet"
+            for _ok, _msg in validate_layer_schema(_pq, _slayer, label=_slabel):
+                print(f"  {_msg}")
+                if not _ok:
+                    all_passed = False
+
+    # Ring-buffer drops are a correctness failure, not a diagnostic: a short capture
+    # looks entirely normal. Checked last so `all_passed` is always in scope.
+    if args.mode == "detailed":
+        for _dq_path, _dq_label in ((args.nvme_out, "NVME"),):
+            _dq_passed, _dq_msg = check_data_quality(_dq_path, label=_dq_label,
+                                                     max_drop_pct=args.max_drop_pct)
+            print(f"  {_dq_msg}")
+            if not _dq_passed:
+                all_passed = False
+            for _sc_passed, _sc_msg in check_stage_consistency(_dq_path, label=_dq_label,
+                                                               tolerance=args.tolerance):
+                print(f"  {_sc_msg}")
+                if not _sc_passed:
+                    all_passed = False
+
     print()
     if all_passed:
         print("  RESULT: PASS")
@@ -284,7 +308,8 @@ def main():
         print("  RESULT: FAIL")
 
     print()
+    return 0 if all_passed else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

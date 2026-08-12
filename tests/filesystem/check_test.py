@@ -12,7 +12,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "util"))
-from stats_generation.shared import parse_counters, print_data_quality
+from stats_generation.shared import (parse_counters, print_data_quality,
+                                     check_data_quality)
 
 
 def parse_fio_json(path):
@@ -328,6 +329,9 @@ def main():
                         help="Profiling mode (default: summary)")
     parser.add_argument("--tolerance", type=float, default=0.02, help="Tolerance for count checks (default: 0.02)")
     parser.add_argument("--container", action="store_true", help="Container mode: allow profiler counts above FIO")
+    parser.add_argument("--max-drop-pct", type=float, default=0.0,
+                        help="Fail if the BPF ring buffer dropped more than this %% of "
+                             "events (default: 0.0 — any drop is a regression)")
     args = parser.parse_args()
 
     fio = parse_fio_json(args.fio_json)
@@ -388,6 +392,16 @@ def main():
             if not passed:
                 all_passed = False
 
+    # Ring-buffer drops are a correctness failure, not a diagnostic: a short capture
+    # looks entirely normal. Checked last so `all_passed` is always in scope.
+    if args.mode == "detailed":
+        for _dq_path, _dq_label in ((args.fs_out, "FS"),):
+            _dq_passed, _dq_msg = check_data_quality(_dq_path, label=_dq_label,
+                                                     max_drop_pct=args.max_drop_pct)
+            print(f"  {_dq_msg}")
+            if not _dq_passed:
+                all_passed = False
+
     print()
     if all_passed:
         print("  RESULT: PASS")
@@ -395,7 +409,8 @@ def main():
         print("  RESULT: FAIL")
 
     print()
+    return 0 if all_passed else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
