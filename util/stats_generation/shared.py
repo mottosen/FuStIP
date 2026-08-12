@@ -47,7 +47,7 @@ _HIST_SINGLE_RE = re.compile(r"^\[(\S+)\]\s+(\d+)\s+\|")
 _TSERIES_DATA_RE = re.compile(r"^(\d{2}:\d{2}:\d{2})\s+.*[|*]\s*(-?\d+)\s*$")
 
 
-def print_data_quality(stats_path, label="", indent="  "):
+def print_data_quality(stats_path, label="", indent="  ", width=0):
     """Print the BPF ring-buffer data_quality (event drops) from a detailed-stats.json.
 
     Detailed mode counts every event the BPF program *generated* and every one that
@@ -68,14 +68,17 @@ def print_data_quality(stats_path, label="", indent="  "):
         return None
     if not dq:
         return None
-    tag = f"{label} DROPS" if label else "DROPS"
+    tag = (f"{label} DROPS" if label else "DROPS") + ":"
     gen = dq.get("total_generated", 0)
     drop = dq.get("total_dropped", 0)
     pct = dq.get("drop_pct", 0.0)
-    print(f"{indent}{tag}: {drop}/{gen} events dropped ({pct:.3f}%)")
-    for etype, v in dq.get("per_event_type", {}).items():
-        if v.get("generated"):
-            print(f"{indent}{' ' * len(tag)}  {etype}: {v.get('dropped')}/{v.get('generated')} "
+    print(f"{indent}{tag:<{width}} {drop}/{gen} events dropped ({pct:.3f}%)")
+    # The per-type breakdown only says something when there is more than one type;
+    # with a single one it restates the total on a second line.
+    types = [(k, v) for k, v in dq.get("per_event_type", {}).items() if v.get("generated")]
+    if len(types) > 1:
+        for etype, v in types:
+            print(f"{indent}{'':<{width}} {etype}: {v.get('dropped')}/{v.get('generated')} "
                   f"({v.get('drop_pct', 0.0):.3f}%)")
     return pct
 

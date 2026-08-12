@@ -15,9 +15,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "util"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from stats_generation.shared import (parse_counters, print_data_quality,
                                      check_data_quality, check_stage_consistency)
-from stats_generation.schema import validate_layer_schema
+from report import (active_ops, print_group, print_numbers, print_result,
+                    schema_summary, strip_prefix)
 
 
 def parse_fio_json(path):
@@ -242,73 +244,41 @@ def main():
     if args.mode == "detailed":
         ops = {"read": ["read"], "write": ["write"], "mixed": ["read", "write"]}[kind]
 
-    print(f"\n=== {args.job} (mode={args.mode}, io_uring_cmd / nvme passthrough) ===")
+    print(f"\n=== {args.job} (mode={args.mode}, io_uring_cmd / nvme passthrough) ===\n")
 
-    print(f"  FIO:  read_ios={fio['read_ios']}  read_bytes={fio['read_bytes']}"
-          f"  write_ios={fio['write_ios']}  write_bytes={fio['write_bytes']}")
-
-    print("")
-    for op in ("read", "write"):
-        prefix = "NVME:" if op == "read" else ""
-        print(f"  {prefix:6}{op + ':':6}"
-              f"  setup={get_val(nvme, 'cmd_setup', op)}"
-              f"  completed={get_val(nvme, 'cmd_completed', op)}"
-              f"  bytes={get_val(nvme, 'cmd_total_bytes', op)}")
+    rows = [("FIO", op, [("ios", fio[f"{op}_ios"]), ("bytes", fio[f"{op}_bytes"])])
+            for op in ("read", "write") if fio[f"{op}_ios"]]
+    rows += [("NVME", op, [("ios", get_val(nvme, "cmd_completed", op)),
+                              ("bytes", get_val(nvme, "cmd_total_bytes", op))])
+             for op in active_ops(nvme, "cmd_completed", fio)]
+    print_numbers(rows)
 
     if args.mode == "detailed":
-        print_data_quality(args.nvme_out)
+        print("")
+        print_data_quality(args.nvme_out, label="NVME", width=len("NVME DROPS:"))
 
-    print()
-
-    all_passed = True
-
-    nvme_results = validate_nvme(fio, nvme, args.tolerance, kind, args.container)
-    for passed, msg in nvme_results:
-        print(f"  {msg}")
-        if not passed:
-            all_passed = False
-
+    checks = [(ok, strip_prefix(m, "nvme")) for ok, m in
+              validate_nvme(fio, nvme, args.tolerance, kind, args.container)]
     if args.mode == "detailed":
-        nvme_ap = parse_access_pattern(args.nvme_out)
-        for passed, msg in validate_access_pattern(args.job, nvme_ap, "nvme", ops, args.tolerance,
-                                                   lookup_key="cmd_sectors"):
-            print(f"  {msg}")
-            if not passed:
-                all_passed = False
+        ap = parse_access_pattern(args.nvme_out)
+        checks += [(ok, strip_prefix(m, "nvme")) for ok, m in
+                   validate_access_pattern(args.job, ap, "nvme", ops, args.tolerance,
+                                           lookup_key="cmd_sectors")]
+        # Structure before values: a malformed capture would otherwise be reported as
+        # a pile of odd numbers rather than as the one problem it is.
+        sok, smsgs = schema_summary(args.nvme_out, "nvme", "NVME")
+        checks += [(sok, m) for m in smsgs]
+        # Ring-buffer drops are a correctness failure, not a diagnostic: a short
+        # capture looks entirely normal, just smaller.
+        checks.append(check_data_quality(args.nvme_out, label="NVME",
+                                         max_drop_pct=args.max_drop_pct))
+        checks += check_stage_consistency(args.nvme_out, label="NVME",
+                                          tolerance=args.tolerance)
+        checks = [(ok, strip_prefix(m, "NVME")) for ok, m in checks]
 
-    # Schema first: every check below reads columns, so a structural problem should
-    # be reported as one rather than as a pile of odd values.
-    if args.mode == "detailed":
-        for _sp, _slayer, _slabel in ((args.nvme_out, "nvme", "NVME"),):
-            _pq = Path(_sp).parent / "detailed.parquet"
-            for _ok, _msg in validate_layer_schema(_pq, _slayer, label=_slabel):
-                print(f"  {_msg}")
-                if not _ok:
-                    all_passed = False
+    all_passed = print_group("NVME", checks)
 
-    # Ring-buffer drops are a correctness failure, not a diagnostic: a short capture
-    # looks entirely normal. Checked last so `all_passed` is always in scope.
-    if args.mode == "detailed":
-        for _dq_path, _dq_label in ((args.nvme_out, "NVME"),):
-            _dq_passed, _dq_msg = check_data_quality(_dq_path, label=_dq_label,
-                                                     max_drop_pct=args.max_drop_pct)
-            print(f"  {_dq_msg}")
-            if not _dq_passed:
-                all_passed = False
-            for _sc_passed, _sc_msg in check_stage_consistency(_dq_path, label=_dq_label,
-                                                               tolerance=args.tolerance):
-                print(f"  {_sc_msg}")
-                if not _sc_passed:
-                    all_passed = False
-
-    print()
-    if all_passed:
-        print("  RESULT: PASS")
-    else:
-        print("  RESULT: FAIL")
-
-    print()
-    return 0 if all_passed else 1
+    return print_result(all_passed)
 
 
 if __name__ == "__main__":
