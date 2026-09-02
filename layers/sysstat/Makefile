@@ -46,10 +46,39 @@ start-collection: ensure-results-exists ensure-sudo
 		> "$(RESULTS_DIR)/sysstat/pidstat.out" \
 		$(ERR_REDIRECT) & echo $$! > "$(PIDS_DIR)/pidstat.pid"
 
+# cgroup v2 memory, sampled at the same interval as pidstat. pidstat reports
+# process-resident memory only, so page cache holding a workload's file-backed
+# data shows up in nobody's RSS; the cgroup accounts for it. Runs unprivileged
+# (the memory.* files are world-readable) and in every filter mode — container,
+# comm/pid, or system-wide — so it is not gated on CONTAINER_FILTER. The --check
+# runs synchronously first so cgroup v1 fails start-collection loudly instead of
+# yielding an empty CSV.
+	$(Q)python "./util/collect_cgroup_mem.py" --check $(OUT_REDIRECT)
+
+	$(Q)python "./util/collect_cgroup_mem.py" "$(RESULTS_DIR)/sysstat" \
+		$(if $(CONTAINER_FILTER),--container "$(CONTAINER_FILTER)") \
+		$(if $(COMM_FILTER),--comm "$(COMM_FILTER)") \
+		$(if $(PID_FILTER),--pid "$(PID_FILTER)") \
+		--interval $(INTERVAL) \
+		$(ERR_REDIRECT) $(OUT_REDIRECT) & echo $$! > "$(PIDS_DIR)/cgroup_mem.pid"
+
 	$(Q)echo -e "sysstat collection is running!\n"
 
 .PHONY: stop-profiling
 stop-profiling: ensure-sudo
+# The cgroup collector is an unprivileged direct child, not a sudo wrapper, so it is
+# stopped here rather than by the loop below (whose `pkill -P` targets a wrapper's
+# children). It streams its CSV, flushing every sample, so even a hard kill would lose
+# at most the current second; SIGTERM just lets it close the file cleanly.
+	$(Q)if [ -f "$(PIDS_DIR)/cgroup_mem.pid" ]; then \
+		pid=$$(cat "$(PIDS_DIR)/cgroup_mem.pid"); \
+		kill -TERM $$pid $(ERR_REDIRECT) || true; \
+		i=0; while [ -d /proc/$$pid ] && [ $$i -lt 25 ]; do \
+			sleep 0.2; i=$$((i+1)); \
+		done; \
+		kill -KILL $$pid $(ERR_REDIRECT) || true; \
+		rm -f "$(PIDS_DIR)/cgroup_mem.pid"; \
+	fi
 # The pidfile holds the backgrounded `sudo` wrapper's PID, not pidstat's. pidstat runs
 # as root (sudo's child), so signal it via -P as root: SIGTERM first so it flushes and
 # closes pidstat.out cleanly, wait for exit, then SIGKILL as a backstop and reap the

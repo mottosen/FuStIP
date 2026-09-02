@@ -10,10 +10,15 @@ ALL_LAYERS = ["sysstat", "nvme", "block", "fs"]
 PROFILE_START_ORDER = ["sysstat", "nvme", "block", "fs"]
 PROFILE_STOP_ORDER = list(reversed(PROFILE_START_ORDER))
 
-# Map CLI layer selections → test suite directories
+# Map CLI layer selections → test suite directories.
+# sysstat appears in two suites on purpose: tests/filesystem starts it alongside
+# fs (so it is exercised under a real fio workload, though only fs is asserted
+# there), while tests/sysstat is its own correctness suite for the cgroup memory
+# collection, which needs a memory workload rather than an I/O one.
 TEST_SUITES = {
     "block_nvme": {"block", "nvme"},
     "filesystem": {"fs", "sysstat"},
+    "sysstat": {"sysstat"},
 }
 
 
@@ -233,8 +238,11 @@ def resolve_env(args):
     args.tmp_dir = os.path.abspath(args.tmp_dir)
 
     if args.action == "test":
+        # Only the fio-driven suites need a target file. tests/sysstat builds its
+        # own memory workload, so `test ... -l sysstat` must not demand FIO_FILE.
         fio_file = os.environ.get("FIO_FILE")
-        if not fio_file:
+        needs_fio = bool(set(args.layers) & {"block", "nvme", "fs"})
+        if not fio_file and needs_fio:
             print("Error: FIO_FILE is not set", file=sys.stderr)
             sys.exit(1)
         args.fio_file = fio_file
@@ -358,8 +366,10 @@ def generate_profile_commands(args):
         for layer in args.layers:
             seq_cmds.append(f'mkdir -p "{rd}/{layer}"')
             if layer == "sysstat":
-                # parse_output.py emits cpu.csv/mem.csv/dev.csv as final output.
-                for fname in ("cpu.csv", "mem.csv", "dev.csv"):
+                # parse_output.py emits cpu.csv/mem.csv/dev.csv as final output;
+                # collect_cgroup_mem.py writes cgroup_mem.csv directly (optional —
+                # absent for runs predating it, hence the tolerant copy below).
+                for fname in ("cpu.csv", "mem.csv", "dev.csv", "cgroup_mem.csv"):
                     seq_cmds.append(
                         f'cp "{td}/{layer}/{fname}" "{rd}/{layer}/" 2>/dev/null || true'
                     )
@@ -420,6 +430,30 @@ TEST_TARGET_MAP = {
 }
 
 
+def _test_comm_vars(args):
+    """COMM_FILTER for a test suite invocation.
+
+    Without a container the workload has no isolation, so comm is pinned to fio
+    (the test workload) regardless of any -p the caller passed — otherwise the
+    capture would be system-wide and the counts meaningless.
+
+    A container already provides that isolation: fio is the only process in it.
+    So the process tier is left unset there and stays a pass-through, which is
+    both the tool's documented filter semantics (each unset tier passes through)
+    and the shape real profiling configs use — they set container_filter alone.
+    Pinning comm on top would test a strictly narrower scope than anything
+    profiled in practice, and would drop I/O issued from kernel worker contexts
+    the container still owns (io_uring's iou-wrk-* threads inherit the mount
+    namespace but not the comm). An explicit -p still narrows within the
+    container for callers who want the nested case.
+    """
+    if not args.container_filter:
+        return ["COMM_FILTER=fio"]
+    if args.comm_filter:
+        return [f"COMM_FILTER={args.comm_filter}"]
+    return []
+
+
 def generate_test_commands(args):
     selected = set(args.layers)
     target = TEST_TARGET_MAP[args.sub_action]
@@ -428,9 +462,15 @@ def generate_test_commands(args):
     if map_cmd:
         cmds.append(map_cmd)
 
-    # Determine which layers within each suite are selected
+    # Determine which layers within each suite are selected. The filesystem
+    # suite is fio-driven and its checker asserts on fs output, so it runs only
+    # when fs is selected — sysstat rides along when both are picked, but
+    # sysstat alone routes to its own suite below rather than to a fio run whose
+    # checks do not apply to it.
     block_nvme_set = TEST_SUITES["block_nvme"] & selected
-    filesystem_layers = sorted(TEST_SUITES["filesystem"] & selected)
+    filesystem_layers = (
+        sorted(TEST_SUITES["filesystem"] & selected) if "fs" in selected else []
+    )
 
     # --nvme-direct re-routes the nvme layer to the io_uring_cmd passthrough
     # suite (nvme only), pulling it out of the block_nvme grouping.
@@ -447,11 +487,9 @@ def generate_test_commands(args):
             vs.append(f"CONTAINER_FILTER={args.container_filter}")
         else:
             vs.append(f"MODE={args.mode}")
-        # comm is always forced to fio (the test workload), regardless of any -p
-        # the user passed. Device/pid filters from the test command are honored in
-        # every mode — including container — so container runs scope by
-        # container ∩ device ∩ comm like the other modes, not container-only.
-        vs.append("COMM_FILTER=fio")
+        # Process tier per _test_comm_vars. Device/pid filters from the test
+        # command are honored in every mode, including container.
+        vs.extend(_test_comm_vars(args))
         if args.dev_filter:
             vs.append(f"DEV_FILTER={args.dev_filter}")
         if args.pid_filter:
@@ -473,7 +511,7 @@ def generate_test_commands(args):
             vs.append(f"CONTAINER_FILTER={args.container_filter}")
         else:
             vs.append(f"MODE={args.mode}")
-        vs.append("COMM_FILTER=fio")
+        vs.extend(_test_comm_vars(args))
         if args.dev_filter:
             vs.append(f"DEV_FILTER={args.dev_filter}")
         if args.pid_filter:
@@ -481,6 +519,16 @@ def generate_test_commands(args):
         vs.append(f"FIO_FILE={args.fio_file}")
         vs.append(f"RESULTS_DIR={args.results_dir}")
         cmds.append(f"make -C tests/nvme_direct {target} {' '.join(vs)} || echo '!! nvme_direct suite failed'")
+
+    # sysstat's own suite. It builds its own memory workload and pins its own
+    # container/comm labels, so it takes neither the filter flags nor FIO_FILE —
+    # the ground truth is what the workload allocates, not what fio reports.
+    if "sysstat" in selected:
+        vs = []
+        if args.debug:
+            vs.append("DEBUG=1")
+        vs.append(f"RESULTS_DIR={args.results_dir}")
+        cmds.append(f"make -C tests/sysstat {target} {' '.join(vs)} || echo '!! sysstat suite failed'")
 
     if filesystem_layers:
         vs = []
@@ -490,10 +538,9 @@ def generate_test_commands(args):
             vs.append(f"CONTAINER_FILTER={args.container_filter}")
         else:
             vs.append(f"MODE={args.mode}")
-        # comm is always forced to fio, regardless of any -p the user passed; pid
-        # from the test command is honored in every mode. (fs has no device tier,
-        # so no DEV_FILTER here.)
-        vs.append("COMM_FILTER=fio")
+        # Process tier per _test_comm_vars; pid from the test command is honored
+        # in every mode. (fs has no device tier, so no DEV_FILTER here.)
+        vs.extend(_test_comm_vars(args))
         if args.pid_filter:
             vs.append(f"PID_FILTER={args.pid_filter}")
         if filesystem_layers != sorted(TEST_SUITES["filesystem"]):
