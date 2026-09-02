@@ -11,7 +11,12 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "util"))
-from stats_generation.shared import parse_counters, print_data_quality
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from stats_generation.shared import (parse_counters, print_data_quality,
+                                     check_data_quality, check_stage_consistency,
+                                     device_access_pattern, load_device_geometry)
+from report import (active_ops, print_group, print_numbers, print_result,
+                    schema_summary, strip_prefix)
 
 
 def parse_fio_json(path):
@@ -63,18 +68,37 @@ def parse_detailed_stats(path):
     return merged
 
 
-def parse_access_pattern(path):
-    """Extract access_pattern section from detailed-stats.json.
+def parse_access_pattern(path, layer=None, lookup_key=None):
+    """Access pattern for the whole capture, as {lookup_key: {op: pattern}}.
 
-    Access pattern is per (process, device): nvme detailed nests it under
-    per_comm[label].per_disk[disk].access_pattern (block keeps it under the per-comm
-    label entry). A single job can touch more than one device — e.g. a container run
-    issues its data I/O to one device while paging its binary/libraries in from the
-    image overlay on another — so an op can appear under several disk/label entries.
-    Pool the raw sequential/random counts across them and recompute the percentages
-    (mirroring how counters are summed), so a small cross-device entry can't overwrite
-    the dominant data device's classification.
+    What fio asserts when it says a job is sequential is a property of the stream the
+    DEVICE saw. The stats JSON stores the pattern per (comm, disk) instead, which is a
+    different question — "was this thread's stream sequential?" — and the two answers
+    diverge whenever one logical stream is issued by more than one thread. A sequential
+    fio write job is exactly that case: io_uring offloads part of the submissions to
+    `iou-wrk-*` kernel workers, so the device sees one perfect ramp while `fio` and
+    `iou-wrk` each see a subsequence full of holes.
+
+    Summing the per-comm counts does not recover it either. Sequentiality is adjacency
+    within an ORDERED stream, so counts computed over different streams are not
+    addable — pooling them reports a job that was 100 % sequential at the device as
+    89.9 %. Derive it from the parquet instead, over all comms at once and in
+    reconstructed submission order.
+
+    Falls back to the pooled JSON figure when there is no parquet to read (summary
+    mode), which keeps the old behaviour where it is the only thing available.
     """
+    pq = Path(path).parent / "detailed.parquet"
+    if layer and pq.exists():
+        geom = load_device_geometry(pq) if layer == "nvme" else None
+        by_disk = device_access_pattern(pq, sector_bytes_for=geom)
+        # One job can touch several devices (a container pages its image in from the
+        # overlay while its data I/O goes elsewhere). Report the busiest, rather than
+        # pooling across devices — which would reintroduce the same addition error.
+        if by_disk:
+            disk = max(by_disk, key=lambda d: sum(v["total_ios"] for v in by_disk[d].values()))
+            return {lookup_key: by_disk[disk]}
+
     with open(path) as f:
         stats = json.load(f)
     merged = {}
@@ -205,22 +229,9 @@ def validate_blk(fio, blk, tolerance, kind, allow_over=False):
             get_val(blk, "rq_total_bytes", "write"),
             fio["write_bytes"], tolerance, allow_over))
 
-    # Consistency: issued~completed, queued~queue_done
-    ops = ("read", "write") if kind == "mixed" else (kind,)
-    for op in ops:
-        issued = get_val(blk, "rq_issued", op)
-        completed = get_val(blk, "rq_completed", op)
-        if issued > 0 and completed > 0:
-            results.append(check_approx(
-                f"blk {op} issued~completed",
-                issued, completed, tolerance))
-
-        queued = get_val(blk, "rq_queued", op)
-        queue_done = get_val(blk, "rq_queue_done", op)
-        if queued > 0 and queue_done > 0:
-            results.append(check_approx(
-                f"blk {op} queued~queue_done",
-                queued, queue_done, tolerance))
+    # Stage consistency is checked by check_stage_consistency() against the BPF stage
+    # counters in data_quality: with one row per request there are no insert/issue
+    # rows to count, so there is no per-op rq_issued/rq_queued to compare against.
 
     return results
 
@@ -250,17 +261,12 @@ def validate_nvme(fio, nvme, tolerance, kind, allow_over=False):
             get_val(nvme, "cmd_total_bytes", "write"),
             fio["write_bytes"], tolerance, allow_over))
 
-    # Consistency: setup~completed
-    ops = ("read", "write") if kind == "mixed" else (kind,)
-    for op in ops:
-        setup = get_val(nvme, "cmd_setup", op)
-        completed = get_val(nvme, "cmd_completed", op)
-        if setup > 0 and completed > 0:
-            results.append(check_approx(
-                f"nvme {op} setup~completed",
-                setup, completed, tolerance))
+    # Stage consistency is checked by check_stage_consistency() against the BPF stage
+    # counters in data_quality: with one row per command there are no setup rows to
+    # count, so there is no per-op cmd_setup to compare against.
 
     return results
+
 
 
 def main():
@@ -269,10 +275,17 @@ def main():
     parser.add_argument("--fio-json", required=True, help="Path to FIO JSON output")
     parser.add_argument("--block-out", required=True, help="Path to block layer output")
     parser.add_argument("--nvme-out", required=True, help="Path to NVMe layer output")
+    parser.add_argument("--fs-out", default=None,
+                        help="Optional fs layer output. Counts are validated by the "
+                             "filesystem suite; what fs adds here is a third concurrent "
+                             "consumer, so only its drop rate is asserted.")
     parser.add_argument("--mode", default="summary", choices=["summary", "detailed"],
                         help="Profiling mode (default: summary)")
     parser.add_argument("--tolerance", type=float, default=0.02, help="Tolerance for count checks (default: 0.02)")
     parser.add_argument("--container", action="store_true", help="Container mode: allow profiler counts above FIO")
+    parser.add_argument("--max-drop-pct", type=float, default=0.0,
+                        help="Fail if the BPF ring buffer dropped more than this %% of "
+                             "events (default: 0.0 — any drop is a regression)")
     args = parser.parse_args()
 
     fio = parse_fio_json(args.fio_json)
@@ -288,75 +301,66 @@ def main():
     if args.mode == "detailed":
         ops = {"read": ["read"], "write": ["write"], "mixed": ["read", "write"]}[kind]
 
-    print(f"\n=== {args.job} (mode={args.mode}) ===")
+    print(f"\n=== {args.job} (mode={args.mode}) ===\n")
 
-    print(f"  FIO:  read_ios={fio['read_ios']}  read_bytes={fio['read_bytes']}"
-          f"  write_ios={fio['write_ios']}  write_bytes={fio['write_bytes']}")
-
-    print("")
-    for op in ("read", "write"):
-        prefix = "BLK:" if op == "read" else ""
-        print(f"  {prefix:6}{op + ':':6}"
-              f"  queued={get_val(blk, 'rq_queued', op)}"
-              f"  issued={get_val(blk, 'rq_issued', op)}"
-              f"  completed={get_val(blk, 'rq_completed', op)}"
-              f"  bytes={get_val(blk, 'rq_total_bytes', op)}")
-
-    print("")
-    for op in ("read", "write"):
-        prefix = "NVME:" if op == "read" else ""
-        print(f"  {prefix:6}{op + ':':6}"
-              f"  setup={get_val(nvme, 'cmd_setup', op)}"
-              f"  completed={get_val(nvme, 'cmd_completed', op)}"
-              f"  bytes={get_val(nvme, 'cmd_total_bytes', op)}")
+    # ── numbers ──
+    rows = [("FIO", op, [("ios", fio[f"{op}_ios"]), ("bytes", fio[f"{op}_bytes"])])
+            for op in ("read", "write") if fio[f"{op}_ios"]]
+    rows += [("BLK", op, [("ios", get_val(blk, "rq_completed", op)),
+                              ("bytes", get_val(blk, "rq_total_bytes", op))])
+             for op in active_ops(blk, "rq_completed", fio)]
+    rows += [("NVME", op, [("ios", get_val(nvme, "cmd_completed", op)),
+                              ("bytes", get_val(nvme, "cmd_total_bytes", op))])
+             for op in active_ops(nvme, "cmd_completed", fio)]
+    print_numbers(rows)
 
     if args.mode == "detailed":
         print("")
-        print_data_quality(args.block_out, label="BLK")
-        print_data_quality(args.nvme_out, label="NVME")
+        w = len("NVME DROPS:")
+        print_data_quality(args.block_out, label="BLK", width=w)
+        print_data_quality(args.nvme_out, label="NVME", width=w)
+        if args.fs_out:
+            print_data_quality(args.fs_out, label="FS", width=w)
 
-    print()
-
+    # ── assertions, grouped per layer ──
     all_passed = True
 
-    blk_results = validate_blk(fio, blk, args.tolerance, kind, args.container)
-    for passed, msg in blk_results:
-        print(f"  {msg}")
-        if not passed:
-            all_passed = False
+    for label, prefix, stats_path, counters, layer, ap_key in (
+            ("BLK", "blk", args.block_out, blk, "block", "rq_sectors"),
+            ("NVME", "nvme", args.nvme_out, nvme, "nvme", "cmd_sectors")):
+        checks = [(ok, strip_prefix(m, prefix)) for ok, m in
+                  (validate_blk if layer == "block" else validate_nvme)(
+                      fio, counters, args.tolerance, kind, args.container)]
+        if args.mode == "detailed":
+            ap = parse_access_pattern(stats_path, layer, ap_key)
+            checks += [(ok, strip_prefix(m, prefix)) for ok, m in
+                       validate_access_pattern(args.job, ap, prefix, ops, args.tolerance,
+                                               lookup_key=ap_key)]
+            # Structure before values: a malformed capture would otherwise be reported
+            # as a pile of odd numbers rather than as the one problem it is.
+            sok, smsgs = schema_summary(stats_path, layer, label)
+            checks += [(sok, m) for m in smsgs]
+            # Ring-buffer drops are a correctness failure, not a diagnostic: a short
+            # capture looks entirely normal, just smaller.
+            checks.append(check_data_quality(stats_path, label=label,
+                                             max_drop_pct=args.max_drop_pct))
+            checks += check_stage_consistency(stats_path, label=label,
+                                              tolerance=args.tolerance)
+            checks = [(ok, strip_prefix(m, label)) for ok, m in checks]
+        all_passed = print_group(label, checks) and all_passed
 
-    if args.mode == "detailed":
-        blk_ap = parse_access_pattern(args.block_out)
-        for passed, msg in validate_access_pattern(args.job, blk_ap, "blk", ops, args.tolerance,
-                                                   lookup_key="rq_sectors"):
-            print(f"  {msg}")
-            if not passed:
-                all_passed = False
+    # fs contributes a third concurrent consumer rather than counts of its own —
+    # those belong to the filesystem suite — so only its drop rate is asserted here.
+    if args.mode == "detailed" and args.fs_out:
+        fs_checks = [check_data_quality(args.fs_out, label="FS",
+                                        max_drop_pct=args.max_drop_pct)]
+        fs_checks += check_stage_consistency(args.fs_out, label="FS",
+                                             tolerance=args.tolerance)
+        fs_checks = [(ok, strip_prefix(m, "FS")) for ok, m in fs_checks]
+        all_passed = print_group("FS", fs_checks) and all_passed
 
-    print()
-
-    nvme_results = validate_nvme(fio, nvme, args.tolerance, kind, args.container)
-    for passed, msg in nvme_results:
-        print(f"  {msg}")
-        if not passed:
-            all_passed = False
-
-    if args.mode == "detailed":
-        nvme_ap = parse_access_pattern(args.nvme_out)
-        for passed, msg in validate_access_pattern(args.job, nvme_ap, "nvme", ops, args.tolerance,
-                                                   lookup_key="cmd_sectors"):
-            print(f"  {msg}")
-            if not passed:
-                all_passed = False
-
-    print()
-    if all_passed:
-        print("  RESULT: PASS")
-    else:
-        print("  RESULT: FAIL")
-
-    print()
+    return print_result(all_passed)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

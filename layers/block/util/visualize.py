@@ -38,37 +38,56 @@ def _comm_filter(comm_list, has_mntns):
 def _build_row(label, parquet_path, comm_filter, ts_min):
     """Build a dashboard row dict using per-plot Parquet scans."""
 
-    def _scan(cols, event_filter=None):
-        lf = pl.scan_parquet(parquet_path).filter(comm_filter)
-        if event_filter is not None:
-            lf = lf.filter(pl.col("event") == event_filter)
-        return lf.select(cols)
+    def _scan(cols):
+        # One row per request, so there is nothing to filter by event type.
+        return pl.scan_parquet(parquet_path).filter(comm_filter).select(cols)
 
     # Pre-compute type counts (tiny scan)
-    counts_df = (_scan(["op"], event_filter="complete")
+    counts_df = (_scan(["op"])
                  .group_by("op").len()
                  .collect(engine="streaming"))
     counts = dict(zip(*counts_df.select("op", "len").get_columns()))
     types = sort_types(counts.keys())
 
+    def _sec(ts_expr, ts_min):
+        return ((ts_expr - ts_min) // WINDOW_NS).cast(pl.Int64).alias("sec")
+
     def q_fn(ax, t=types, ts_min=ts_min):
-        df = (_scan(["timestamp_ns", "op", "q_inflight"])
-              .with_columns(((pl.col("timestamp_ns") - ts_min) // WINDOW_NS).cast(pl.Int64).alias("sec"))
+        # Queue depth changes at insert (+1) and issue (-1), so sample at both.
+        # Only requests that actually queued contribute: direct-dispatched ones
+        # never entered the scheduler queue and their zeros would drag the curve down.
+        base = (_scan(["timestamp_ns", "latency_ns", "queue_latency_ns", "queued", "op",
+                       "q_inflight_at_insert", "q_inflight_at_issue"])
+                .filter(pl.col("queued") == 1))
+        issue_ts = pl.col("timestamp_ns") - pl.col("latency_ns")
+        df = (pl.concat([
+                  base.select(["op", _sec(issue_ts - pl.col("queue_latency_ns"), ts_min),
+                               pl.col("q_inflight_at_insert").alias("q_inflight")]),
+                  base.select(["op", _sec(issue_ts, ts_min),
+                               pl.col("q_inflight_at_issue").alias("q_inflight")]),
+              ])
               .group_by("op", "sec").agg(pl.col("q_inflight").last())
               .sort("op", "sec")
               .collect(engine="streaming"))
         plot_inflight_from_column(ax, df, "op", t, inflight_col="q_inflight", title="Queue Inflight")
 
     def d_fn(ax, t=types, ts_min=ts_min):
-        df = (_scan(["timestamp_ns", "op", "d_inflight"])
-              .with_columns(((pl.col("timestamp_ns") - ts_min) // WINDOW_NS).cast(pl.Int64).alias("sec"))
+        # Driver depth changes at issue (+1) and completion (-1).
+        base = _scan(["timestamp_ns", "latency_ns", "op",
+                      "d_inflight_at_issue", "d_inflight_at_complete"])
+        df = (pl.concat([
+                  base.select(["op", _sec(pl.col("timestamp_ns") - pl.col("latency_ns"), ts_min),
+                               pl.col("d_inflight_at_issue").alias("d_inflight")]),
+                  base.select(["op", _sec(pl.col("timestamp_ns"), ts_min),
+                               pl.col("d_inflight_at_complete").alias("d_inflight")]),
+              ])
               .group_by("op", "sec").agg(pl.col("d_inflight").last())
               .sort("op", "sec")
               .collect(engine="streaming"))
         plot_inflight_from_column(ax, df, "op", t, inflight_col="d_inflight", title="Driver Inflight")
 
     def cumul_fn(ax, t=types, ts_min=ts_min):
-        df = (_scan(["op", "timestamp_ns", "bytes"], event_filter="complete")
+        df = (_scan(["op", "timestamp_ns", "bytes"])
               .with_columns(((pl.col("timestamp_ns") - ts_min) // WINDOW_NS).cast(pl.Int64).alias("sec"))
               .group_by("op", "sec").agg(pl.col("bytes").sum())
               .sort("op", "sec")
@@ -76,15 +95,15 @@ def _build_row(label, parquet_path, comm_filter, ts_min):
         plot_cumulated_mb_over_time(ax, df, "op", "bytes", t)
 
     def size_fn(ax, t=types):
-        df = _scan(["op", "bytes"], event_filter="complete").collect(engine="streaming")
+        df = _scan(["op", "bytes"]).collect(engine="streaming")
         plot_io_size_cdf(ax, df, "op", "bytes", t)
 
     def latency_fn(ax, t=types):
-        df = _scan(["op", "latency_ns"], event_filter="complete").collect(engine="streaming")
+        df = _scan(["op", "latency_ns"]).collect(engine="streaming")
         plot_io_latency_cdf(ax, df, "op", "latency_ns", t)
 
     def iops_fn(ax, t=types, ts_min=ts_min):
-        df = (_scan(["timestamp_ns", "op"], event_filter="complete")
+        df = (_scan(["timestamp_ns", "op"])
               .with_columns(((pl.col("timestamp_ns") - ts_min) // WINDOW_NS).cast(pl.Int64).alias("sec"))
               .group_by("op", "sec").agg(pl.len().alias("iops"))
               .sort("op", "sec")
@@ -92,7 +111,12 @@ def _build_row(label, parquet_path, comm_filter, ts_min):
         plot_inflight_from_column(ax, df, "op", t, inflight_col="iops", title="IOPS", ylabel="IOPS")
 
     def gap_fn(ax, t=types):
-        df = _scan(["op", "sector", "bytes", "timestamp_ns"], event_filter="issue").collect(engine="streaming")
+        # plot_gap_cdf() sorts by `timestamp_ns`, and the gap test only means
+        # anything in the order the driver received the requests. Pass the
+        # reconstructed issue time under that name.
+        df = (_scan(["op", "sector", "bytes", "timestamp_ns", "latency_ns"])
+              .with_columns((pl.col("timestamp_ns") - pl.col("latency_ns")).alias("timestamp_ns"))
+              .collect(engine="streaming"))
         plot_gap_cdf(ax, df, "op", "sector", "bytes", t)
 
     return {
@@ -130,8 +154,12 @@ def main():
         label = get_comm_label(comm, mntns_id_str, mntns_map, comm_map)
         label_to_comms.setdefault(label, []).append((comm, mntns_id_str))
 
+    # Window starts when the first request ENTERED the block layer, not when the
+    # first one completed — every per-second plot is binned relative to this, so
+    # using completion time would shift the whole x-axis right by one service time.
     global_ts_min = (pl.scan_parquet(parquet_path)
-                     .select(pl.col("timestamp_ns").min())
+                     .select((pl.col("timestamp_ns") - pl.col("latency_ns")
+                              - pl.col("queue_latency_ns")).min())
                      .collect(engine="streaming").item())
 
     print("Building dashboard...")

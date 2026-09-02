@@ -55,9 +55,10 @@ struct cmd_data {
   __u64 sector;
   __u64 mntns_id;
   __u8 comm[16];
-  char disk_name[32]; // kernel gendisk name, read once at fentry setup
-  __u16 qid;          // NVMe queue id, read once at fentry setup
-  __u32 tid;          // submitting thread id, read once at fentry setup
+  char disk_name[32];      // kernel gendisk name, read once at fentry setup
+  __u16 qid;               // NVMe queue id, read once at fentry setup
+  __u32 tid;               // submitting thread id, read once at fentry setup
+  __s32 inflight_at_setup; // queue depth for this (op, comm) when the command was issued
 };
 
 // ── Per-(op, comm) key for inflight counters ──
@@ -94,7 +95,7 @@ struct {
 
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
-  __uint(max_entries, 1 << 28); // 256 MB
+  __uint(max_entries, 1 << 29); // 512 MB default; override at load time with -b
 } events SEC(".maps");
 
 // Per-event-type counters: [type*2] = generated, [type*2+1] = dropped
@@ -218,32 +219,17 @@ static __always_inline int handle_nvme_rawtp_setup(void *cmd) {
   if (cnt)
     cur_inflight = (__s32)(__sync_fetch_and_add(cnt, 1) + 1);
 
-  // Emit setup event
+  // Stash the setup-time depth for the completion probe to emit. Not recoverable
+  // later — see the comment on nvme_event.inflight_at_setup.
+  data->inflight_at_setup = cur_inflight;
+
+  // NO ring-buffer record here. Count the command as submitted and return: the
+  // completion probe emits the single record carrying both ends of its life.
+  // This counter is still what `cmd_setup` reports, and the difference against
+  // the completion counter is how many commands were still in flight at teardown.
   __u32 gen_key = 0;
   __u64 *gen_cnt = bpf_map_lookup_elem(&event_counters, &gen_key);
   if (gen_cnt) (*gen_cnt)++;
-
-  struct nvme_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-  if (e) {
-    e->timestamp_ns = ts;
-    e->mntns_id = data->mntns_id;
-    e->event_type = EVT_SETUP;
-    e->op = data->op;
-    e->bytes = data->bytes;
-    e->latency_ns = 0;
-    e->sector = data->sector;
-    e->rq = rq_key;
-    __builtin_memcpy(e->comm, data->comm, 16);
-    e->tid = data->tid;
-    e->inflight = cur_inflight;
-    e->qid = data->qid;
-    __builtin_memcpy(e->disk_name, data->disk_name, 32);
-    bpf_ringbuf_submit(e, 0);
-  } else {
-    __u32 drop_key = 1;
-    __u64 *drop_cnt = bpf_map_lookup_elem(&event_counters, &drop_key);
-    if (drop_cnt) (*drop_cnt)++;
-  }
 
   return 0;
 }
@@ -304,7 +290,6 @@ static __always_inline int handle_nvme_complete(struct request *req) {
   if (e) {
     e->timestamp_ns = now;
     e->mntns_id = data->mntns_id;
-    e->event_type = EVT_COMPLETE;
     e->op = data->op;
     e->bytes = data->bytes;
     e->latency_ns = latency;
@@ -312,6 +297,7 @@ static __always_inline int handle_nvme_complete(struct request *req) {
     e->rq = rq_key;
     __builtin_memcpy(e->comm, data->comm, 16);
     e->tid = data->tid;
+    e->inflight_at_setup = data->inflight_at_setup;
     e->inflight = cur_inflight;
     e->qid = data->qid;
     __builtin_memcpy(e->disk_name, data->disk_name, 32);

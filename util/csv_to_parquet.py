@@ -20,7 +20,11 @@ STRING_COLS = {"event", "op", "syscall", "comm", "rq"}
 # Columns that can be empty (nullable) but must be numeric, not Utf8.
 # Polars infers Utf8 when a numeric column has empty cells in CSV.
 INT_COLS = {"latency_ns", "timestamp_ns", "bytes",
-            "q_inflight", "d_inflight", "offset", "count", "mntns_id", "qid", "tid"}
+            "q_inflight", "d_inflight", "offset", "count", "mntns_id", "qid", "tid",
+            # One row per operation (schema v2): the reconstructed-stage columns.
+            "queue_latency_ns", "queued", "inflight", "inflight_at_setup",
+            "q_inflight_at_insert", "q_inflight_at_issue",
+            "d_inflight_at_issue", "d_inflight_at_complete"}
 
 # Unsigned 64-bit columns. `sector` is rq->__sector, a raw u64 LBA. For NVMe
 # passthrough (io_uring_cmd) the block-layer sector is never set and reads back

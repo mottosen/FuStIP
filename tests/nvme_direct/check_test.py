@@ -15,7 +15,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "util"))
-from stats_generation.shared import parse_counters, print_data_quality
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from stats_generation.shared import (parse_counters, print_data_quality,
+                                     check_data_quality, check_stage_consistency)
+from report import (active_ops, print_group, print_numbers, print_result,
+                    schema_summary, strip_prefix)
 
 
 def parse_fio_json(path):
@@ -208,15 +212,9 @@ def validate_nvme(fio, nvme, tolerance, kind, allow_over=False):
             get_val(nvme, "cmd_total_bytes", "write"),
             fio["write_bytes"], tolerance, allow_over))
 
-    # Consistency: setup~completed
-    ops = ("read", "write") if kind == "mixed" else (kind,)
-    for op in ops:
-        setup = get_val(nvme, "cmd_setup", op)
-        completed = get_val(nvme, "cmd_completed", op)
-        if setup > 0 and completed > 0:
-            results.append(check_approx(
-                f"nvme {op} setup~completed",
-                setup, completed, tolerance))
+    # Stage consistency is checked by check_stage_consistency() against the BPF stage
+    # counters in data_quality: with one row per command there are no setup rows to
+    # count, so there is no per-op cmd_setup to compare against.
 
     return results
 
@@ -230,6 +228,9 @@ def main():
                         help="Profiling mode (default: summary)")
     parser.add_argument("--tolerance", type=float, default=0.02, help="Tolerance for count checks (default: 0.02)")
     parser.add_argument("--container", action="store_true", help="Container mode: allow profiler counts above FIO")
+    parser.add_argument("--max-drop-pct", type=float, default=0.0,
+                        help="Fail if the BPF ring buffer dropped more than this %% of "
+                             "events (default: 0.0 — any drop is a regression)")
     args = parser.parse_args()
 
     fio = parse_fio_json(args.fio_json)
@@ -243,48 +244,42 @@ def main():
     if args.mode == "detailed":
         ops = {"read": ["read"], "write": ["write"], "mixed": ["read", "write"]}[kind]
 
-    print(f"\n=== {args.job} (mode={args.mode}, io_uring_cmd / nvme passthrough) ===")
+    print(f"\n=== {args.job} (mode={args.mode}, io_uring_cmd / nvme passthrough) ===\n")
 
-    print(f"  FIO:  read_ios={fio['read_ios']}  read_bytes={fio['read_bytes']}"
-          f"  write_ios={fio['write_ios']}  write_bytes={fio['write_bytes']}")
-
-    print("")
-    for op in ("read", "write"):
-        prefix = "NVME:" if op == "read" else ""
-        print(f"  {prefix:6}{op + ':':6}"
-              f"  setup={get_val(nvme, 'cmd_setup', op)}"
-              f"  completed={get_val(nvme, 'cmd_completed', op)}"
-              f"  bytes={get_val(nvme, 'cmd_total_bytes', op)}")
+    rows = [("FIO", op, [("ios", fio[f"{op}_ios"]), ("bytes", fio[f"{op}_bytes"])])
+            for op in ("read", "write") if fio[f"{op}_ios"]]
+    rows += [("NVME", op, [("ios", get_val(nvme, "cmd_completed", op)),
+                              ("bytes", get_val(nvme, "cmd_total_bytes", op))])
+             for op in active_ops(nvme, "cmd_completed", fio)]
+    print_numbers(rows)
 
     if args.mode == "detailed":
-        print_data_quality(args.nvme_out)
+        print("")
+        print_data_quality(args.nvme_out, label="NVME", width=len("NVME DROPS:"))
 
-    print()
-
-    all_passed = True
-
-    nvme_results = validate_nvme(fio, nvme, args.tolerance, kind, args.container)
-    for passed, msg in nvme_results:
-        print(f"  {msg}")
-        if not passed:
-            all_passed = False
-
+    checks = [(ok, strip_prefix(m, "nvme")) for ok, m in
+              validate_nvme(fio, nvme, args.tolerance, kind, args.container)]
     if args.mode == "detailed":
-        nvme_ap = parse_access_pattern(args.nvme_out)
-        for passed, msg in validate_access_pattern(args.job, nvme_ap, "nvme", ops, args.tolerance,
-                                                   lookup_key="cmd_sectors"):
-            print(f"  {msg}")
-            if not passed:
-                all_passed = False
+        ap = parse_access_pattern(args.nvme_out)
+        checks += [(ok, strip_prefix(m, "nvme")) for ok, m in
+                   validate_access_pattern(args.job, ap, "nvme", ops, args.tolerance,
+                                           lookup_key="cmd_sectors")]
+        # Structure before values: a malformed capture would otherwise be reported as
+        # a pile of odd numbers rather than as the one problem it is.
+        sok, smsgs = schema_summary(args.nvme_out, "nvme", "NVME")
+        checks += [(sok, m) for m in smsgs]
+        # Ring-buffer drops are a correctness failure, not a diagnostic: a short
+        # capture looks entirely normal, just smaller.
+        checks.append(check_data_quality(args.nvme_out, label="NVME",
+                                         max_drop_pct=args.max_drop_pct))
+        checks += check_stage_consistency(args.nvme_out, label="NVME",
+                                          tolerance=args.tolerance)
+        checks = [(ok, strip_prefix(m, "NVME")) for ok, m in checks]
 
-    print()
-    if all_passed:
-        print("  RESULT: PASS")
-    else:
-        print("  RESULT: FAIL")
+    all_passed = print_group("NVME", checks)
 
-    print()
+    return print_result(all_passed)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

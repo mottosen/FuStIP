@@ -33,7 +33,7 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 1 << 28); // 256 MB
+	__uint(max_entries, 1 << 29); // 512 MB default; override at load time with -b
 } events SEC(".maps");
 
 // Per-event-type counters: [type*2] = generated, [type*2+1] = dropped

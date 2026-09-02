@@ -94,7 +94,12 @@ ifdef CONTAINER_FILTER
     LAYER_VARS = CONTAINER_FILTER=$(CONTAINER_FILTER) RESULTS_DIR=$(RESULTS_DIR)
     CONTAINER_FLAG = --container
 else
-    LAYER_VARS = MODE=$(MODE) RESULTS_DIR=$(RESULTS_DIR)
+    # The fs layer has no device tier, so it REFUSES to start unfiltered — unlike
+    # block/nvme, which fall back to DEV_FILTER. Without a default this suite cannot
+    # run in its documented form (`make validate MODE=detailed`) at all; it dies in
+    # the first job with "no filter set". fio is the only process this suite runs.
+    LAYER_VARS = MODE=$(MODE) RESULTS_DIR=$(RESULTS_DIR) \
+                 COMM_FILTER=$(if $(COMM_FILTER),$(COMM_FILTER),fio)
     CONTAINER_FLAG =
 endif
 

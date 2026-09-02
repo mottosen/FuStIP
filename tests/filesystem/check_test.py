@@ -12,7 +12,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "util"))
-from stats_generation.shared import parse_counters, print_data_quality
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from stats_generation.shared import (parse_counters, print_data_quality,
+                                     check_data_quality)
+from report import (active_ops, print_group, print_numbers, print_result,
+                    strip_prefix)
 
 
 def parse_fio_json(path):
@@ -328,6 +332,9 @@ def main():
                         help="Profiling mode (default: summary)")
     parser.add_argument("--tolerance", type=float, default=0.02, help="Tolerance for count checks (default: 0.02)")
     parser.add_argument("--container", action="store_true", help="Container mode: allow profiler counts above FIO")
+    parser.add_argument("--max-drop-pct", type=float, default=0.0,
+                        help="Fail if the BPF ring buffer dropped more than this %% of "
+                             "events (default: 0.0 — any drop is a regression)")
     args = parser.parse_args()
 
     fio = parse_fio_json(args.fio_json)
@@ -340,62 +347,53 @@ def main():
     read_key, write_key = syscall_keys_for_job(args.job)
     kind = classify_job(fio)
 
-    print(f"\n=== {args.job} (mode={args.mode}) ===")
+    print(f"\n=== {args.job} (mode={args.mode}) ===\n")
 
-    print(f"  FIO:  read_ios={fio['read_ios']}  read_bytes={fio['read_bytes']}"
-          f"  write_ios={fio['write_ios']}  write_bytes={fio['write_bytes']}")
+    rows = [("FIO", op, [("ios", fio[f"{op}_ios"]), ("bytes", fio[f"{op}_bytes"])])
+            for op in ("read", "write") if fio[f"{op}_ios"]]
+    # fs still emits an entry and an exit record per syscall, so `entered` is a
+    # measurement here rather than the constant zero it would be on block/nvme.
+    rows += [("FS", sc, [("entered", get_val(fs, "sc_entered", sc)),
+                         ("completed", get_val(fs, "sc_completed", sc)),
+                         ("bytes", get_val(fs, "sc_total_bytes", sc))])
+             for sc in active_ops(fs, "sc_completed", ops=(read_key, write_key))]
+    print_numbers(rows)
 
-    print("")
-    for i, sc in enumerate((read_key, write_key)):
-        prefix = "FS:" if i == 0 else ""
-        print(f"  {prefix:6}{sc + ':':9}"
-              f"  entered={get_val(fs, 'sc_entered', sc)}"
-              f"  completed={get_val(fs, 'sc_completed', sc)}"
-              f"  bytes={get_val(fs, 'sc_total_bytes', sc)}")
-
-    # Display auxiliary syscall counts
     aux_parts = [f"{sc}={get_val(fs, 'sc_count', sc)}" for sc in AUXILIARY_SYSCALLS
                  if get_val(fs, "sc_count", sc) > 0]
     if aux_parts:
-        print(f"        {', '.join(aux_parts)}")
+        print(f"  {'':<12}{', '.join(aux_parts)}")
 
     if args.mode == "detailed":
-        print_data_quality(args.fs_out)
-
-    print()
+        print("")
+        print_data_quality(args.fs_out, label="FS", width=len("FS DROPS:"))
 
     if is_uring_job(args.job):
         # Counting io_uring reads as read()/pread64() would fail by construction — that
         # absence IS the result here, so this job gets its own assertions.
-        results = validate_io_uring(fio, fs, args.tolerance, args.fs_out)
+        checks = validate_io_uring(fio, fs, args.tolerance, args.fs_out)
     else:
-        results = validate_completed_vs_fio(fio, fs, args.tolerance, read_key, write_key, kind,
-                                            args.container)
-        results += validate_consistency(fs, args.tolerance, read_key, write_key, kind)
-
-    all_passed = True
-    for passed, msg in results:
-        print(f"  {msg}")
-        if not passed:
-            all_passed = False
+        checks = validate_completed_vs_fio(fio, fs, args.tolerance, read_key, write_key, kind,
+                                           args.container)
+        checks += validate_consistency(fs, args.tolerance, read_key, write_key, kind)
 
     if args.mode == "detailed" and not is_uring_job(args.job):
         ops = {"read": [read_key], "write": [write_key], "mixed": [read_key, write_key]}[kind]
         fs_ap = parse_access_pattern(args.fs_out)
-        for passed, msg in validate_access_pattern(args.job, fs_ap, "fs", ops, args.tolerance,
-                                                   lookup_key="sc_offsets"):
-            print(f"  {msg}")
-            if not passed:
-                all_passed = False
+        checks += validate_access_pattern(args.job, fs_ap, "fs", ops, args.tolerance,
+                                          lookup_key="sc_offsets")
 
-    print()
-    if all_passed:
-        print("  RESULT: PASS")
-    else:
-        print("  RESULT: FAIL")
+    if args.mode == "detailed":
+        # Ring-buffer drops are a correctness failure, not a diagnostic: a short
+        # capture looks entirely normal, just smaller.
+        checks.append(check_data_quality(args.fs_out, label="FS",
+                                         max_drop_pct=args.max_drop_pct))
 
-    print()
+    checks = [(ok, strip_prefix(strip_prefix(m, "fs"), "FS")) for ok, m in checks]
+    all_passed = print_group("FS", checks)
+
+    return print_result(all_passed)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -35,6 +35,9 @@ from container.labeling import bind_containers, load_comm_label_map, load_mntns_
 
 LAYER_PREFIX = "block"
 
+# On-disk format this reader implements; must match the collector's counters.json.
+SCHEMA_VERSION = 2
+
 
 def _sec_to_time(s):
     h, m, ss = s // 3600, (s % 3600) // 60, s % 60
@@ -109,14 +112,23 @@ def generate_stats(parquet_path):
     # Group by raw (comm, mntns_id) — streaming engine stays effective.
     # ts_min/ts_max and event_counts derived from this result (no separate scan).
     # Explicit select avoids loading 'rq' (~5 GB) and other unreferenced columns.
+    # One row per request, all completions. The active span runs from the first
+    # request ENTERING the block layer to the last completion, so ts_min comes from
+    # the reconstructed insert time (issue - queue_latency, which equals issue for
+    # direct-dispatched requests); using completion timestamps would shorten the
+    # window by a request's full service time and inflate the derived IOPS.
     comm_agg_raw = (pl.scan_parquet(parquet_path)
-                      .select([*id_keys, "event", "op", "bytes", "timestamp_ns"])
-                      .filter(pl.col("event").is_in(["insert", "issue", "complete"]))
-                      .group_by(*id_keys, "event", "op")
+                      .select([*id_keys, "op", "bytes", "timestamp_ns",
+                               "latency_ns", "queue_latency_ns"])
+                      .with_columns(
+                          (pl.col("timestamp_ns") - pl.col("latency_ns")
+                           - pl.col("queue_latency_ns")).alias("enter_ts")
+                      )
+                      .group_by(*id_keys, "op")
                       .agg(
                           pl.len().alias("count"),
                           pl.col("bytes").sum().alias("total_bytes"),
-                          pl.col("timestamp_ns").min().alias("ts_min"),
+                          pl.col("enter_ts").min().alias("ts_min"),
                           pl.col("timestamp_ns").max().alias("ts_max"),
                       )
                       .collect(engine="streaming"))
@@ -124,8 +136,8 @@ def generate_stats(parquet_path):
     ts_min = comm_agg_raw["ts_min"].min()
     ts_max = comm_agg_raw["ts_max"].max()
     duration_s = (ts_max - ts_min) / 1e9 if ts_min and ts_max and ts_max > ts_min else 0
-    event_agg = comm_agg_raw.group_by("event").agg(pl.col("count").sum())
-    event_counts = dict(zip(event_agg["event"].to_list(), event_agg["count"].to_list()))
+    # Received-record count, for the data_quality cross-check against counters.json.
+    event_counts = {"request": int(comm_agg_raw["count"].sum())}
 
     for part in comm_agg_raw.partition_by(id_keys, maintain_order=False):
         row0 = part.row(0, named=True)
@@ -133,30 +145,21 @@ def generate_stats(parquet_path):
         entry = ensure_comm_entry(comm, mntns_id_str)
         comm_counters = {}
 
-        complete_rows = part.filter(pl.col("event") == "complete")
-        if len(complete_rows) > 0:
-            comm_counters["rq_completed"] = dict(zip(
-                complete_rows["op"].to_list(),
-                [int(v) for v in complete_rows["count"].to_list()]
-            ))
-            comm_counters["rq_total_bytes"] = dict(zip(
-                complete_rows["op"].to_list(),
-                [int(v) for v in complete_rows["total_bytes"].to_list()]
-            ))
-
-        issue_rows = part.filter(pl.col("event") == "issue")
-        if len(issue_rows) > 0:
-            comm_counters["rq_issued"] = dict(zip(
-                issue_rows["op"].to_list(),
-                [int(v) for v in issue_rows["count"].to_list()]
-            ))
-
-        insert_rows = part.filter(pl.col("event") == "insert")
-        if len(insert_rows) > 0:
-            comm_counters["rq_queued"] = dict(zip(
-                insert_rows["op"].to_list(),
-                [int(v) for v in insert_rows["count"].to_list()]
-            ))
+        # Every row is a completed request.
+        #
+        # rq_issued / rq_queued are deliberately NOT emitted per (comm, op): the BPF
+        # stage counters have no op breakdown, and deriving them from the completion
+        # count would make the issued~completed consistency check compare a number
+        # against itself. The totals, and the direct-dispatch count they imply, are
+        # reported once under data_quality.
+        comm_counters["rq_completed"] = dict(zip(
+            part["op"].to_list(),
+            [int(v) for v in part["count"].to_list()]
+        ))
+        comm_counters["rq_total_bytes"] = dict(zip(
+            part["op"].to_list(),
+            [int(v) for v in part["total_bytes"].to_list()]
+        ))
 
         entry["counters"] = comm_counters
         # Trustworthy iops/throughput = completed ÷ active duration (the
@@ -171,15 +174,13 @@ def generate_stats(parquet_path):
     # Process one op at a time: quantile on ~60M rows uses ~11 GB RSS.
     # Per-op scans reuse allocator memory (~12 GB total vs ~22 GB simultaneous).
     ops = (pl.scan_parquet(parquet_path)
-             .filter(pl.col("event") == "complete")
              .select("op")
              .unique()
              .collect()["op"].to_list())
 
     for op in ops:
         raw_dlat_op = (pl.scan_parquet(parquet_path)
-                         .select([*id_keys, "event", "op", "latency_ns"])
-                         .filter(pl.col("event") == "complete")
+                         .select([*id_keys, "op", "latency_ns"])
                          .filter(pl.col("op") == op)
                          .filter(pl.col("latency_ns").is_not_null())
                          .group_by(*id_keys)
@@ -190,24 +191,21 @@ def generate_stats(parquet_path):
             ensure_comm_entry(comm, mntns_id_str)["distributions"].setdefault("driver_latencies", {})[op] = _row_to_stats(row)
         del raw_dlat_op
 
-    issue_ops = (pl.scan_parquet(parquet_path)
-                   .filter(pl.col("event") == "issue")
-                   .select("op")
-                   .unique()
-                   .collect()["op"].to_list())
+    issue_ops = ops
 
     for op in issue_ops:
-        # latency_ns == 0 on issue events means the request was direct-dispatched
-        # (no block_rq_insert occurred — common with the 'none' I/O scheduler).
-        # Drop those so the queue-latency distribution reflects only requests
-        # that actually waited in the queue.
+        # Select on `queued`, not on a positive latency. Direct-dispatched requests
+        # never entered the scheduler queue (no block_rq_insert — the common case
+        # with the 'none' scheduler and io_uring) and must stay out of this
+        # distribution; the old test for latency_ns > 0 also silently discarded
+        # genuinely-queued requests whose wait rounded to zero.
         raw_qlat_op = (pl.scan_parquet(parquet_path)
-                         .select([*id_keys, "event", "op", "latency_ns"])
-                         .filter(pl.col("event") == "issue")
+                         .select([*id_keys, "op", "queued", "queue_latency_ns"])
                          .filter(pl.col("op") == op)
-                         .filter(pl.col("latency_ns") > 0)
+                         .filter(pl.col("queued") == 1)
+                         .filter(pl.col("queue_latency_ns").is_not_null())
                          .group_by(*id_keys)
-                         .agg(_series_stats_exprs("latency_ns"))
+                         .agg(_series_stats_exprs("queue_latency_ns"))
                          .collect(engine="streaming"))
         for row in raw_qlat_op.iter_rows(named=True):
             comm, mntns_id_str = _comm_key(row, has_mntns)
@@ -216,8 +214,7 @@ def generate_stats(parquet_path):
 
     for op in ops:
         raw_size_op = (pl.scan_parquet(parquet_path)
-                         .select([*id_keys, "event", "op", "bytes"])
-                         .filter(pl.col("event") == "complete")
+                         .select([*id_keys, "op", "bytes"])
                          .filter(pl.col("op") == op)
                          .group_by(*id_keys)
                          .agg(_series_stats_exprs("bytes"))
@@ -233,18 +230,58 @@ def generate_stats(parquet_path):
     # tseries computed per comm; bind_containers keeps dominant comm's for container labels.
     if duration_s > 0:
         window_ns = 1_000_000_000
-        per_comm_snap = (pl.scan_parquet(parquet_path)
-                           .select([*id_keys, "event", "op", "timestamp_ns", "q_inflight", "d_inflight"])
-                           .filter(pl.col("event").is_in(["insert", "issue", "complete"]))
-                           .with_columns(
-                               ((pl.col("timestamp_ns") - ts_min) // window_ns).cast(pl.Int64).alias("sec")
-                           )
+        # Each request contributes a depth sample at every stage transition it
+        # actually made:
+        #
+        #   insert (queued only) -> q_inflight_at_insert
+        #   issue                -> q_inflight_at_issue (queued only), d_inflight_at_issue
+        #   complete             -> d_inflight_at_complete
+        #
+        # The old rows also carried the *other* counter as a bare snapshot (driver
+        # depth at insert, queue depth at complete). Those are re-reads of a shared
+        # counter that say nothing about this request's own transition, so they are
+        # not reproduced; the transitions carry the information.
+        #
+        # Sampling only at completion would leave every second that contained
+        # submissions but no completions with no sample, flattening ramp-up spikes.
+        base = (pl.scan_parquet(parquet_path)
+                  .select([*id_keys, "op", "timestamp_ns", "latency_ns",
+                           "queue_latency_ns", "queued",
+                           "q_inflight_at_insert", "q_inflight_at_issue",
+                           "d_inflight_at_issue", "d_inflight_at_complete"]))
+        issue_ts = pl.col("timestamp_ns") - pl.col("latency_ns")
+        insert_ts = issue_ts - pl.col("queue_latency_ns")
+        null_i32 = pl.lit(None, dtype=pl.Int32)
+
+        def _sec(ts_expr):
+            return ((ts_expr - ts_min) // window_ns).cast(pl.Int64).alias("sec")
+
+        at_insert = base.filter(pl.col("queued") == 1).select([
+            *id_keys, "op", _sec(insert_ts),
+            pl.col("q_inflight_at_insert").cast(pl.Int32).alias("q_inflight"),
+            null_i32.alias("d_inflight"),
+            pl.lit(0, dtype=pl.Int32).alias("is_completion"),
+        ])
+        at_issue = base.select([
+            *id_keys, "op", _sec(issue_ts),
+            pl.when(pl.col("queued") == 1)
+              .then(pl.col("q_inflight_at_issue").cast(pl.Int32))
+              .otherwise(null_i32).alias("q_inflight"),
+            pl.col("d_inflight_at_issue").cast(pl.Int32).alias("d_inflight"),
+            pl.lit(0, dtype=pl.Int32).alias("is_completion"),
+        ])
+        at_complete = base.select([
+            *id_keys, "op", _sec(pl.col("timestamp_ns")),
+            null_i32.alias("q_inflight"),
+            pl.col("d_inflight_at_complete").cast(pl.Int32).alias("d_inflight"),
+            pl.lit(1, dtype=pl.Int32).alias("is_completion"),
+        ])
+        per_comm_snap = (pl.concat([at_insert, at_issue, at_complete])
                            .group_by(*id_keys, "op", "sec")
                            .agg(
-                               pl.col("q_inflight").last(),
-                               pl.col("d_inflight").last(),
-                               pl.when(pl.col("event") == "complete")
-                                 .then(pl.lit(1)).otherwise(pl.lit(0)).sum().alias("io_count"),
+                               pl.col("q_inflight").drop_nulls().last(),
+                               pl.col("d_inflight").drop_nulls().last(),
+                               pl.col("is_completion").sum().alias("io_count"),
                            )
                            .collect(engine="streaming"))
 
@@ -277,16 +314,18 @@ def generate_stats(parquet_path):
                     entry["tseries"].setdefault("iops", {})[op] = tseries_stats(iops_points)
         del per_comm_snap
 
-    # --- Scan 4: Access pattern (per comm, per op, timestamp-ordered) ---
-    # The gap test depends on submission order, but streaming collect does not preserve
-    # row order and the parquet is ~6% out-of-order on adjacent timestamps (multi-CPU
-    # ring buffer). So sort by timestamp_ns after collect. To keep the sorted unit (and
-    # the sort's ~2x transient) small, scan per (comm, op) over only timestamp_ns/sector/
-    # bytes — one op at a time, no op string in the frame, no partition_by full-copy
-    # spike. Peak is ~2x a single op's reduced frame (well under the quantile ceiling).
+    # --- Scan 4: Access pattern (per comm, per op, submission-ordered) ---
+    # The gap test asks whether request i+1 starts where request i ended, which is
+    # only meaningful in the order the DRIVER received them — i.e. issue order.
+    # Rows are now completions, and completions reorder under any queue depth above
+    # one, so sorting by the row's own timestamp_ns would feed the gap test a
+    # sequence that never happened and report sequential I/O as random. Sort by the
+    # reconstructed issue time (timestamp_ns - latency_ns) instead. The parquet is
+    # also physically unordered (multi-CPU ring buffer), so an explicit sort is
+    # required either way. shared.py cannot detect a violation of this contract.
     if has_sector:
         has_ts = "timestamp_ns" in schema
-        cols = (["timestamp_ns"] if has_ts else []) + ["sector", "bytes"]
+        cols = (["timestamp_ns", "latency_ns"] if has_ts else []) + ["sector", "bytes"]
         for (comm, mntns_id_str) in list(_entries.keys()):
             if has_mntns and mntns_id_str:
                 comm_filter = (pl.col("comm") == comm) & (pl.col("mntns_id") == int(mntns_id_str))
@@ -294,7 +333,6 @@ def generate_stats(parquet_path):
                 comm_filter = (pl.col("comm") == comm)
             base = (pl.scan_parquet(parquet_path)
                       .filter(comm_filter)
-                      .filter(pl.col("event") == "issue")
                       .filter(pl.col("sector").is_not_null()))
             ops = base.select("op").unique().collect(engine="streaming")["op"].to_list()
             if not ops:
@@ -309,7 +347,10 @@ def generate_stats(parquet_path):
                     del op_df
                     continue
                 if has_ts:
-                    op_df = op_df.sort("timestamp_ns")
+                    op_df = (op_df
+                             .with_columns((pl.col("timestamp_ns") - pl.col("latency_ns"))
+                                           .alias("issue_ts"))
+                             .sort("issue_ts"))
                 sectors = op_df["sector"].cast(pl.Int64).to_numpy()
                 bytes_list = op_df["bytes"].cast(pl.Int64).to_numpy()
                 entry["access_pattern"]["rq_sectors"][op] = compute_access_pattern(
@@ -331,31 +372,50 @@ def load_data_quality(layer_dir, event_counts):
         with open(counters_file) as f:
             counters = json.load(f)
 
-        per_event_type = {}
-        total_generated = 0
-        total_dropped = 0
+        # This reader implements SCHEMA_VERSION. A capture written to any other
+        # version is refused rather than summed as if it were this one: the counter
+        # names are the same but their meaning is not, so the failure would surface
+        # as a quietly wrong drop_pct rather than as an error.
+        version = counters.get("schema_version")
+        if version != SCHEMA_VERSION:
+            raise ValueError(
+                f"{counters_file} declares schema_version "
+                f"{version if version is not None else '<unset>'}; this tool reads "
+                f"v{SCHEMA_VERSION} only."
+            )
 
-        for event_type in ("insert", "issue", "complete"):
-            entry = counters.get(event_type, {})
-            gen = entry.get("generated", 0)
-            drop = entry.get("dropped", 0)
-            received = int(event_counts.get(event_type, 0))
-            total_generated += gen
-            total_dropped += drop
-            per_event_type[event_type] = {
-                "generated": gen,
-                "dropped": drop,
-                "received": received,
-                "drop_pct": round(100 * drop / gen, 4) if gen > 0 else 0.0,
-            }
+        queued = counters.get("insert", {}).get("generated", 0)
+        issued = counters.get("issue", {}).get("generated", 0)
+        completed = counters.get("complete", {})
+        gen = completed.get("generated", 0)
+        drop = completed.get("dropped", 0)
+        # Rows actually in the parquet — an independent cross-check of gen - drop.
+        received = int(event_counts.get("request", 0))
+        direct = counters.get("direct_dispatch", max(0, issued - queued))
 
-        total_received = total_generated - total_dropped
         result = {
-            "total_generated": total_generated,
-            "total_dropped": total_dropped,
-            "total_received": total_received,
-            "drop_pct": round(100 * total_dropped / total_generated, 4) if total_generated > 0 else 0.0,
-            "per_event_type": per_event_type,
+            "schema_version": SCHEMA_VERSION,
+            "total_generated": gen,
+            "total_dropped": drop,
+            "total_received": received,
+            "drop_pct": round(100 * drop / gen, 4) if gen > 0 else 0.0,
+            # Single-entry mapping so consumers that iterate per_event_type
+            # (print_data_quality, the overview) keep working unchanged.
+            "per_event_type": {
+                "request": {
+                    "generated": gen,
+                    "dropped": drop,
+                    "received": received,
+                    "drop_pct": round(100 * drop / gen, 4) if gen > 0 else 0.0,
+                }
+            },
+            # Stage totals. The BPF counters have no op breakdown, so they are
+            # reported once here rather than per (comm, op).
+            "requests_queued": queued,
+            "requests_issued": issued,
+            "requests_incomplete": counters.get("incomplete", max(0, issued - gen)),
+            "direct_dispatch": direct,
+            "direct_dispatch_pct": round(100 * direct / issued, 4) if issued > 0 else 0.0,
         }
 
         # Untracked completions: completions whose request was never tracked at

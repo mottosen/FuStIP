@@ -232,3 +232,27 @@ size=16G
 time_based=1
 runtime=600
 stonewall
+
+
+; ============================================================
+;  D  Saturation — the regression test for collector event loss
+; ============================================================
+; Everything above tests one or two collectors against a workload that leaves the
+; host mostly idle. That combination passed for an entire campaign while the nvme
+; layer was losing 23% of its events, because loss only appears when several
+; collectors compete at a rate near their combined ceiling.
+;
+; Run this with LAYERS="block nvme fs" and MODE=detailed. It offers the highest
+; sustainable event rate a single device can produce (8 threads x QD256), for long
+; enough that a 512 MB ring cannot simply absorb the whole run: at ~0.7 M records/s
+; the ring holds ~6.4 s, so a 90 s job means any real deficit has to show up.
+; Expected access pattern: random.
+[stress_saturation]
+rw=randread
+bs=4k
+iodepth=256
+numjobs=8
+size=16G
+time_based=1
+runtime=90
+stonewall

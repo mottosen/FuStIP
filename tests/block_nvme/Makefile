@@ -23,6 +23,7 @@ MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 BLOCK_DIR = ../../layers/block
 NVME_DIR = ../../layers/nvme
+FS_DIR = ../../layers/fs
 UTIL_DIR := $(MAKEFILE_DIR)../../util
 
 FIO_OUT = $(RESULTS_DIR)/fio/block_nvme-fio_out.json
@@ -40,6 +41,10 @@ DOCKER_COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker
 VAL_JOBS = val_seqread val_seqwrite val_randread val_randwrite val_randrw val_high_qd
 WORK_JOBS = work_index_search work_bulk_insert work_compaction work_query_insert work_scan work_high_qd
 STRESS_JOBS = stress_2m stress_5m stress_10m
+# Run explicitly with all three layers:
+#   make -C tests/block_nvme saturation LAYERS="block nvme fs" MODE=detailed \
+#        FIO_FILE=<file> RESULTS_DIR=<dir>
+SATURATION_JOBS = stress_saturation
 
 .NOTPARALLEL:
 
@@ -70,8 +75,11 @@ workload: $(WORK_JOBS)
 .PHONY: stress
 stress: $(STRESS_JOBS)
 
+.PHONY: saturation
+saturation: $(SATURATION_JOBS)
+
 .PHONY: all
-all: validate workload stress
+all: validate workload stress saturation
 
 # ── Per-job pattern ──
 # Each target: wait for device quiescence → start collection → run fio →
@@ -82,13 +90,20 @@ all: validate workload stress
 ifeq ($(MODE),detailed)
     BLOCK_OUT_FLAG = --block-out $(RESULTS_DIR)/block/detailed-stats.json
     NVME_OUT_FLAG = --nvme-out $(RESULTS_DIR)/nvme/detailed-stats.json
+    FS_OUT_FLAG = --fs-out $(RESULTS_DIR)/fs/detailed-stats.json
     MODE_FLAG = --mode detailed
 else
     BLOCK_OUT_FLAG = --block-out $(RESULTS_DIR)/block/trace.out
     NVME_OUT_FLAG = --nvme-out $(RESULTS_DIR)/nvme/trace.out
+    FS_OUT_FLAG =
     MODE_FLAG =
 endif
 
+# The fs layer is opt-in here (LAYERS="block nvme fs"). Its counts are validated by
+# the filesystem suite, not this one — what it contributes here is a THIRD concurrent
+# consumer. That matters because collector contention is invisible to any single-layer
+# test: the campaign that lost 23% of its NVMe events ran three collectors, and every
+# suite that passed beforehand ran one.
 LAYERS ?= block nvme
 
 # Variables passed to layer Makefiles
@@ -98,6 +113,13 @@ ifdef CONTAINER_FILTER
 else
     LAYER_VARS = MODE=$(MODE) RESULTS_DIR=$(RESULTS_DIR)
     CONTAINER_FLAG =
+endif
+# The fs layer has no device tier, so DEV_FILTER (inherited on the command line)
+# must not reach it; it needs a process or container filter instead.
+ifdef CONTAINER_FILTER
+    FS_LAYER_VARS = CONTAINER_FILTER=$(CONTAINER_FILTER) RESULTS_DIR=$(RESULTS_DIR) DEV_FILTER=
+else
+    FS_LAYER_VARS = MODE=$(MODE) RESULTS_DIR=$(RESULTS_DIR) DEV_FILTER= COMM_FILTER=$(if $(COMM_FILTER),$(COMM_FILTER),fio)
 endif
 
 define JOB_TEMPLATE
@@ -109,6 +131,7 @@ $(1): ensure-sudo prebuild
 	$(Q)bash $(UTIL_DIR)/wait_device_idle.sh "$(if $(DEV_FILTER),$(DEV_FILTER),$(FIO_FILE))" 10 $(REDIRECT) || true
 	$(if $(filter block,$(LAYERS)),$(Q)$(MAKE) -C $(BLOCK_DIR) start-collection $(LAYER_VARS) $(REDIRECT))
 	$(if $(filter nvme,$(LAYERS)),$(Q)$(MAKE) -C $(NVME_DIR) start-collection $(LAYER_VARS) $(REDIRECT))
+	$(if $(filter fs,$(LAYERS)),$(Q)$(MAKE) -C $(FS_DIR) start-collection $(FS_LAYER_VARS) $(REDIRECT))
 	$(Q)sleep 5
 	$(Q)mkdir -p $(RESULTS_DIR)/fio
 ifdef CONTAINER_FILTER
@@ -127,18 +150,22 @@ endif
 	$(Q)( \
 		$(if $(filter nvme,$(LAYERS)), $(MAKE) -C $(NVME_DIR) stop-profiling $(LAYER_VARS) $(REDIRECT) &) \
 		$(if $(filter block,$(LAYERS)), $(MAKE) -C $(BLOCK_DIR) stop-profiling $(LAYER_VARS) $(REDIRECT) &) \
+		$(if $(filter fs,$(LAYERS)), $(MAKE) -C $(FS_DIR) stop-profiling $(FS_LAYER_VARS) $(REDIRECT) &) \
 		wait )
 	$(if $(filter nvme,$(LAYERS)),$(Q)$(MAKE) -C $(NVME_DIR) csv-to-parquet $(LAYER_VARS) $(REDIRECT))
 	$(if $(filter block,$(LAYERS)),$(Q)$(MAKE) -C $(BLOCK_DIR) csv-to-parquet $(LAYER_VARS) $(REDIRECT))
 	$(if $(filter nvme,$(LAYERS)),$(Q)$(MAKE) -C $(NVME_DIR) generate-stats $(LAYER_VARS) $(REDIRECT))
 	$(if $(filter block,$(LAYERS)),$(Q)$(MAKE) -C $(BLOCK_DIR) generate-stats $(LAYER_VARS) $(REDIRECT))
+	$(if $(filter fs,$(LAYERS)),$(Q)$(MAKE) -C $(FS_DIR) csv-to-parquet $(FS_LAYER_VARS) $(REDIRECT))
+	$(if $(filter fs,$(LAYERS)),$(Q)$(MAKE) -C $(FS_DIR) generate-stats $(FS_LAYER_VARS) $(REDIRECT))
 	$(Q)sleep 1
 	$(Q)python $(MAKEFILE_DIR)check_test.py --job $(1) \
 		--fio-json $(FIO_OUT) \
 		$(if $(filter block,$(LAYERS)),$(BLOCK_OUT_FLAG)) \
 		$(if $(filter nvme,$(LAYERS)),$(NVME_OUT_FLAG)) \
+		$(if $(filter fs,$(LAYERS)),$(FS_OUT_FLAG)) \
 		$(MODE_FLAG) \
 		$(CONTAINER_FLAG)
 endef
 
-$(foreach job,$(VAL_JOBS) $(WORK_JOBS) $(STRESS_JOBS),$(eval $(call JOB_TEMPLATE,$(job))))
+$(foreach job,$(VAL_JOBS) $(WORK_JOBS) $(STRESS_JOBS) $(SATURATION_JOBS),$(eval $(call JOB_TEMPLATE,$(job))))
