@@ -39,6 +39,13 @@ LAYER_PREFIX = "block"
 SCHEMA_VERSION = 2
 
 
+# The tracer writes (u64)-1 when it could not read a sector -- a request with no LBA, or one
+# whose bio was gone by the time the probe ran. It is "no sector", exactly like a null, and must
+# be excluded from the access pattern: the cast to Int64 below raises on it rather than producing
+# a nonsense LBA. The nvme layer has always filtered this; block did not.
+SECTOR_UNSET = (1 << 64) - 1
+
+
 def _sec_to_time(s):
     h, m, ss = s // 3600, (s % 3600) // 60, s % 60
     return f"{h:02d}:{m:02d}:{ss:02d}"
@@ -333,7 +340,8 @@ def generate_stats(parquet_path):
                 comm_filter = (pl.col("comm") == comm)
             base = (pl.scan_parquet(parquet_path)
                       .filter(comm_filter)
-                      .filter(pl.col("sector").is_not_null()))
+                      .filter(pl.col("sector").is_not_null()
+                              & (pl.col("sector") != SECTOR_UNSET)))
             ops = base.select("op").unique().collect(engine="streaming")["op"].to_list()
             if not ops:
                 continue
