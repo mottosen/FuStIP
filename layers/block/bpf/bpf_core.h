@@ -5,12 +5,16 @@
 #include "event.h"
 
 // ── Per-request metadata stored across probes ──
+// comm/mntns/tid are captured in the SUBMITTER's context (insert, or issue when the request
+// direct-dispatched past insert) and carried to the completion probe, which runs in interrupt
+// context where `current` is not the submitting task.
 struct rq_data {
 	__u8  op;
 	__u32 bytes;
 	__u64 sector;
 	__u64 mntns_id;
 	__u8  comm[16];
+	__u32 tid;
 };
 
 // ── Per-(op, comm) key for inflight counters ──
@@ -110,6 +114,7 @@ static __always_inline int handle_block_rq_insert(struct request *rq)
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	data.mntns_id = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
 	bpf_get_current_comm(&data.comm, sizeof(data.comm));
+	data.tid = (__u32)bpf_get_current_pid_tgid();
 	bpf_map_update_elem(&rq_metadata, &rq_key, &data, BPF_ANY);
 
 	// Atomically increment queue inflight; snapshot driver inflight
@@ -144,6 +149,7 @@ static __always_inline int handle_block_rq_insert(struct request *rq)
 		e->sector = sector;
 		e->rq = rq_key;
 		__builtin_memcpy(e->comm, data.comm, 16);
+		e->tid = data.tid;
 		e->q_inflight = qi;
 		e->d_inflight = di;
 		bpf_ringbuf_submit(e, 0);
@@ -176,13 +182,19 @@ static __always_inline int handle_block_rq_issue(struct request *rq)
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	data.mntns_id = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
 
-	// Preserve comm from insert if available, else capture current
+	// Preserve comm/tid from insert if available, else capture current. The else branch is
+	// the direct-dispatch path (scheduler 'none', io_uring) where insert never fired — it is
+	// the common case for the workloads this layer exists to profile, so tid must be captured
+	// here too or it would be null on exactly the I/O that matters.
 	struct rq_data *old_data = bpf_map_lookup_elem(&rq_metadata, &rq_key);
 	if (old_data) {
 		__builtin_memcpy(data.comm, old_data->comm, 16);
 		data.mntns_id = old_data->mntns_id;
-	} else
+		data.tid = old_data->tid;
+	} else {
 		bpf_get_current_comm(&data.comm, sizeof(data.comm));
+		data.tid = (__u32)bpf_get_current_pid_tgid();
+	}
 	bpf_map_update_elem(&rq_metadata, &rq_key, &data, BPF_ANY);
 
 	// Compute queue latency (insert → issue)
@@ -230,6 +242,7 @@ static __always_inline int handle_block_rq_issue(struct request *rq)
 		e->sector = sector;
 		e->rq = rq_key;
 		__builtin_memcpy(e->comm, data.comm, 16);
+		e->tid = data.tid;
 		e->q_inflight = qi;
 		e->d_inflight = di;
 		bpf_ringbuf_submit(e, 0);
@@ -303,6 +316,7 @@ static __always_inline int handle_block_rq_complete(struct request *rq)
 		e->sector = data->sector;
 		e->rq = rq_key;
 		__builtin_memcpy(e->comm, data->comm, 16);
+		e->tid = data->tid;
 		e->q_inflight = qi;
 		e->d_inflight = di;
 		bpf_ringbuf_submit(e, 0);

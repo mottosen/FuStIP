@@ -14,6 +14,7 @@ Usage:
 """
 
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -165,10 +166,17 @@ def main():
         print(f"Error: {results_dir} not found", file=sys.stderr)
         sys.exit(1)
 
+    # Where the collectors ran is part of the result, not part of the invocation: an
+    # unpinned collector on a busy host loses events silently, so a reader asking "can
+    # I trust these counts?" needs the placement recorded beside them rather than
+    # having to remember how the run was launched. Read at stop, which is the same
+    # environment start ran under.
+    cpuset = os.environ.get("PROFILER_CPUSET", "").strip()
     out = [
         "FuStIP results overview",
-        f"  dir:       {results_dir}",
-        f"  generated: {datetime.now().isoformat(timespec='seconds')}",
+        f"  dir:        {results_dir}",
+        f"  generated:  {datetime.now().isoformat(timespec='seconds')}",
+        f"  collectors: {'pinned to ' + cpuset if cpuset else 'unpinned'}",
     ]
 
     found = False

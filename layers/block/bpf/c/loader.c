@@ -146,19 +146,19 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	int n;
 	if (e->latency_ns > 0)
 		n = snprintf(line, sizeof(line),
-			     "%llu,%llu,%s,%s,%u,%llu,%llu,0x%llx,%s,%d,%d\n",
+			     "%llu,%llu,%s,%s,%u,%llu,%llu,0x%llx,%u,%s,%d,%d\n",
 			     e->timestamp_ns, e->mntns_id,
 			     event_name(e->event_type),
 			     op_name(e->op), e->bytes, e->latency_ns,
-			     e->sector, e->rq, comm,
+			     e->sector, e->rq, e->tid, comm,
 			     e->q_inflight, e->d_inflight);
 	else
 		n = snprintf(line, sizeof(line),
-			     "%llu,%llu,%s,%s,%u,,%llu,0x%llx,%s,%d,%d\n",
+			     "%llu,%llu,%s,%s,%u,,%llu,0x%llx,%u,%s,%d,%d\n",
 			     e->timestamp_ns, e->mntns_id,
 			     event_name(e->event_type),
 			     op_name(e->op), e->bytes,
-			     e->sector, e->rq, comm,
+			     e->sector, e->rq, e->tid, comm,
 			     e->q_inflight, e->d_inflight);
 
 	// snprintf returns the would-be length; clamp so a hypothetical overlong
@@ -413,7 +413,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	setvbuf(output, output_buf, _IOFBF, sizeof(output_buf));
-	fprintf(output, "timestamp_ns,mntns_id,event,op,bytes,latency_ns,sector,rq,comm,q_inflight,d_inflight\n");
+	fprintf(output, "timestamp_ns,mntns_id,event,op,bytes,latency_ns,sector,rq,tid,comm,q_inflight,d_inflight\n");
 
 	// Set up ring buffer
 	struct ring_buffer *rb = ring_buffer__new(

@@ -334,4 +334,82 @@ int handle_exit_munmap(struct trace_event_raw_sys_exit *ctx)
 	return handle_sc_exit(ctx->ret);
 }
 
+// ── io_uring_enter() ──
+//
+// The submit/reap boundary for io_uring applications. One call can push many SQEs and/or wait
+// for completions, so this is NOT one event per I/O — it fires per batch, at roughly the rate
+// the application submits, which is well below the block/NVMe event rate.
+//
+// The generic fs_event fields are reused rather than widening the struct for one syscall:
+//   fd     = args[0]  the ring fd (not a file)
+//   bytes  = args[1]  to_submit — number of SQEs submitted, NOT a byte count
+//   offset = args[2]  min_complete — number of completions waited for
+// `bytes` is safe to overload because the byte/latency distributions are computed over an
+// explicit allowlist of I/O syscalls (IO_SYSCALLS in generate_detailed_stats.py) that this is
+// not a member of; it lands in counters.sc_count only. to_submit is worth keeping: it is the
+// observed submission batch size, i.e. direct evidence of the queue depth the application
+// actually asked for, independent of whatever its configuration claims.
+SEC("tp/syscalls/sys_enter_io_uring_enter")
+int handle_enter_io_uring_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	if (!should_trace())
+		return 0;
+	__s32 ring_fd = (__s32)ctx->args[0];
+	__s64 to_submit = (__s64)ctx->args[1];
+	__s64 min_complete = (__s64)ctx->args[2];
+	return handle_sc_enter(SC_IO_URING_ENTER, ring_fd, min_complete, to_submit);
+}
+
+SEC("tp/syscalls/sys_exit_io_uring_enter")
+int handle_exit_io_uring_enter(struct trace_event_raw_sys_exit *ctx)
+{
+	return handle_sc_exit(ctx->ret);
+}
+
+// ── io_submit() / io_getevents()  (libaio) ──
+//
+// The other asynchronous data path, and the one the DiskANN reference reader is built on.
+// Same rationale as io_uring_enter: an application using these issues no read/pread64 at all,
+// so the classic syscall set reports zero I/O for it. Same column overloading, so the two
+// async families read the same way:
+//
+//   io_submit(ctx, nr, iocbpp)                 bytes = nr        (iocbs submitted)
+//   io_getevents(ctx, min_nr, nr, ev, tmo)     bytes = nr        (max events reaped)
+//                                              offset = min_nr   (events waited for)
+//
+// `fd` stays -1 for both: the first argument is an aio_context_t, not a descriptor. Splitting
+// submit from reap matters — io_submit returns as soon as the iocbs are queued, while
+// io_getevents is where the thread actually blocks, so it is the reap side that carries the
+// waiting time a latency breakdown wants.
+SEC("tp/syscalls/sys_enter_io_submit")
+int handle_enter_io_submit(struct trace_event_raw_sys_enter *ctx)
+{
+	if (!should_trace())
+		return 0;
+	__s64 nr = (__s64)ctx->args[1];
+	return handle_sc_enter(SC_IO_SUBMIT, -1, -1, nr);
+}
+
+SEC("tp/syscalls/sys_exit_io_submit")
+int handle_exit_io_submit(struct trace_event_raw_sys_exit *ctx)
+{
+	return handle_sc_exit(ctx->ret);
+}
+
+SEC("tp/syscalls/sys_enter_io_getevents")
+int handle_enter_io_getevents(struct trace_event_raw_sys_enter *ctx)
+{
+	if (!should_trace())
+		return 0;
+	__s64 min_nr = (__s64)ctx->args[1];
+	__s64 nr = (__s64)ctx->args[2];
+	return handle_sc_enter(SC_IO_GETEVENTS, -1, min_nr, nr);
+}
+
+SEC("tp/syscalls/sys_exit_io_getevents")
+int handle_exit_io_getevents(struct trace_event_raw_sys_exit *ctx)
+{
+	return handle_sc_exit(ctx->ret);
+}
+
 char LICENSE[] SEC("license") = "GPL";

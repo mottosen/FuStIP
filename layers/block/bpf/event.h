@@ -25,6 +25,7 @@ struct block_event {
 	__u64 sector;       // rq->__sector
 	__u64 rq;           // request pointer (correlation ID)
 	char  comm[16];     // process name
+	__u32 tid;          // SUBMITTING thread id (captured at insert/issue, carried to complete)
 	__s32 q_inflight;   // queue inflight (insert -> issue)
 	__s32 d_inflight;   // driver inflight (issue -> complete)
 } __attribute__((packed));

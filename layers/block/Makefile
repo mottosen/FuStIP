@@ -25,6 +25,34 @@ endif
 
 BPFTRACE := $(shell which bpftrace)
 PIDS_DIR = /tmp/bpftrace_block-pids
+# Pin the collection process to the cores the caller reserved for profiling, if any.
+#
+# The consumer is single-threaded, and a single thread whose SMT sibling is busy runs at
+# 1.19 M events/s against 2.57 M/s idle — measured. On a host whose CPUs are all allocated
+# to the workload it therefore loses events steadily once the workload generates more than
+# ~1.2 M/s, and it does so silently: the run completes and the CSV looks normal. Giving it
+# another *logical* CPU fixes nothing (1.18 M/s); only freeing the SIBLING does. So
+# PROFILER_CPUSET must name WHOLE physical cores, both siblings of each, excluded from
+# every other cpuset.
+#
+# Empty or unset = no pinning, which is the right default: on an unloaded machine there is
+# no sibling to lose to. taskset goes before sudo deliberately — affinity is inherited
+# across exec, so this needs no privileges of its own.
+TASKSET = $(if $(PROFILER_CPUSET),taskset -c $(PROFILER_CPUSET),)
+# Refuse an impossible cpuset at PARSE time, before anything is launched.
+#
+# Without this the failure is silent and looks like success: taskset would exit
+# "Invalid argument", the backgrounded loader would never start, start-collection
+# would still return 0, and the run would produce an empty capture. That is the
+# exact failure class this pinning exists to remove, so it must not be reachable
+# through a typo. Parse-time (not recipe-time) so it also fires under `make -n`.
+ifneq ($(PROFILER_CPUSET),)
+ifneq ($(shell taskset -c $(PROFILER_CPUSET) true >/dev/null 2>&1; echo $$?),0)
+$(error PROFILER_CPUSET="$(PROFILER_CPUSET)" is not settable on this machine \
+        (taskset rejected it). Give a CPU list this host actually has, or unset \
+        it to run unpinned.)
+endif
+endif
 
 INTERVAL ?= 1
 
@@ -67,7 +95,7 @@ ifeq ($(MODE),detailed)
 
 	$(Q)sudo rm -f "$(RESULTS_DIR)/block/detailed.csv" "$(RESULTS_DIR)/block/counters.json" $(ERR_REDIRECT) || true
 	$(Q)touch "$(RESULTS_DIR)/block/detailed.csv" "$(RESULTS_DIR)/block/counters.json"
-	$(Q)sudo ./bpf/c/standalone \
+	$(Q)$(TASKSET) sudo ./bpf/c/standalone \
 		-o "$(RESULTS_DIR)/block/detailed.csv" \
 		$(if $(DEV_FILTER),-f $(DEV_FILTER)) \
 		$(if $(COMM_FILTER),-p $(COMM_FILTER)) \
@@ -84,7 +112,7 @@ else
 # left by a previous run (bpftrace also truncates on open, but this closes the race).
 	$(Q)sudo rm -f "$(RESULTS_DIR)/block/trace.out" $(ERR_REDIRECT) || true
 
-	$(Q)sudo $(BPFTRACE) ./bt/trace.bt "$(if $(DEV_FILTER),$(DEV_FILTER),_)" "$(if $(COMM_FILTER),$(COMM_FILTER),_)" $$(echo '$(PID_FILTER)' | tr ',' ' ') \
+	$(Q)$(TASKSET) sudo $(BPFTRACE) ./bt/trace.bt "$(if $(DEV_FILTER),$(DEV_FILTER),_)" "$(if $(COMM_FILTER),$(COMM_FILTER),_)" $$(echo '$(PID_FILTER)' | tr ',' ' ') \
 		--no-warnings \
 		-o "$(RESULTS_DIR)/block/trace.out" \
 		$(ERR_REDIRECT) 1>&2 & echo $$! > "$(PIDS_DIR)/trace.pid"

@@ -47,6 +47,8 @@ static __always_inline __u8 nvme_opcode_to_op(__u8 opcode) {
 }
 
 // ── Per-command metadata stored between setup and complete ──
+// comm/mntns/tid are captured in the SUBMITTER's context at fentry setup and carried to the
+// completion probe, which runs in NVMe interrupt context where `current` is not the submitter.
 struct cmd_data {
   __u8 op;
   __u32 bytes;
@@ -55,6 +57,7 @@ struct cmd_data {
   __u8 comm[16];
   char disk_name[32]; // kernel gendisk name, read once at fentry setup
   __u16 qid;          // NVMe queue id, read once at fentry setup
+  __u32 tid;          // submitting thread id, read once at fentry setup
 };
 
 // ── Per-(op, comm) key for inflight counters ──
@@ -147,6 +150,10 @@ static __always_inline int handle_nvme_fentry_setup(struct request *req) {
   struct task_struct *task = (struct task_struct *)bpf_get_current_task();
   data.mntns_id = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
   bpf_get_current_comm(&data.comm, sizeof(data.comm));
+  // Same tid the bridge below keys on, but kept in the event: the completion probe cannot
+  // recover it. For io_uring this is whichever thread reached the driver — the app thread on
+  // the inline submit path, an iou-wrk-* worker when the SQE was offloaded.
+  data.tid = (__u32)tid;
   struct gendisk *disk = BPF_CORE_READ(req, q, disk);
   if (disk)
     bpf_probe_read_kernel_str(&data.disk_name, sizeof(data.disk_name), &disk->disk_name);
@@ -227,6 +234,7 @@ static __always_inline int handle_nvme_rawtp_setup(void *cmd) {
     e->sector = data->sector;
     e->rq = rq_key;
     __builtin_memcpy(e->comm, data->comm, 16);
+    e->tid = data->tid;
     e->inflight = cur_inflight;
     e->qid = data->qid;
     __builtin_memcpy(e->disk_name, data->disk_name, 32);
@@ -303,6 +311,7 @@ static __always_inline int handle_nvme_complete(struct request *req) {
     e->sector = data->sector;
     e->rq = rq_key;
     __builtin_memcpy(e->comm, data->comm, 16);
+    e->tid = data->tid;
     e->inflight = cur_inflight;
     e->qid = data->qid;
     __builtin_memcpy(e->disk_name, data->disk_name, 32);

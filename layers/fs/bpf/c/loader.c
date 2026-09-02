@@ -37,6 +37,9 @@ static const char *syscall_names[] = {
 	[10] = "mkdirat",
 	[11] = "mmap",
 	[12] = "munmap",
+	[13] = "io_uring_enter",
+	[14] = "io_submit",
+	[15] = "io_getevents",
 };
 
 static const char *sc_name(__u8 idx)
@@ -326,6 +329,17 @@ int main(int argc, char **argv)
 	if (container_count > 0)
 		skel->rodata->filter_by_mntns = true;
 
+	// The async-submission probes are attached separately and tolerated if missing: those
+	// tracepoints only exist when the kernel was built with CONFIG_IO_URING / CONFIG_AIO, and
+	// standalone_bpf__attach() fails as a unit — one absent tracepoint would otherwise take
+	// the whole fs layer down on a kernel that simply has nothing there to trace.
+	bpf_program__set_autoattach(skel->progs.handle_enter_io_uring_enter, false);
+	bpf_program__set_autoattach(skel->progs.handle_exit_io_uring_enter, false);
+	bpf_program__set_autoattach(skel->progs.handle_enter_io_submit, false);
+	bpf_program__set_autoattach(skel->progs.handle_exit_io_submit, false);
+	bpf_program__set_autoattach(skel->progs.handle_enter_io_getevents, false);
+	bpf_program__set_autoattach(skel->progs.handle_exit_io_getevents, false);
+
 	int err = standalone_bpf__load(skel);
 	if (err) {
 		fprintf(stderr, "Failed to load BPF skeleton: %d\n", err);
@@ -339,6 +353,29 @@ int main(int argc, char **argv)
 		standalone_bpf__destroy(skel);
 		return 1;
 	}
+
+	skel->links.handle_enter_io_uring_enter =
+		bpf_program__attach(skel->progs.handle_enter_io_uring_enter);
+	skel->links.handle_exit_io_uring_enter =
+		bpf_program__attach(skel->progs.handle_exit_io_uring_enter);
+	if (!skel->links.handle_enter_io_uring_enter || !skel->links.handle_exit_io_uring_enter)
+		fprintf(stderr,
+			"WARNING: io_uring_enter tracepoint unavailable — io_uring submissions "
+			"will be invisible to the fs layer (kernel without CONFIG_IO_URING?)\n");
+
+	skel->links.handle_enter_io_submit =
+		bpf_program__attach(skel->progs.handle_enter_io_submit);
+	skel->links.handle_exit_io_submit =
+		bpf_program__attach(skel->progs.handle_exit_io_submit);
+	skel->links.handle_enter_io_getevents =
+		bpf_program__attach(skel->progs.handle_enter_io_getevents);
+	skel->links.handle_exit_io_getevents =
+		bpf_program__attach(skel->progs.handle_exit_io_getevents);
+	if (!skel->links.handle_enter_io_submit || !skel->links.handle_exit_io_submit ||
+	    !skel->links.handle_enter_io_getevents || !skel->links.handle_exit_io_getevents)
+		fprintf(stderr,
+			"WARNING: libaio tracepoints unavailable — io_submit/io_getevents "
+			"submissions will be invisible to the fs layer (kernel without CONFIG_AIO?)\n");
 
 	output = fopen(output_path, "w");
 	if (!output) {

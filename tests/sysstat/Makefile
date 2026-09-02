@@ -97,7 +97,7 @@ define CONTAINER_JOB
 .PHONY: $(1)
 $(1): ensure-sudo pull-image
 	$(Q)echo -e "\n============================================================"
-	$(Q)echo -e "  Running: $(1)"
+	$(Q)echo -e "  Running: $(1)$(if $(PROFILER_CPUSET),  [collectors pinned to $(PROFILER_CPUSET)],  [collectors unpinned])"
 	$(Q)echo -e "============================================================\n"
 	$(Q)docker rm -f $(MEM_CONTAINER) $(REDIRECT) || true
 	$(Q)rm -rf "$(RESULTS_DIR)/sysstat"
@@ -162,7 +162,7 @@ $(eval $(call CONTAINER_JOB,stress_2m,134217728,268435456,,\
 .PHONY: val_comm
 val_comm: ensure-sudo
 	$(Q)echo -e "\n============================================================"
-	$(Q)echo -e "  Running: val_comm  [comm mode, no container]"
+	$(Q)echo -e "  Running: val_comm  [comm mode, no container]$(if $(PROFILER_CPUSET),  [collectors pinned to $(PROFILER_CPUSET)],  [collectors unpinned])"
 	$(Q)echo -e "============================================================\n"
 	$(Q)rm -rf "$(RESULTS_DIR)/sysstat"
 	$(Q)mkdir -p "$(RESULTS_DIR)/sysstat"
