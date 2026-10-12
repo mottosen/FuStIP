@@ -231,6 +231,31 @@ def generate_stats(parquet_path):
             ensure_comm_entry(comm, mntns_id_str)["distributions"].setdefault("rq_sizes", {})[op] = _row_to_stats(row)
         del raw_size_op
 
+    # Depth as a DISTRIBUTION OVER REQUESTS, for the reason the nvme layer's equivalent block
+    # states in full: Scan 3 below samples the per-second depth with .last(), which reads zero
+    # for a submitter that drains its queue between batches. Both stages get one, because the
+    # queue and the driver are different depths and a reader comparing them needs the same
+    # statistic on each.
+    #
+    # The at-ISSUE columns, matching nvme's inflight_at_setup: both are the post-increment that
+    # counts the request itself. q_inflight_at_insert is 0 for a request that was never queued,
+    # which is why the insert stage is not the one summarised here.
+    for stage, col in (("q_inflight", "q_inflight_at_issue"),
+                       ("d_inflight", "d_inflight_at_issue")):
+        for op in ops:
+            raw_if_op = (pl.scan_parquet(parquet_path)
+                           .select([*id_keys, "op", col])
+                           .filter(pl.col("op") == op)
+                           .filter(pl.col(col) > 0)
+                           .group_by(*id_keys)
+                           .agg(_series_stats_exprs(col))
+                           .collect(engine="streaming"))
+            for row in raw_if_op.iter_rows(named=True):
+                comm, mntns_id_str = _comm_key(row, has_mntns)
+                (ensure_comm_entry(comm, mntns_id_str)["distributions"]
+                    .setdefault(stage, {})[op]) = _row_to_stats(row)
+            del raw_if_op
+
     # --- Scan 3: Inflight time-series (per comm) ---
     # Explicit select for projection pushdown: block parquet has a unique 'rq'
     # string column (~5.6 GB) that would be force-loaded without explicit select.

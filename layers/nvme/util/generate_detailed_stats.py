@@ -215,6 +215,37 @@ def generate_stats(parquet_path):
             ensure_entry(key)["distributions"].setdefault("cmd_sizes", {})[op] = _row_to_stats(row)
         del raw_size_op
 
+    # Queue depth as a DISTRIBUTION OVER COMMANDS, which is the only form of it that
+    # survives a bursty submitter.
+    #
+    # tseries.cmd_inflight below samples the depth once per second, by taking the LAST
+    # command of each second. That is sound for a steady stream and wrong for a drain-to-
+    # empty one: a beam-search walk submits a batch, drains it, computes, then submits the
+    # next, so the final command of any wall-clock second is almost always the one that
+    # emptied the queue. Measured on an upstream-DiskANN capture at beam width 16 (53,422
+    # commands, 3.4 s): the per-second sample read 0 in 6 of 6 seconds while the depth over
+    # commands had mean 7.20 and max 16. A consumer reading the series got a measured floor
+    # of zero with nothing to indicate it was an artifact.
+    #
+    # inflight_at_setup, not inflight: it is the post-increment at submission, so it counts
+    # the command itself and is the depth the device was handed (event.h). `inflight` is the
+    # post-decrement at completion and sits exactly one lower for the same queue. On the
+    # capture above the two read 7.20 and 6.20, against 7.01 for the time-weighted depth over
+    # the device-busy span -- which is the quantity the analysis side calls achieved_qd and
+    # computes from this parquet. This is a per-command mean, not that time-weighted one; it
+    # is reported under its own name for that reason.
+    for op in ops:
+        raw_if_op = (pl.scan_parquet(parquet_path)
+                       .select([*group_keys, "op", "inflight_at_setup"])
+                       .filter(pl.col("op") == op)
+                       .group_by(*group_keys)
+                       .agg(_series_stats_exprs("inflight_at_setup"))
+                       .collect(engine="streaming"))
+        for row in raw_if_op.iter_rows(named=True):
+            key = _entry_key(row, has_mntns, has_disk)
+            ensure_entry(key)["distributions"].setdefault("cmd_inflight", {})[op] = _row_to_stats(row)
+        del raw_if_op
+
     # --- Scan 3: Inflight time-series (per entry) ---
     # No add_label_column in the scan — explicit select for projection pushdown.
     # tseries computed per entry; bind_containers keeps dominant comm's per disk.
